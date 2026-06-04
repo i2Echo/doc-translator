@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Doc Translator</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-left"></div>
+    <div class="ambient ambient-right"></div>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Private Deployment Document Translation</p>
+        <h1>Translate documents without giving up control of the files.</h1>
+        <p class="hero-copy">
+          Originals and translated outputs stay inside customer-controlled storage. If your model
+          endpoint is external, text is sent there during translation by design.
+        </p>
+        <div class="hero-pills">
+          <span>PDF + DOCX</span>
+          <span>Async Jobs</span>
+          <span>OCR Fallback</span>
+          <span>Audit Trail</span>
+        </div>
+      </section>
+
+      <section id="auth-panel" class="card auth-card">
+        <div>
+          <p class="section-kicker">Local Sign-In</p>
+          <h2>Access the translation workspace</h2>
+          <p class="section-copy">
+            Use the locally managed account created from your deployment environment.
+          </p>
+        </div>
+        <form id="login-form" class="stack">
+          <label>
+            <span>Email</span>
+            <input id="login-email" type="email" name="username" autocomplete="username" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input
+              id="login-password"
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <button type="submit" class="primary-button">Sign in</button>
+          <p id="login-error" class="form-note error"></p>
+        </form>
+      </section>
+
+      <section id="dashboard" class="dashboard hidden">
+        <header class="dashboard-header">
+          <div>
+            <p id="user-badge" class="section-kicker"></p>
+            <h2>Operations Console</h2>
+          </div>
+          <div class="header-actions">
+            <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
+            <button id="logout-button" class="ghost-button" type="button">Log out</button>
+          </div>
+        </header>
+
+        <div class="dashboard-grid">
+          <section class="card">
+            <div class="panel-header">
+              <div>
+                <p class="section-kicker">Upload</p>
+                <h3>Start a translation job</h3>
+              </div>
+              <span class="panel-tag">Queue</span>
+            </div>
+            <form id="upload-form" class="stack">
+              <label>
+                <span>Document</span>
+                <input id="upload-file" type="file" accept=".pdf,.docx,application/pdf" required />
+              </label>
+              <div class="two-column">
+                <label>
+                  <span>Source language</span>
+                  <select id="source-language">
+                    <option value="auto">Auto detect</option>
+                    <option value="English">English</option>
+                    <option value="Chinese">Chinese</option>
+                    <option value="Japanese">Japanese</option>
+                    <option value="Spanish">Spanish</option>
+                    <option value="French">French</option>
+                    <option value="German">German</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Target language</span>
+                  <select id="target-language">
+                    <option value="English">English</option>
+                    <option value="Chinese">Chinese</option>
+                    <option value="Japanese">Japanese</option>
+                    <option value="Spanish">Spanish</option>
+                    <option value="French">French</option>
+                    <option value="German">German</option>
+                  </select>
+                </label>
+              </div>
+              <button type="submit" class="primary-button">Upload and queue</button>
+              <p id="upload-message" class="form-note"></p>
+            </form>
+          </section>
+
+          <section class="card">
+            <div class="panel-header">
+              <div>
+                <p class="section-kicker">Jobs</p>
+                <h3>Translation queue and history</h3>
+              </div>
+              <span id="job-count" class="panel-tag">0 jobs</span>
+            </div>
+            <div id="jobs-list" class="jobs-list"></div>
+          </section>
+
+          <section class="card detail-card">
+            <div class="panel-header">
+              <div>
+                <p class="section-kicker">Detail</p>
+                <h3>Selected job timeline</h3>
+              </div>
+              <span id="detail-status" class="panel-tag">No selection</span>
+            </div>
+            <div id="job-detail" class="job-detail empty-state">
+              Pick a job to inspect progress, events, and download availability.
+            </div>
+          </section>
+        </div>
+
+        <section id="admin-area" class="admin-area hidden">
+          <div class="admin-grid">
+            <section class="card">
+              <div class="panel-header">
+                <div>
+                  <p class="section-kicker">Settings</p>
+                  <h3>Model, OCR, and retention</h3>
+                </div>
+                <span class="panel-tag">Admin</span>
+              </div>
+              <form id="settings-form" class="stack">
+                <label>
+                  <span>Model base URL</span>
+                  <input id="settings-model-base-url" type="url" required />
+                </label>
+                <label>
+                  <span>Model API key</span>
+                  <input id="settings-model-api-key" type="password" required />
+                </label>
+                <div class="two-column">
+                  <label>
+                    <span>Model name</span>
+                    <input id="settings-model-name" type="text" required />
+                  </label>
+                  <label>
+                    <span>Model timeout (seconds)</span>
+                    <input id="settings-model-timeout" type="number" min="1" max="3600" required />
+                  </label>
+                </div>
+                <div class="two-column">
+                  <label>
+                    <span>Storage mode</span>
+                    <input id="settings-storage-mode" type="text" required />
+                  </label>
+                  <label>
+                    <span>Local storage path</span>
+                    <input id="settings-storage-path" type="text" required />
+                  </label>
+                </div>
+                <div class="two-column">
+                  <label>
+                    <span>Retention days</span>
+                    <input id="settings-retention-days" type="number" min="1" max="3650" required />
+                  </label>
+                  <label>
+                    <span>Max upload (MB)</span>
+                    <input id="settings-max-upload" type="number" min="1" max="2048" required />
+                  </label>
+                </div>
+                <div class="two-column">
+                  <label>
+                    <span>Max concurrent jobs</span>
+                    <input id="settings-max-concurrency" type="number" min="1" max="16" required />
+                  </label>
+                  <label>
+                    <span>OCR language hint</span>
+                    <input id="settings-ocr-language" type="text" required />
+                  </label>
+                </div>
+                <label class="checkbox-row">
+                  <input id="settings-ocr-enabled" type="checkbox" />
+                  <span>Enable OCR for scanned PDFs</span>
+                </label>
+                <div class="button-row">
+                  <button type="submit" class="primary-button">Save settings</button>
+                  <button id="test-model-button" type="button" class="ghost-button">Test connection</button>
+                </div>
+                <p id="settings-message" class="form-note"></p>
+                <p id="settings-privacy" class="privacy-note"></p>
+              </form>
+            </section>
+
+            <section class="card">
+              <div class="panel-header">
+                <div>
+                  <p class="section-kicker">Users</p>
+                  <h3>Manage local accounts</h3>
+                </div>
+                <span class="panel-tag">Admin</span>
+              </div>
+              <form id="create-user-form" class="stack compact-form">
+                <div class="two-column">
+                  <label>
+                    <span>Full name</span>
+                    <input id="new-user-name" type="text" required />
+                  </label>
+                  <label>
+                    <span>Email</span>
+                    <input id="new-user-email" type="email" required />
+                  </label>
+                </div>
+                <div class="two-column">
+                  <label>
+                    <span>Password</span>
+                    <input id="new-user-password" type="password" minlength="8" required />
+                  </label>
+                  <label>
+                    <span>Role</span>
+                    <select id="new-user-role">
+                      <option value="user">Standard user</option>
+                      <option value="admin">Admin</option>
+                    </select>
+                  </label>
+                </div>
+                <button type="submit" class="primary-button">Create user</button>
+                <p id="user-message" class="form-note"></p>
+              </form>
+              <div id="users-list" class="users-list"></div>
+            </section>
+
+            <section class="card">
+              <div class="panel-header">
+                <div>
+                  <p class="section-kicker">Storage</p>
+                  <h3>Capacity snapshot</h3>
+                </div>
+                <span class="panel-tag">Admin</span>
+              </div>
+              <div id="storage-summary" class="summary-grid"></div>
+            </section>
+
+            <section class="card audit-card">
+              <div class="panel-header">
+                <div>
+                  <p class="section-kicker">Audit</p>
+                  <h3>Recent system activity</h3>
+                </div>
+                <span class="panel-tag">Admin</span>
+              </div>
+              <div id="audit-list" class="audit-list"></div>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
+
