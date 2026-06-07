@@ -4,42 +4,39 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Doc Translator</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="ambient ambient-left"></div>
-    <div class="ambient ambient-right"></div>
     <main class="shell">
-      <section class="hero">
-        <p class="eyebrow">Private Deployment Document Translation</p>
-        <h1>Translate documents without giving up control of the files.</h1>
-        <p class="hero-copy">
-          Originals and translated outputs stay inside customer-controlled storage. If your model
-          endpoint is external, text is sent there during translation by design.
+      <section id="hero" class="hero">
+        <p id="hero-eyebrow" class="eyebrow">私有部署文档翻译</p>
+        <h1 id="hero-title">翻译文档，在线校对</h1>
+        <p id="hero-copy" class="hero-copy">
+          原文与译文保存在你自己的存储中。若模型端点位于外部，翻译时文本会按设计发送到该模型服务。
         </p>
         <div class="hero-pills">
-          <span>PDF + DOCX</span>
-          <span>Async Jobs</span>
-          <span>OCR Fallback</span>
-          <span>Audit Trail</span>
+          <span id="hero-pill-format">PDF + DOCX</span>
+          <span id="hero-pill-preview">预览 + 编辑</span>
+          <span id="hero-pill-jobs">异步任务</span>
+          <span id="hero-pill-audit">审计记录</span>
         </div>
       </section>
 
       <section id="auth-panel" class="card auth-card">
         <div>
-          <p class="section-kicker">Local Sign-In</p>
-          <h2>Access the translation workspace</h2>
-          <p class="section-copy">
-            Use the locally managed account created from your deployment environment.
+          <p id="auth-kicker" class="section-kicker">本地登录</p>
+          <h2 id="auth-title">进入翻译工作台</h2>
+          <p id="auth-copy" class="section-copy">
+            使用部署环境中创建的本地账号登录。
           </p>
         </div>
         <form id="login-form" class="stack">
           <label>
-            <span>Email</span>
+            <span id="login-email-label">邮箱</span>
             <input id="login-email" type="email" name="username" autocomplete="username" required />
           </label>
           <label>
-            <span>Password</span>
+            <span id="login-password-label">密码</span>
             <input
               id="login-password"
               type="password"
@@ -48,83 +45,178 @@
               required
             />
           </label>
-          <button type="submit" class="primary-button">Sign in</button>
+          <button id="login-submit-button" type="submit" class="primary-button">登录</button>
           <p id="login-error" class="form-note error"></p>
         </form>
       </section>
 
       <section id="dashboard" class="dashboard hidden">
-        <header class="dashboard-header">
+        <header class="app-header">
           <div>
             <p id="user-badge" class="section-kicker"></p>
-            <h2>Operations Console</h2>
+            <h2>Document Translation</h2>
           </div>
           <div class="header-actions">
-            <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
-            <button id="logout-button" class="ghost-button" type="button">Log out</button>
+            <label class="ui-language-picker">
+              <span id="ui-language-label" class="sr-only">界面语言</span>
+              <select id="ui-language-select">
+                <option value="zh-CN">简体中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <button id="workspace-home-button" class="ghost-button hidden" type="button">工作台</button>
+            <button id="admin-entry-button" class="ghost-button hidden" type="button">管理</button>
+            <button id="refresh-button" class="ghost-button" type="button">刷新</button>
+            <button id="logout-button" class="ghost-button" type="button">退出</button>
           </div>
         </header>
 
-        <div class="dashboard-grid">
-          <section class="card">
-            <div class="panel-header">
-              <div>
-                <p class="section-kicker">Upload</p>
-                <h3>Start a translation job</h3>
+        <section id="workspace-view" class="workspace-view">
+          <section class="card workspace-panel">
+            <form id="upload-form" class="workspace-form">
+              <div id="drop-zone" class="drop-zone workspace-drop-zone" role="button" tabindex="0" aria-controls="upload-file">
+                <input
+                  id="upload-file"
+                  class="sr-only"
+                  type="file"
+                  accept=".pdf,.docx,application/pdf"
+                  required
+                />
+                <div class="drop-zone-inner">
+                  <div class="drop-zone-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 16V4"></path>
+                      <path d="m7 9 5-5 5 5"></path>
+                      <path d="M5 18v1a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-1"></path>
+                    </svg>
+                  </div>
+                  <strong id="drop-zone-title">拖拽文件到这里</strong>
+                  <p id="drop-zone-copy" class="drop-copy">支持 PDF 和 DOCX 上传。</p>
+                  <p class="drop-stats">
+                    <span id="queue-summary">No active tasks</span>
+                    <span id="parallel-summary">Maximum 2 parallel tasks</span>
+                  </p>
+                  <div id="selected-file" class="selected-file hidden">
+                    <span class="selected-file-label">Selected file</span>
+                    <strong id="selected-file-name"></strong>
+                    <span id="selected-file-meta" class="meta-line"></span>
+                  </div>
+                  <button id="browse-files-button" class="ghost-button browse-button" type="button">选择文件</button>
+                </div>
               </div>
-              <span class="panel-tag">Queue</span>
-            </div>
-            <form id="upload-form" class="stack">
-              <label>
-                <span>Document</span>
-                <input id="upload-file" type="file" accept=".pdf,.docx,application/pdf" required />
-              </label>
-              <div class="two-column">
-                <label>
-                  <span>Source language</span>
-                  <select id="source-language">
-                    <option value="auto">Auto detect</option>
-                    <option value="English">English</option>
-                    <option value="Chinese">Chinese</option>
-                    <option value="Japanese">Japanese</option>
-                    <option value="Spanish">Spanish</option>
-                    <option value="French">French</option>
-                    <option value="German">German</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Target language</span>
-                  <select id="target-language">
-                    <option value="English">English</option>
-                    <option value="Chinese">Chinese</option>
-                    <option value="Japanese">Japanese</option>
-                    <option value="Spanish">Spanish</option>
-                    <option value="French">French</option>
-                    <option value="German">German</option>
-                  </select>
-                </label>
+
+              <div class="workspace-controls">
+                <div class="control-row primary">
+                  <label class="inline-control">
+                    <span id="source-language-label">源语言:</span>
+                    <select id="source-language">
+                      <option value="auto">自动检测</option>
+                      <option value="English">English</option>
+                      <option value="Chinese">中文</option>
+                      <option value="Japanese">日本语</option>
+                      <option value="Spanish">Español</option>
+                      <option value="French">Français</option>
+                      <option value="German">Deutsch</option>
+                    </select>
+                  </label>
+                  <label class="inline-control">
+                    <span id="target-language-label">目标语言:</span>
+                    <select id="target-language">
+                      <option value="Chinese">中文</option>
+                      <option value="English">English</option>
+                      <option value="Japanese">日本语</option>
+                      <option value="Spanish">Español</option>
+                      <option value="French">Français</option>
+                      <option value="German">Deutsch</option>
+                    </select>
+                  </label>
+                  <label class="inline-control model-control">
+                    <span id="model-label">选择模型:</span>
+                    <div id="workspace-model-name" class="static-select model-pill">Managed model</div>
+                  </label>
+                  <button id="more-settings-button" class="more-settings-button" type="button" aria-expanded="true">
+                    <span id="more-settings-text">更多设置</span>
+                    <span class="chevron" aria-hidden="true">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="m4 10 4-4 4 4"></path>
+                      </svg>
+                    </span>
+                  </button>
+                </div>
+
+                <div id="workspace-more-settings" class="workspace-more-settings">
+                  <div class="control-row secondary">
+                    <label class="inline-control compact-control">
+                      <span id="glossary-label">术语表:</span>
+                      <select id="workspace-glossary">
+                        <option value="">请选择</option>
+                      </select>
+                    </label>
+                    <label class="inline-control compact-control">
+                      <span id="translation-style-label">翻译风格:</span>
+                      <select id="workspace-translation-style">
+                        <option value="">请选择</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div class="feature-toggle-row">
+                    <label class="toggle-option">
+                      <input id="toggle-translate-images" type="checkbox" />
+                      <span class="toggle-switch" aria-hidden="true"></span>
+                      <span id="toggle-images-label">翻译 PDF 图片</span>
+                    </label>
+                    <label class="toggle-option">
+                      <input id="toggle-formula-enhancement" type="checkbox" />
+                      <span class="toggle-switch" aria-hidden="true"></span>
+                      <span id="toggle-formula-label">公式识别增强</span>
+                    </label>
+                    <label class="toggle-option">
+                      <input id="toggle-email-notice" type="checkbox" />
+                      <span class="toggle-switch" aria-hidden="true"></span>
+                      <span id="toggle-email-label">邮件通知</span>
+                    </label>
+                    <label class="toggle-option">
+                      <input id="toggle-priority-queue" type="checkbox" />
+                      <span class="toggle-switch" aria-hidden="true"></span>
+                      <span id="toggle-priority-label">优先队列</span>
+                    </label>
+                  </div>
+                </div>
               </div>
-              <button type="submit" class="primary-button">Upload and queue</button>
-              <p id="upload-message" class="form-note"></p>
+
+              <div class="workspace-actions workspace-actions-bar">
+                <div class="button-row">
+                  <button id="clear-file-button" type="button" class="ghost-button">清空</button>
+                  <button id="start-translation-button" type="submit" class="primary-button workspace-submit-button">开始翻译</button>
+                </div>
+                <p id="upload-message" class="form-note"></p>
+              </div>
             </form>
           </section>
 
-          <section class="card">
-            <div class="panel-header">
-              <div>
-                <p class="section-kicker">Jobs</p>
-                <h3>Translation queue and history</h3>
-              </div>
-              <span id="job-count" class="panel-tag">0 jobs</span>
+          <section class="recent-jobs-panel">
+            <span id="job-count" class="sr-only">0 jobs</span>
+            <div class="jobs-carousel">
+              <button id="jobs-scroll-prev" class="jobs-scroll-button" type="button" aria-label="Scroll jobs left">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m10 4-4 4 4 4"></path>
+                </svg>
+              </button>
+              <div id="jobs-list" class="jobs-strip"></div>
+              <button id="jobs-scroll-next" class="jobs-scroll-button" type="button" aria-label="Scroll jobs right">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m6 4 4 4-4 4"></path>
+                </svg>
+              </button>
             </div>
-            <div id="jobs-list" class="jobs-list"></div>
           </section>
 
-          <section class="card detail-card">
-            <div class="panel-header">
+          <section class="card job-detail-card hidden" aria-hidden="true">
+            <div class="section-header">
               <div>
-                <p class="section-kicker">Detail</p>
-                <h3>Selected job timeline</h3>
+                <p class="section-kicker">Selected Job</p>
+                <h3>Progress, events, and quick actions</h3>
               </div>
               <span id="detail-status" class="panel-tag">No selection</span>
             </div>
@@ -132,18 +224,61 @@
               Pick a job to inspect progress, events, and download availability.
             </div>
           </section>
-        </div>
+        </section>
 
-        <section id="admin-area" class="admin-area hidden">
-          <div class="admin-grid">
-            <section class="card">
-              <div class="panel-header">
-                <div>
-                  <p class="section-kicker">Settings</p>
-                  <h3>Model, OCR, and retention</h3>
+        <section id="preview-view" class="preview-view hidden">
+          <div class="preview-topbar">
+            <div class="preview-title-row">
+              <button id="preview-back-button" class="preview-back-button" type="button" aria-label="Back">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m10 3.5-5 4.5 5 4.5"></path>
+                </svg>
+              </button>
+              <div class="preview-file-row">
+                <span id="preview-file-kind" class="preview-file-kind">PDF</span>
+                <div class="preview-file-copy">
+                  <h3 id="preview-title">Translated document preview</h3>
+                  <p id="preview-subtitle" class="section-copy"></p>
                 </div>
-                <span class="panel-tag">Admin</span>
               </div>
+            </div>
+            <div class="preview-topbar-actions">
+              <button id="preview-edit-toggle" class="preview-action-button" type="button">Edit</button>
+              <button id="preview-save-button" class="preview-save-button" type="button">Save edits</button>
+              <button id="preview-download-button" class="preview-action-button" type="button">Download</button>
+            </div>
+          </div>
+
+          <section class="card preview-card">
+            <div class="preview-message-row">
+              <p id="preview-note" class="privacy-note">
+                PDF preview loads the real document first. Edit mode opens the review editor only
+                when you need to change wording.
+              </p>
+              <p id="preview-message" class="form-note"></p>
+            </div>
+            <div id="preview-stage" class="preview-stage"></div>
+          </section>
+        </section>
+
+        <section id="admin-view" class="admin-view hidden">
+          <div class="admin-shell">
+            <div class="admin-header">
+              <div>
+                <p class="section-kicker">Admin</p>
+                <h3 id="admin-page-title">Settings</h3>
+                <p id="admin-page-copy" class="section-copy"></p>
+              </div>
+            </div>
+
+            <nav class="admin-nav" aria-label="Admin pages">
+              <button data-admin-route="settings" class="admin-nav-button" type="button">Settings</button>
+              <button data-admin-route="users" class="admin-nav-button" type="button">Users</button>
+              <button data-admin-route="storage" class="admin-nav-button" type="button">Storage</button>
+              <button data-admin-route="audit" class="admin-nav-button" type="button">Audit</button>
+            </nav>
+
+            <section id="admin-page-settings" class="card admin-page hidden">
               <form id="settings-form" class="stack">
                 <label>
                   <span>Model base URL</span>
@@ -206,14 +341,7 @@
               </form>
             </section>
 
-            <section class="card">
-              <div class="panel-header">
-                <div>
-                  <p class="section-kicker">Users</p>
-                  <h3>Manage local accounts</h3>
-                </div>
-                <span class="panel-tag">Admin</span>
-              </div>
+            <section id="admin-page-users" class="card admin-page hidden">
               <form id="create-user-form" class="stack compact-form">
                 <div class="two-column">
                   <label>
@@ -244,32 +372,17 @@
               <div id="users-list" class="users-list"></div>
             </section>
 
-            <section class="card">
-              <div class="panel-header">
-                <div>
-                  <p class="section-kicker">Storage</p>
-                  <h3>Capacity snapshot</h3>
-                </div>
-                <span class="panel-tag">Admin</span>
-              </div>
+            <section id="admin-page-storage" class="card admin-page hidden">
               <div id="storage-summary" class="summary-grid"></div>
             </section>
 
-            <section class="card audit-card">
-              <div class="panel-header">
-                <div>
-                  <p class="section-kicker">Audit</p>
-                  <h3>Recent system activity</h3>
-                </div>
-                <span class="panel-tag">Admin</span>
-              </div>
+            <section id="admin-page-audit" class="card admin-page hidden">
               <div id="audit-list" class="audit-list"></div>
             </section>
           </div>
         </section>
       </section>
     </main>
-    <script src="./app.js" defer></script>
+    <script src="/app.js" defer></script>
   </body>
 </html>
-

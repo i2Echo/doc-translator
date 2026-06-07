@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from doc_translator.models import JobFileKind, JobStatus, UserRole
 
@@ -122,6 +122,86 @@ class JobDetail(JobRead):
     events: list[JobEventRead]
 
 
+class JobPreviewPdfTextBlockRead(BaseModel):
+    type: Literal["text"] = "text"
+    block_id: str
+    rect: list[float] = Field(min_length=4, max_length=4)
+    font_name: str
+    font_size_original: float
+    font_size_current: float
+    src_text: str
+    tgt_text: str
+
+
+class JobPreviewPdfTableCellRead(BaseModel):
+    cell_id: str
+    row_index: int = Field(ge=1)
+    col_index: int = Field(ge=1)
+    row_span: int = Field(default=1, ge=1)
+    col_span: int = Field(default=1, ge=1)
+    rect: list[float] = Field(min_length=4, max_length=4)
+    font_size_original: float
+    font_size_current: float
+    src_text: str
+    tgt_text: str
+
+
+class JobPreviewPdfTableBlockRead(BaseModel):
+    type: Literal["table"]
+    block_id: str
+    table_rect: list[float] = Field(min_length=4, max_length=4)
+    rows_count: int = Field(ge=1)
+    cols_count: int = Field(ge=1)
+    cells: list[JobPreviewPdfTableCellRead] = Field(default_factory=list)
+
+
+class JobPreviewPageRead(BaseModel):
+    id: str | None = None
+    label: str | None = None
+    source_text: str | None = None
+    translated_text: str | None = None
+    page_num: int | None = None
+    page_width: float | None = None
+    page_height: float | None = None
+    blocks: list[JobPreviewPdfTextBlockRead | JobPreviewPdfTableBlockRead] = Field(default_factory=list)
+
+
+class JobPreviewRead(BaseModel):
+    job_id: str
+    title: str
+    output_name: str
+    document_kind: Literal["pdf", "docx"]
+    source_language: str
+    target_language: str
+    created_at: datetime
+    updated_at: datetime
+    pages: list[JobPreviewPageRead]
+
+
+class JobPreviewPageUpdate(BaseModel):
+    id: str
+    translated_text: str
+
+
+class JobPreviewPdfBlockUpdate(BaseModel):
+    block_id: str | None = None
+    cell_id: str | None = None
+    tgt_text: str
+    font_size_final: float = Field(ge=0.5)
+
+    @model_validator(mode="after")
+    def validate_identifier(self) -> "JobPreviewPdfBlockUpdate":
+        if bool(self.block_id) == bool(self.cell_id):
+            raise ValueError("Provide exactly one of block_id or cell_id")
+        return self
+
+
+class JobPreviewUpdate(BaseModel):
+    pages: list[JobPreviewPageUpdate] | None = None
+    status: Literal["validated"] | None = None
+    payload: list[JobPreviewPdfBlockUpdate] | None = None
+
+
 class AuditLogRead(ORMModel):
     id: str
     action: str
@@ -145,4 +225,3 @@ class ModelTestResult(BaseModel):
     ok: bool
     latency_ms: int
     preview: str
-

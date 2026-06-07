@@ -16,13 +16,22 @@ from doc_translator.bootstrap import bootstrap_defaults
 from doc_translator.core.config import get_settings
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health
-from doc_translator.models import JobFile
+from doc_translator.models import JobEvent, JobFile, JobStatus, TranslationJob
+from doc_translator.preview import preview_sidecar_path
 from doc_translator.queueing import TRANSLATION_QUEUE_KEY, get_redis_client
 from doc_translator.settings_service import get_runtime_settings
 from doc_translator.translation import run_translation_job
 
 
 logger = logging.getLogger(__name__)
+
+RECOVERABLE_JOB_STATUSES = {
+    JobStatus.QUEUED,
+    JobStatus.PARSING,
+    JobStatus.OCR_RUNNING,
+    JobStatus.TRANSLATING,
+    JobStatus.REBUILDING,
+}
 
 
 class WorkerRuntime:
@@ -40,6 +49,7 @@ class WorkerRuntime:
         configure_logging(self.settings.log_level)
         with SessionLocal() as session:
             bootstrap_defaults(session)
+        self.recover_orphaned_jobs()
         self.dispatch_thread = threading.Thread(target=self.dispatch_loop, daemon=True)
         self.cleanup_thread = threading.Thread(target=self.cleanup_loop, daemon=True)
         self.dispatch_thread.start()
@@ -55,6 +65,95 @@ class WorkerRuntime:
 
     def update_heartbeat(self) -> None:
         self.last_heartbeat = datetime.now(timezone.utc)
+
+    def recover_orphaned_jobs(self) -> None:
+        try:
+            redis_client = get_redis_client()
+            queued_job_ids = set(redis_client.lrange(TRANSLATION_QUEUE_KEY, 0, -1))
+        except redis.RedisError:
+            logger.exception("Worker could not inspect Redis queue during orphaned-job recovery")
+            return
+
+        jobs_to_enqueue: list[str] = []
+        recovered_count = 0
+        cancelled_count = 0
+
+        with SessionLocal() as session:
+            jobs = (
+                session.query(TranslationJob)
+                .filter(TranslationJob.status.in_(tuple(RECOVERABLE_JOB_STATUSES)))
+                .order_by(TranslationJob.created_at.asc())
+                .all()
+            )
+            for job in jobs:
+                if job.cancel_requested:
+                    previous_status = job.status
+                    job.status = JobStatus.CANCELLED
+                    job.completed_at = datetime.now(timezone.utc)
+                    session.add(
+                        JobEvent(
+                            job_id=job.id,
+                            level="info",
+                            message="Recovered orphaned job and finalized cancellation",
+                            details={"recovery": "worker_startup", "previous_status": previous_status.value},
+                        )
+                    )
+                    record_audit(
+                        session,
+                        action="jobs.recovered_cancelled",
+                        entity_type="translation_job",
+                        entity_id=job.id,
+                        details={"previous_status": previous_status.value},
+                    )
+                    cancelled_count += 1
+                    continue
+
+                if job.status != JobStatus.QUEUED:
+                    previous_status = job.status
+                    job.status = JobStatus.QUEUED
+                    job.progress = 0
+                    job.started_at = None
+                    job.completed_at = None
+                    job.error_message = None
+                    session.add(
+                        JobEvent(
+                            job_id=job.id,
+                            level="info",
+                            message="Recovered orphaned in-progress job and re-queued it",
+                            details={"recovery": "worker_startup", "previous_status": previous_status.value},
+                        )
+                    )
+                    record_audit(
+                        session,
+                        action="jobs.recovered_queued",
+                        entity_type="translation_job",
+                        entity_id=job.id,
+                        details={"previous_status": previous_status.value},
+                    )
+                    recovered_count += 1
+
+                if job.id not in queued_job_ids:
+                    jobs_to_enqueue.append(job.id)
+                    queued_job_ids.add(job.id)
+
+            session.commit()
+
+        if jobs_to_enqueue:
+            try:
+                redis_client.rpush(TRANSLATION_QUEUE_KEY, *jobs_to_enqueue)
+            except redis.RedisError:
+                logger.exception("Worker could not re-enqueue recovered jobs")
+                return
+
+        if recovered_count or cancelled_count:
+            logger.warning(
+                "Recovered orphaned translation jobs on worker startup",
+                extra={
+                    "recovered_count": recovered_count,
+                    "cancelled_count": cancelled_count,
+                    "enqueued_count": len(jobs_to_enqueue),
+                },
+            )
 
     def dispatch_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -114,6 +213,8 @@ class WorkerRuntime:
                     from pathlib import Path
 
                     Path(job_file.storage_path).unlink(missing_ok=True)
+                    if job_file.kind.value == "output":
+                        preview_sidecar_path(job_file.storage_path).unlink(missing_ok=True)
                 finally:
                     job_file.deleted_at = datetime.now(timezone.utc)
                     record_audit(

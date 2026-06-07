@@ -37,10 +37,18 @@ doc-translator/
 ## Quick Start
 
 1. Copy `.env.example` to `.env` and replace the secrets and model settings.
-2. Start the stack with `docker compose up --build`.
+2. Start the stack with `.\dev.ps1`.
 3. Open [http://localhost:3000](http://localhost:3000).
 4. Sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD` from the environment.
 5. Update the model endpoint in the admin settings screen if needed.
+
+`.\dev.ps1` will create `.env` from `.env.example` if needed, start Docker Desktop when possible, build the images, bring the stack up, and wait for the health checks to pass. If you prefer Command Prompt or double-click launch, use `.\dev.cmd`.
+
+Useful commands:
+
+- `.\dev.ps1 logs`
+- `.\dev.ps1 status`
+- `.\dev.ps1 down`
 
 ## Running Without Docker
 

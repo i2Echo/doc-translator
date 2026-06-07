@@ -17,13 +17,20 @@ The supported MVP deployment target is Docker Compose in a customer-controlled e
 3. Review `LOCAL_STORAGE_PATH`, `FILE_RETENTION_DAYS`, and `MAX_CONCURRENT_JOBS`.
 4. Start the stack:
 
-```bash
-docker compose up --build -d
+```powershell
+.\dev.ps1
 ```
 
-5. Open [http://localhost:3000](http://localhost:3000).
-6. Sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD`.
-7. Open the admin settings panel and verify the configured model endpoint with the connection test.
+5. The script will create `.env` from `.env.example` if needed, start Docker Desktop when possible, build the images, and wait for all service health checks.
+6. Open [http://localhost:3000](http://localhost:3000).
+7. Sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD`.
+8. Open the admin settings panel and verify the configured model endpoint with the connection test.
+
+Useful commands:
+
+- `.\dev.ps1 logs`
+- `.\dev.ps1 status`
+- `.\dev.ps1 down`
 
 ## Volumes
 
@@ -44,4 +51,3 @@ Recommended reverse proxy behavior:
 ## Network Boundary Reminder
 
 The application stores files only on customer-managed infrastructure. If the configured model endpoint is external, translated text is sent to that endpoint during processing.
-

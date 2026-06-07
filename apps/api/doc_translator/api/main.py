@@ -16,10 +16,13 @@ from doc_translator.core.config import get_settings
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health, get_db
 from doc_translator.models import AuditLog, JobFile, JobFileKind, JobStatus, TranslationJob, User
+from doc_translator.preview import load_or_create_preview, update_preview
 from doc_translator.queueing import enqueue_job, get_redis_client
 from doc_translator.schemas import (
     AuditLogRead,
     JobDetail,
+    JobPreviewRead,
+    JobPreviewUpdate,
     JobRead,
     ModelTestResult,
     SettingsRead,
@@ -76,6 +79,25 @@ def build_runtime_override(runtime: RuntimeSettings, payload: SettingsTestReques
     override = payload.model_dump(exclude_none=True)
     data.update(override)
     return RuntimeSettings(**data)
+
+
+def ensure_job_has_previewable_output(job: TranslationJob) -> None:
+    if job.status != JobStatus.COMPLETED or job.output_file is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preview is available after translation completes")
+    if job.output_file.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Preview is no longer available because the translated file expired")
+
+
+def load_job_document(job: TranslationJob, document_kind: str) -> JobFile:
+    if document_kind == "source":
+        return job.input_file
+    if document_kind == "translated":
+        if job.output_file is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No translated file is available yet")
+        if job.output_file.deleted_at is not None:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Translated file has expired")
+        return job.output_file
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
 
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
@@ -395,6 +417,68 @@ def download_job(
     )
     session.commit()
     return FileResponse(path=job.output_file.storage_path, filename=job.output_file.original_name)
+
+
+@app.get("/api/v1/jobs/{job_id}/documents/{document_kind}")
+def read_job_document(
+    job_id: str,
+    document_kind: str,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    job = load_job_or_404(session, job_id, current_user)
+    job_file = load_job_document(job, document_kind)
+    return FileResponse(
+        path=job_file.storage_path,
+        media_type=job_file.content_type,
+        filename=job_file.original_name,
+        headers={"Content-Disposition": f'inline; filename="{job_file.original_name}"'},
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}/preview", response_model=JobPreviewRead)
+def read_job_preview(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+) -> JobPreviewRead:
+    job = load_job_or_404(session, job_id, current_user)
+    ensure_job_has_previewable_output(job)
+    try:
+        preview = load_or_create_preview(job)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not prepare preview: {exc}") from exc
+    return JobPreviewRead.model_validate(preview)
+
+
+@app.put("/api/v1/jobs/{job_id}/preview", response_model=JobPreviewRead)
+def save_job_preview(
+    job_id: str,
+    payload: JobPreviewUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+) -> JobPreviewRead:
+    job = load_job_or_404(session, job_id, current_user)
+    ensure_job_has_previewable_output(job)
+    try:
+        preview = update_preview(job, payload.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    record_audit(
+        session,
+        action="jobs.preview_updated",
+        entity_type="translation_job",
+        entity_id=job.id,
+        actor_id=current_user.id,
+        ip_address=get_request_ip(request),
+        details={"page_count": len(preview["pages"])},
+    )
+    session.commit()
+    return JobPreviewRead.model_validate(preview)
 
 
 @app.get("/api/v1/audit-logs", response_model=list[AuditLogRead])

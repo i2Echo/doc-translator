@@ -70,6 +70,7 @@ services:
         condition: service_healthy
     volumes:
       - files_data:/data/files
+      - babeldoc_cache:/root/.cache/babeldoc
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/live')"]
       interval: 15s
@@ -99,3 +100,4 @@ volumes:
   postgres_data:
   redis_data:
   files_data:
+  babeldoc_cache:
