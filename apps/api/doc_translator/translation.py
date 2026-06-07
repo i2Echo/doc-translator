@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import queue
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -19,6 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 from doc_translator.audit import record_audit
 from doc_translator.db import SessionLocal
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
+from doc_translator.preview import load_or_create_preview
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
 from doc_translator.storage import build_output_target, file_checksum
 
@@ -43,10 +50,61 @@ BABELDOC_LANGUAGE_CODES = {
     "german": "de",
 }
 PDF_OCR_DPI = 300
-PDF_BACKGROUND_ANALYSIS_DPI = 24
-PDF_OCR_WORKAROUND_MIN_LUMINANCE = 235.0
-PDF_OCR_WORKAROUND_MIN_BRIGHT_RATIO = 0.6
-PDF_OCR_WORKAROUND_PAGE_SAMPLE_LIMIT = 5
+BABELDOC_QPS = max(1, int(os.getenv("BABELDOC_QPS", "6")))
+BABELDOC_PROGRESS_REPORT_INTERVAL_SECONDS = 0.5
+_BABELDOC_PROGRESS_START = 20
+_BABELDOC_PROGRESS_END = 92
+_BABELDOC_PROGRESS_EVENT_PREFIX = "__BABELDOC_PROGRESS__"
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_BABELDOC_PROGRESS_FRACTION_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+@dataclass(frozen=True)
+class _BabeldocProgressStage:
+    name: str
+    weight: float
+    status: JobStatus
+    message: str
+    cumulative_weight_before: float
+
+
+_BABELDOC_PROGRESS_STAGE_BLUEPRINTS = [
+    ("Parse PDF and Create Intermediate Representation", 14.12, JobStatus.PARSING, "Analyzing PDF structure"),
+    ("DetectScannedFile", 2.45, JobStatus.PARSING, "Checking whether PDF needs OCR"),
+    ("Parse Page Layout", 14.03, JobStatus.PARSING, "Analyzing page layout"),
+    ("Parse Table", 1.0, JobStatus.PARSING, "Analyzing tables"),
+    ("Parse Paragraphs", 6.26, JobStatus.PARSING, "Analyzing paragraphs"),
+    ("Parse Formulas and Styles", 1.66, JobStatus.PARSING, "Analyzing formulas and styles"),
+    ("Automatic Term Extraction", 30.0, JobStatus.TRANSLATING, "Extracting terminology"),
+    ("Translate Paragraphs", 46.96, JobStatus.TRANSLATING, "Translating extracted text"),
+    ("Typesetting", 4.71, JobStatus.REBUILDING, "Typesetting translated PDF"),
+    ("Add Fonts", 0.61, JobStatus.REBUILDING, "Embedding fonts"),
+    ("Generate drawing instructions", 1.96, JobStatus.REBUILDING, "Generating drawing instructions"),
+    ("Subset font", 0.92, JobStatus.REBUILDING, "Optimizing embedded fonts"),
+    ("Save PDF", 6.34, JobStatus.REBUILDING, "Saving translated PDF"),
+]
+
+
+def _build_babeldoc_progress_stages() -> tuple[_BabeldocProgressStage, ...]:
+    cumulative_weight = 0.0
+    stages: list[_BabeldocProgressStage] = []
+    for name, weight, status, message in _BABELDOC_PROGRESS_STAGE_BLUEPRINTS:
+        stages.append(
+            _BabeldocProgressStage(
+                name=name,
+                weight=weight,
+                status=status,
+                message=message,
+                cumulative_weight_before=cumulative_weight,
+            )
+        )
+        cumulative_weight += weight
+    return tuple(stages)
+
+
+_BABELDOC_PROGRESS_STAGES = _build_babeldoc_progress_stages()
+_BABELDOC_PROGRESS_STAGE_BY_NAME = {stage.name: stage for stage in _BABELDOC_PROGRESS_STAGES}
+_BABELDOC_TOTAL_STAGE_WEIGHT = sum(stage.weight for stage in _BABELDOC_PROGRESS_STAGES)
 
 
 class JobCancelledError(Exception):
@@ -334,51 +392,6 @@ def _pdf_has_any_extractable_text(path: Path) -> bool:
         document.close()
 
 
-def _page_luminance_metrics(page: fitz.Page) -> tuple[float, float]:
-    pixmap = page.get_pixmap(dpi=PDF_BACKGROUND_ANALYSIS_DPI, alpha=False)
-    samples = pixmap.samples
-    pixel_count = len(samples) // 3
-    if pixel_count == 0:
-        return 0.0, 0.0
-
-    total_luminance = 0.0
-    bright_pixels = 0
-    for index in range(0, len(samples), 3):
-        red = samples[index]
-        green = samples[index + 1]
-        blue = samples[index + 2]
-        luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
-        total_luminance += luminance
-        if luminance >= 245:
-            bright_pixels += 1
-
-    return total_luminance / pixel_count, bright_pixels / pixel_count
-
-
-def _pdf_prefers_ocr_workaround(path: Path) -> bool:
-    document = fitz.open(path)
-    try:
-        sample_count = min(document.page_count, PDF_OCR_WORKAROUND_PAGE_SAMPLE_LIMIT)
-        if sample_count == 0:
-            return False
-
-        total_luminance = 0.0
-        total_bright_ratio = 0.0
-        for page_index in range(sample_count):
-            luminance, bright_ratio = _page_luminance_metrics(document[page_index])
-            total_luminance += luminance
-            total_bright_ratio += bright_ratio
-
-        average_luminance = total_luminance / sample_count
-        average_bright_ratio = total_bright_ratio / sample_count
-        return (
-            average_luminance >= PDF_OCR_WORKAROUND_MIN_LUMINANCE
-            and average_bright_ratio >= PDF_OCR_WORKAROUND_MIN_BRIGHT_RATIO
-        )
-    finally:
-        document.close()
-
-
 def _prepare_pdf_for_babeldoc(
     input_path: str,
     prepared_path: Path,
@@ -389,6 +402,14 @@ def _prepare_pdf_for_babeldoc(
         has_text_by_page = [_page_has_extractable_text(page) for page in document]
         page_count = document.page_count
         if all(has_text_by_page):
+            return page_count, False
+
+        # Some native PDFs still contain a few pages that PyMuPDF cannot extract
+        # words from reliably even though BabelDOC can translate the original
+        # document well. Rebuilding the whole file to inject OCR text for those
+        # pages degrades untouched native-text pages, especially dense tables.
+        # Restrict OCR preprocessing to fully scanned/image-only PDFs.
+        if any(has_text_by_page):
             return page_count, False
 
         if not runtime.ocr_enabled:
@@ -417,27 +438,185 @@ def _prepare_pdf_for_babeldoc(
         document.close()
 
 
+def _normalize_babeldoc_output_line(line: str) -> str:
+    return " ".join(_ANSI_ESCAPE_RE.sub("", line).split())
+
+
+def _map_babeldoc_overall_progress(overall_progress: float) -> int:
+    ratio = min(max(overall_progress, 0.0), 100.0) / 100.0
+    progress_span = _BABELDOC_PROGRESS_END - _BABELDOC_PROGRESS_START
+    progress = _BABELDOC_PROGRESS_START + int(round(progress_span * ratio))
+    return max(_BABELDOC_PROGRESS_START, min(_BABELDOC_PROGRESS_END, progress))
+
+
+def _extract_babeldoc_progress_fraction(line: str) -> tuple[int, int] | None:
+    matches = _BABELDOC_PROGRESS_FRACTION_RE.findall(line)
+    if not matches:
+        return None
+    current, total = matches[-1]
+    total_value = int(total)
+    if total_value <= 0:
+        return None
+    return int(current), total_value
+
+
+def _map_babeldoc_progress(stage: _BabeldocProgressStage, current: int, total: int) -> int:
+    stage_ratio = min(max(current / total, 0.0), 1.0)
+    overall_ratio = (stage.cumulative_weight_before + stage.weight * stage_ratio) / _BABELDOC_TOTAL_STAGE_WEIGHT
+    progress_span = _BABELDOC_PROGRESS_END - _BABELDOC_PROGRESS_START
+    progress = _BABELDOC_PROGRESS_START + int(round(progress_span * overall_ratio))
+    return max(_BABELDOC_PROGRESS_START, min(_BABELDOC_PROGRESS_END, progress))
+
+
+def _parse_babeldoc_progress_update(line: str) -> tuple[_BabeldocProgressStage, int, str] | None:
+    normalized = _normalize_babeldoc_output_line(line)
+    if not normalized:
+        return None
+
+    event_prefix_index = normalized.find(_BABELDOC_PROGRESS_EVENT_PREFIX)
+    if event_prefix_index >= 0:
+        payload = normalized[event_prefix_index + len(_BABELDOC_PROGRESS_EVENT_PREFIX) :]
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            event = None
+        if isinstance(event, dict):
+            stage_name = event.get("stage")
+            stage = _BABELDOC_PROGRESS_STAGE_BY_NAME.get(stage_name) if isinstance(stage_name, str) else None
+            overall_progress = event.get("overall_progress")
+            if stage is not None and isinstance(overall_progress, (int, float)):
+                return stage, _map_babeldoc_overall_progress(float(overall_progress)), normalized
+
+    for stage in _BABELDOC_PROGRESS_STAGES:
+        if not normalized.startswith(stage.name):
+            continue
+        fraction = _extract_babeldoc_progress_fraction(normalized)
+        progress = (
+            _map_babeldoc_progress(stage, *fraction)
+            if fraction is not None
+            else _map_babeldoc_progress(stage, 0, 1)
+        )
+        return stage, progress, normalized
+    return None
+
+
+class _BabeldocProgressTracker:
+    def __init__(self, session: Session, job: TranslationJob) -> None:
+        self.session = session
+        self.job = job
+        self.last_status = job.status
+        self.last_progress = job.progress
+        self.last_stage_name: str | None = None
+
+    def handle_output_line(self, line: str) -> None:
+        parsed = _parse_babeldoc_progress_update(line)
+        if parsed is None:
+            return
+
+        stage, progress, normalized_line = parsed
+        progress = max(progress, self.last_progress)
+        if (
+            stage.status == self.last_status
+            and progress == self.last_progress
+            and stage.name == self.last_stage_name
+        ):
+            return
+
+        stage_changed = stage.name != self.last_stage_name or stage.status != self.last_status
+        update_job_state(
+            self.session,
+            self.job,
+            status=stage.status,
+            progress=progress,
+            message=stage.message if stage_changed else None,
+            details={"stage": stage.name, "line": normalized_line} if stage_changed else None,
+        )
+        self.last_status = stage.status
+        self.last_progress = progress
+        self.last_stage_name = stage.name
+
+
+def _enqueue_babeldoc_output_lines(buffer: str, output_lines: queue.Queue[str]) -> str:
+    if not buffer:
+        return ""
+
+    ends_with_separator = buffer.endswith(("\r", "\n"))
+    segments = re.split(r"[\r\n]+", buffer)
+    complete_segments = segments if ends_with_separator else segments[:-1]
+    pending = "" if ends_with_separator else segments[-1]
+
+    for segment in complete_segments:
+        normalized = segment.strip()
+        if normalized:
+            output_lines.put(normalized)
+    return pending
+
+
+def _read_command_output(
+    stream,
+    captured_output: list[str],
+    output_lines: queue.Queue[str],
+) -> None:
+    pending = ""
+    read_chunk = getattr(stream, "read1", stream.read)
+    try:
+        while True:
+            chunk = read_chunk(4096)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            captured_output.append(text)
+            pending = _enqueue_babeldoc_output_lines(pending + text, output_lines)
+    except (OSError, ValueError):
+        return
+
+    tail = pending.strip()
+    if tail:
+        output_lines.put(tail)
+
+
+def _drain_command_output(output_lines: queue.Queue[str], on_output_line: Callable[[str], None] | None) -> None:
+    while True:
+        try:
+            line = output_lines.get_nowait()
+        except queue.Empty:
+            return
+        if on_output_line is not None:
+            on_output_line(line)
+
+
 def _run_command_with_cancellation(
     command: list[str],
     *,
     session: Session,
     job: TranslationJob,
     cwd: Path | None = None,
+    on_output_line: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         command,
         cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        stderr=subprocess.STDOUT,
     )
+    if process.stdout is None:
+        raise RuntimeError("Failed to capture command output")
+
+    captured_output: list[str] = []
+    output_lines: queue.Queue[str] = queue.Queue()
+    output_reader = threading.Thread(
+        target=_read_command_output,
+        args=(process.stdout, captured_output, output_lines),
+        daemon=True,
+    )
+    output_reader.start()
     try:
         while process.poll() is None:
             ensure_not_cancelled(session, job)
+            _drain_command_output(output_lines, on_output_line)
             time.sleep(0.5)
-        stdout, stderr = process.communicate()
+        output_reader.join(timeout=5)
+        _drain_command_output(output_lines, on_output_line)
     except JobCancelledError:
         process.terminate()
         try:
@@ -445,13 +624,68 @@ def _run_command_with_cancellation(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
+        output_reader.join(timeout=5)
+        _drain_command_output(output_lines, on_output_line)
         raise
+    finally:
+        process.stdout.close()
 
-    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    stdout = "".join(captured_output)
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, "")
     if completed.returncode != 0:
-        error_text = (completed.stderr or completed.stdout or "BabelDOC failed").strip()
+        error_text = (completed.stdout or "BabelDOC failed").strip()
         raise RuntimeError(f"BabelDOC translation failed: {error_text[-4000:]}")
     return completed
+
+
+def _translate_prepared_pdf_with_babeldoc_cli(
+    input_path: Path,
+    output_dir: Path,
+    working_dir: Path,
+    runtime: RuntimeSettings,
+    job: TranslationJob,
+    session: Session,
+    *,
+    source_language: str | None,
+    target_language: str,
+    use_ocr_workaround: bool,
+) -> Path:
+    progress_tracker = _BabeldocProgressTracker(session, job)
+    command = [
+        "babeldoc",
+        "--files",
+        str(input_path),
+        "--output",
+        str(output_dir),
+        "--working-dir",
+        str(working_dir),
+        "--lang-out",
+        target_language,
+        "--openai",
+        "--openai-model",
+        runtime.model_name,
+        "--openai-base-url",
+        runtime.model_base_url,
+        "--openai-api-key",
+        runtime.model_api_key,
+        "--no-dual",
+        "--watermark-output-mode",
+        "no_watermark",
+        "--report-interval",
+        str(BABELDOC_PROGRESS_REPORT_INTERVAL_SECONDS),
+    ]
+    if source_language:
+        command.extend(["--lang-in", source_language])
+    if use_ocr_workaround:
+        command.extend(["--skip-scanned-detection", "--ocr-workaround"])
+
+    _run_command_with_cancellation(
+        command,
+        session=session,
+        job=job,
+        on_output_line=progress_tracker.handle_output_line,
+    )
+    return _find_babeldoc_mono_output(output_dir, input_path.stem)
 
 
 def _find_babeldoc_mono_output(output_dir: Path, input_stem: str) -> Path:
@@ -544,7 +778,9 @@ def translate_pdf(
 
         page_count, used_ocr = _prepare_pdf_for_babeldoc(input_path, prepared_input_path, runtime)
         babeldoc_input_path = prepared_input_path if used_ocr else Path(input_path)
-        use_ocr_workaround = used_ocr or _pdf_prefers_ocr_workaround(babeldoc_input_path)
+        # OCR workaround paints over original content before re-typesetting it.
+        # Restrict it to OCR-prepared PDFs so native-text diagrams and rotated labels are not erased.
+        use_ocr_workaround = used_ocr
 
         if used_ocr:
             update_job_state(session, job, status=JobStatus.OCR_RUNNING, progress=18, message="Prepared searchable PDF for scanned pages")
@@ -552,44 +788,29 @@ def translate_pdf(
         update_job_state(
             session,
             job,
-            status=JobStatus.TRANSLATING,
+            status=JobStatus.PARSING,
             progress=20,
-            message="Running layout-preserving PDF translation",
-            details={"ocr_workaround": use_ocr_workaround, "ocr_prepared": used_ocr, "pdf_mode": "babeldoc"},
+            message="Starting layout-preserving PDF translation",
+            details={
+                "ocr_workaround": use_ocr_workaround,
+                "ocr_prepared": used_ocr,
+                "pdf_mode": "babeldoc_cli",
+                "enhance_compatibility": False,
+            },
+        )
+        mono_output = _translate_prepared_pdf_with_babeldoc_cli(
+            babeldoc_input_path,
+            output_dir,
+            working_dir,
+            runtime,
+            job,
+            session,
+            source_language=source_language,
+            target_language=target_language,
+            use_ocr_workaround=use_ocr_workaround,
         )
 
-        command = [
-            "babeldoc",
-            "--files",
-            str(babeldoc_input_path),
-            "--output",
-            str(output_dir),
-            "--working-dir",
-            str(working_dir),
-            "--lang-out",
-            target_language,
-            "--openai",
-            "--openai-model",
-            runtime.model_name,
-            "--openai-base-url",
-            runtime.model_base_url,
-            "--openai-api-key",
-            runtime.model_api_key,
-            "--no-dual",
-            "--enhance-compatibility",
-            "--split-short-lines",
-            "--watermark-output-mode",
-            "no_watermark",
-        ]
-        if source_language:
-            command.extend(["--lang-in", source_language])
-        if use_ocr_workaround:
-            command.extend(["--skip-scanned-detection", "--ocr-workaround"])
-
-        _run_command_with_cancellation(command, session=session, job=job)
-
-        update_job_state(session, job, status=JobStatus.REBUILDING, progress=88, message="Finalizing translated PDF")
-        mono_output = _find_babeldoc_mono_output(output_dir, babeldoc_input_path.stem)
+        update_job_state(session, job, status=JobStatus.REBUILDING, progress=92, message="Optimizing translated PDF")
         shutil.move(str(mono_output), output_path)
         _optimize_pdf_in_place(output_path, temp_root)
 
@@ -658,7 +879,15 @@ def run_translation_job(job_id: str) -> None:
         session.flush()
 
         job.output_file_id = output_file.id
+        job.output_file = output_file
         job.page_count = page_count
+        preview_details: dict | None = None
+        try:
+            preview = load_or_create_preview(job, force=True)
+            preview_details = {"preview_pages": len(preview["pages"])}
+        except Exception as exc:
+            logger.warning("Preview preparation failed", extra={"job_id": job.id, "error": str(exc)})
+            add_job_event(session, job, "Preview could not be prepared", details={"error": str(exc)})
         update_job_state(session, job, status=JobStatus.COMPLETED, progress=100, message="Translation completed")
         record_audit(
             session,
@@ -666,7 +895,7 @@ def run_translation_job(job_id: str) -> None:
             entity_type="translation_job",
             entity_id=job.id,
             actor_id=job.created_by,
-            details={"status": job.status.value, "output_file_id": output_file.id},
+            details={"status": job.status.value, "output_file_id": output_file.id, **(preview_details or {})},
         )
         session.commit()
         logger.info("Completed translation job", extra={"job_id": job.id})

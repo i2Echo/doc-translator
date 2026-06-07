@@ -3,6 +3,42 @@ from pathlib import Path
 
 PATCHES = (
     (
+        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        "import asyncio\n",
+        "import asyncio\nimport json\n",
+    ),
+    (
+        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        """        def progress_handler(event):
+            if show_log and random.random() <= 0.1:  # noqa: S311
+                logger.info(event)
+""",
+        """        def progress_handler(event):
+            if show_log and event["type"] in {
+                "stage_summary",
+                "progress_start",
+                "progress_update",
+                "progress_end",
+            }:
+                print(
+                    "__BABELDOC_PROGRESS__"
+                    + json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                    flush=True,
+                )
+""",
+    ),
+    (
+        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        """        progress_context, progress_handler = create_progress_handler(
+            config, show_log=False
+        )
+""",
+        """        progress_context, progress_handler = create_progress_handler(
+            config, show_log=True
+        )
+""",
+    ),
+    (
         Path("/usr/lib/python3.12/site-packages/babeldoc/format/pdf/document_il/midend/typesetting.py"),
         "        line_skip = 1.50 if self.is_cjk else 1.3\n",
         "        line_skip = 1.38 if self.is_cjk else 1.3\n",
