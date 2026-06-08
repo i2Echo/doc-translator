@@ -14,6 +14,7 @@ For a fresh VPS, the repository now includes:
 
 - `bootstrap-vps.sh`, which clones or updates the repository from GitHub and then starts the project deployment flow
 - `deploy-vps.sh`, which installs Docker on Ubuntu/Debian or AlmaLinux/RHEL-compatible hosts, prepares `.env`, starts the compose stack, and waits for the health checks
+- `update-vps.sh`, which pulls the latest code on the VPS, rebuilds the compose services, and waits for health checks without rerunning the full host bootstrap flow
 - `.env.vps.example`, which is the editable production env template used to create `.env` on the VPS, including `CERTBOT_EMAIL`
 
 ## VPS One-Click Deploy
@@ -46,6 +47,22 @@ curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstra
 ```
 
 `bootstrap-vps.sh` clones or updates the repository into `/opt/doc-translator` by default and then runs `deploy-vps.sh`.
+
+## Updating Code On The VPS
+
+After the first deployment, update the running stack in place with:
+
+```bash
+sudo bash ./update-vps.sh
+```
+
+If the VPS tracks a different branch, pass it explicitly:
+
+```bash
+sudo env BRANCH=main bash ./update-vps.sh
+```
+
+`update-vps.sh` only pulls the latest repository code, runs `docker compose up -d --build` with the VPS compose files, and waits for `postgres`, `redis`, `api`, `worker`, and `web` to become healthy again. It does not reinstall Docker, rewrite Nginx, or request certificates again.
 
 ### What `deploy-vps.sh` does
 
@@ -96,6 +113,8 @@ sudo certbot renew --dry-run
 ```
 
 If the VPS is public, also restrict direct access to ports `3000` and `8000` with the VPS firewall or cloud security group so traffic enters only through `80/443`.
+
+Login credentials are sent to `/api/v1/auth/login` as a normal HTTPS request body and are not protected by a frontend-side hash. That is expected: the real transport protection is TLS. Do not expose production login over plain HTTP.
 
 ## Steps
 

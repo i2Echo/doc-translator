@@ -585,6 +585,8 @@ svg {
 .user-list {
   display: grid;
   gap: 8px;
+  align-content: start;
+  grid-auto-rows: max-content;
   min-height: 0;
   overflow: auto;
   padding-right: 4px;
