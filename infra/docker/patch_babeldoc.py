@@ -1,14 +1,22 @@
+import sysconfig
 from pathlib import Path
+
+
+SITE_PACKAGES = Path(sysconfig.get_path("purelib"))
+
+
+def babeldoc_path(*parts: str) -> Path:
+    return SITE_PACKAGES.joinpath("babeldoc", *parts)
 
 
 PATCHES = (
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        babeldoc_path("main.py"),
         "import asyncio\n",
         "import asyncio\nimport json\n",
     ),
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        babeldoc_path("main.py"),
         """        def progress_handler(event):
             if show_log and random.random() <= 0.1:  # noqa: S311
                 logger.info(event)
@@ -28,7 +36,7 @@ PATCHES = (
 """,
     ),
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/main.py"),
+        babeldoc_path("main.py"),
         """        progress_context, progress_handler = create_progress_handler(
             config, show_log=False
         )
@@ -39,12 +47,12 @@ PATCHES = (
 """,
     ),
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/format/pdf/document_il/midend/typesetting.py"),
+        babeldoc_path("format", "pdf", "document_il", "midend", "typesetting.py"),
         "        line_skip = 1.50 if self.is_cjk else 1.3\n",
         "        line_skip = 1.38 if self.is_cjk else 1.3\n",
     ),
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/format/pdf/document_il/midend/paragraph_finder.py"),
+        babeldoc_path("format", "pdf", "document_il", "midend", "paragraph_finder.py"),
         """        paragraph.first_line_indent = False
         if (
             paragraph.pdf_paragraph_composition
@@ -71,7 +79,7 @@ PATCHES = (
 """,
     ),
     (
-        Path("/usr/lib/python3.12/site-packages/babeldoc/format/pdf/document_il/midend/styles_and_formulas.py"),
+        babeldoc_path("format", "pdf", "document_il", "midend", "styles_and_formulas.py"),
         """    def _calculate_base_style(self, paragraph) -> PdfStyle:
         \"\"\"计算段落的基准样式（除公式外所有文字样式的交集）\"\"\"
         styles = []
