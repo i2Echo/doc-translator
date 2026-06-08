@@ -10,9 +10,15 @@ STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-600}"
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.vps.yml)
 SERVICES=(postgres redis api worker web)
 NGINX_SITE_NAME="doc-translator"
-NGINX_SITE_PATH="/etc/nginx/sites-available/${NGINX_SITE_NAME}"
-NGINX_SITE_LINK="/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
-NGINX_DEFAULT_SITE_LINK="/etc/nginx/sites-enabled/default"
+OS_FAMILY=""
+OS_ID=""
+OS_MAJOR_VERSION=""
+OS_CODENAME=""
+PACKAGE_MANAGER=""
+NGINX_SITE_PATH=""
+NGINX_SITE_LINK=""
+NGINX_DEFAULT_SITE_LINK=""
+COMPOSE_COMMAND=()
 
 log() {
   printf '==> %s\n' "$*"
@@ -43,72 +49,205 @@ load_os_release() {
   # shellcheck disable=SC1091
   . /etc/os-release
 
-  case "${ID:-}" in
+  OS_ID="${ID:-}"
+  OS_MAJOR_VERSION="${VERSION_ID%%.*}"
+
+  case "${OS_ID}" in
     ubuntu|debian)
+      OS_FAMILY="debian"
+      PACKAGE_MANAGER="apt-get"
+      OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+      [[ -n "${OS_CODENAME}" ]] || die "Could not determine the distribution codename from /etc/os-release"
+      NGINX_SITE_PATH="/etc/nginx/sites-available/${NGINX_SITE_NAME}"
+      NGINX_SITE_LINK="/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
+      NGINX_DEFAULT_SITE_LINK="/etc/nginx/sites-enabled/default"
+      ;;
+    almalinux|rocky|rhel|centos|ol)
+      OS_FAMILY="rhel"
+      if has_command dnf; then
+        PACKAGE_MANAGER="dnf"
+      elif has_command yum; then
+        PACKAGE_MANAGER="yum"
+      else
+        die "Could not find dnf or yum on this RHEL-compatible host"
+      fi
+      NGINX_SITE_PATH="/etc/nginx/conf.d/${NGINX_SITE_NAME}.conf"
+      NGINX_SITE_LINK=""
+      NGINX_DEFAULT_SITE_LINK=""
       ;;
     *)
-      die "This script currently supports Ubuntu and Debian VPS hosts only"
+      if [[ " ${ID_LIKE:-} " == *" debian "* ]]; then
+        OS_FAMILY="debian"
+        PACKAGE_MANAGER="apt-get"
+        OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        [[ -n "${OS_CODENAME}" ]] || die "Could not determine the distribution codename from /etc/os-release"
+        NGINX_SITE_PATH="/etc/nginx/sites-available/${NGINX_SITE_NAME}"
+        NGINX_SITE_LINK="/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
+        NGINX_DEFAULT_SITE_LINK="/etc/nginx/sites-enabled/default"
+      elif [[ " ${ID_LIKE:-} " == *" rhel "* || " ${ID_LIKE:-} " == *" fedora "* ]]; then
+        OS_FAMILY="rhel"
+        if has_command dnf; then
+          PACKAGE_MANAGER="dnf"
+        elif has_command yum; then
+          PACKAGE_MANAGER="yum"
+        else
+          die "Could not find dnf or yum on this RHEL-compatible host"
+        fi
+        NGINX_SITE_PATH="/etc/nginx/conf.d/${NGINX_SITE_NAME}.conf"
+        NGINX_SITE_LINK=""
+        NGINX_DEFAULT_SITE_LINK=""
+      else
+        die "This script currently supports Ubuntu/Debian and AlmaLinux/RHEL-compatible VPS hosts only"
+      fi
       ;;
   esac
+}
 
-  OS_ID="${ID}"
-  OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
-  [[ -n "${OS_CODENAME}" ]] || die "Could not determine the distribution codename from /etc/os-release"
+package_update() {
+  case "${OS_FAMILY}" in
+    debian)
+      apt-get update
+      ;;
+    rhel)
+      "${PACKAGE_MANAGER}" makecache -y >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+package_install() {
+  case "${OS_FAMILY}" in
+    debian)
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      ;;
+    rhel)
+      "${PACKAGE_MANAGER}" install -y "$@"
+      ;;
+  esac
+}
+
+try_package_install() {
+  case "${OS_FAMILY}" in
+    debian)
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1
+      ;;
+    rhel)
+      "${PACKAGE_MANAGER}" install -y "$@" >/dev/null 2>&1
+      ;;
+  esac
+}
+
+has_compose_command() {
+  if has_command docker && docker compose version >/dev/null 2>&1; then
+    return 0
+  fi
+
+  has_command docker-compose
+}
+
+detect_compose_command() {
+  if has_command docker && docker compose version >/dev/null 2>&1; then
+    COMPOSE_COMMAND=(docker compose)
+    return
+  fi
+
+  if has_command docker-compose; then
+    COMPOSE_COMMAND=(docker-compose)
+    return
+  fi
+
+  die "Docker Compose was not found. Install docker compose plugin or docker-compose and rerun the script."
 }
 
 install_system_packages() {
   log "Installing system packages"
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  package_update
+  package_install \
     ca-certificates \
     curl \
     nginx \
     openssl
+
+  if [[ "${OS_FAMILY}" == "rhel" ]] && ! has_command setsebool; then
+    try_package_install policycoreutils-python-utils || try_package_install policycoreutils-python || true
+  fi
 }
 
 install_certbot() {
   if has_command certbot; then
     log "Certbot is already available"
   else
-    log "Installing Certbot for Nginx"
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      certbot \
-      python3-certbot-nginx
+    if [[ "${OS_FAMILY}" == "debian" ]]; then
+      log "Installing Certbot for Nginx"
+      package_update
+      package_install \
+        certbot \
+        python3-certbot-nginx
+    else
+      log "Installing Certbot for Nginx on AlmaLinux/RHEL-compatible host"
+      try_package_install epel-release || true
+      package_update
+      package_install snapd
+      systemctl enable --now snapd.socket
+      ln -sfn /var/lib/snapd/snap /snap
+      if ! snap list certbot >/dev/null 2>&1; then
+        snap install --classic certbot
+      fi
+      ln -sfn /snap/bin/certbot /usr/local/bin/certbot
+    fi
   fi
 
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 }
 
 install_docker() {
-  if has_command docker && docker compose version >/dev/null 2>&1; then
+  if has_command docker && has_compose_command; then
     log "Docker and docker compose are already available"
     return
   fi
 
   log "Installing Docker Engine and docker compose plugin"
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
+  if [[ "${OS_FAMILY}" == "debian" ]]; then
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
 
-  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
-    "$(dpkg --print-architecture)" \
-    "${OS_ID}" \
-    "${OS_CODENAME}" > /etc/apt/sources.list.d/docker.list
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+      "$(dpkg --print-architecture)" \
+      "${OS_ID}" \
+      "${OS_CODENAME}" > /etc/apt/sources.list.d/docker.list
 
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    containerd.io \
-    docker-buildx-plugin \
-    docker-ce \
-    docker-ce-cli \
-    docker-compose-plugin
+    package_update
+    package_install \
+      containerd.io \
+      docker-buildx-plugin \
+      docker-ce \
+      docker-ce-cli \
+      docker-compose-plugin
+  else
+    cat > /etc/yum.repos.d/docker-ce.repo <<'EOF'
+[docker-ce-stable]
+name=Docker CE Stable - $basearch
+baseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://download.docker.com/linux/centos/gpg
+EOF
+
+    package_update
+    package_install \
+      containerd.io \
+      docker-ce \
+      docker-ce-cli
+    try_package_install docker-buildx-plugin || true
+    try_package_install docker-compose-plugin || try_package_install docker-compose || true
+  fi
 }
 
 ensure_docker_ready() {
   log "Ensuring Docker daemon is running"
   systemctl enable --now docker
   docker info >/dev/null 2>&1 || die "Docker daemon is not available"
+  detect_compose_command
 }
 
 ensure_env_file() {
@@ -376,12 +515,34 @@ configure_nginx() {
 
   log "Configuring Nginx reverse proxy"
   write_nginx_config "${server_name}" "${upload_limit}" "${cert_fullchain_path}" "${cert_privkey_path}"
-  ln -sfn "${NGINX_SITE_PATH}" "${NGINX_SITE_LINK}"
-  rm -f "${NGINX_DEFAULT_SITE_LINK}"
+  if [[ -n "${NGINX_SITE_LINK}" ]]; then
+    ln -sfn "${NGINX_SITE_PATH}" "${NGINX_SITE_LINK}"
+  fi
+  if [[ -n "${NGINX_DEFAULT_SITE_LINK}" ]]; then
+    rm -f "${NGINX_DEFAULT_SITE_LINK}"
+  fi
 
   nginx -t
   systemctl enable --now nginx
   systemctl reload nginx
+}
+
+configure_host_networking() {
+  if [[ "${OS_FAMILY}" != "rhel" ]]; then
+    return
+  fi
+
+  if has_command getenforce && has_command setsebool && [[ "$(getenforce)" != "Disabled" ]]; then
+    log "Allowing Nginx to reach local upstreams under SELinux"
+    setsebool -P httpd_can_network_connect 1
+  fi
+
+  if has_command firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+    log "Opening HTTP and HTTPS in firewalld"
+    firewall-cmd --permanent --add-service=http >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-service=https >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
 }
 
 ensure_tls_certificate() {
@@ -493,8 +654,12 @@ configure_env() {
 run_compose() {
   (
     cd "${PROJECT_ROOT}"
-    docker compose "${COMPOSE_FILES[@]}" "$@"
+    "${COMPOSE_COMMAND[@]}" "${COMPOSE_FILES[@]}" "$@"
   )
+}
+
+compose_command_text() {
+  printf '%s' "${COMPOSE_COMMAND[*]}"
 }
 
 container_status() {
@@ -556,16 +721,18 @@ start_stack() {
 show_access_info() {
   local base_url
   local admin_email
+  local compose_command
 
   base_url="$(get_env_value APP_BASE_URL 2>/dev/null || printf 'http://localhost:3000')"
   admin_email="$(get_env_value ADMIN_EMAIL 2>/dev/null || printf 'admin@example.com')"
+  compose_command="$(compose_command_text)"
 
   printf '\nDeployment complete.\n'
   printf 'Web UI: %s\n' "${base_url}"
   printf 'Admin email: %s\n' "${admin_email}"
   printf '\nUseful commands:\n'
-  printf '  cd %s && docker compose %s ps\n' "${PROJECT_ROOT}" "${COMPOSE_FILES[*]}"
-  printf '  cd %s && docker compose %s logs -f --tail 200\n' "${PROJECT_ROOT}" "${COMPOSE_FILES[*]}"
+  printf '  cd %s && %s %s ps\n' "${PROJECT_ROOT}" "${compose_command}" "${COMPOSE_FILES[*]}"
+  printf '  cd %s && %s %s logs -f --tail 200\n' "${PROJECT_ROOT}" "${compose_command}" "${COMPOSE_FILES[*]}"
 }
 
 main() {
@@ -579,6 +746,7 @@ main() {
   configure_env
   start_stack
   wait_for_services
+  configure_host_networking
   configure_nginx
   ensure_tls_certificate
   configure_nginx

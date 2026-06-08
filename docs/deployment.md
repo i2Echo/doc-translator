@@ -13,7 +13,7 @@ The supported MVP deployment target is Docker Compose in a customer-controlled e
 For a fresh VPS, the repository now includes:
 
 - `bootstrap-vps.sh`, which clones or updates the repository from GitHub and then starts the project deployment flow
-- `deploy-vps.sh`, which installs Docker on Ubuntu or Debian, prepares `.env`, starts the compose stack, and waits for the health checks
+- `deploy-vps.sh`, which installs Docker on Ubuntu/Debian or AlmaLinux/RHEL-compatible hosts, prepares `.env`, starts the compose stack, and waits for the health checks
 - `.env.vps.example`, which is the editable production env template used to create `.env` on the VPS, including `CERTBOT_EMAIL`
 
 ## VPS One-Click Deploy
@@ -56,7 +56,8 @@ curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstra
 - start the stack with `docker-compose.yml` and `docker-compose.vps.yml`
 - wait until `postgres`, `redis`, `api`, `worker`, and `web` report healthy status
 - install and configure a host-level Nginx reverse proxy to `127.0.0.1:3000`
-- automatically obtain a Let's Encrypt certificate and enable `certbot.timer` when `APP_BASE_URL` uses `https://`
+- automatically obtain a Let's Encrypt certificate and set up automatic renewal when `APP_BASE_URL` uses `https://`
+- on AlmaLinux 8, use `dnf`, `snapd`, SELinux, and `firewalld` friendly defaults
 
 You can also run it non-interactively by exporting the required variables before execution, for example `MODEL_API_KEY`, `MODEL_BASE_URL`, `MODEL_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, optionally `CERTBOT_EMAIL`, and `APP_BASE_URL`.
 
@@ -82,15 +83,15 @@ It is created automatically from:
 The generated Nginx site file is:
 
 ```text
-/etc/nginx/sites-available/doc-translator
+Ubuntu/Debian: /etc/nginx/sites-available/doc-translator
+AlmaLinux/RHEL-compatible: /etc/nginx/conf.d/doc-translator.conf
 ```
 
 After deployment, open the URL you set in `APP_BASE_URL`.
 
-If HTTPS is enabled, `deploy-vps.sh` uses Certbot and enables automatic renewal through `certbot.timer`. You can verify it with:
+If HTTPS is enabled, `deploy-vps.sh` uses Certbot and enables automatic renewal. On AlmaLinux 8 the script installs Certbot through `snapd`; on Ubuntu or Debian it uses the distro packages. You can verify renewal with:
 
 ```bash
-sudo systemctl status certbot.timer
 sudo certbot renew --dry-run
 ```
 
@@ -133,6 +134,7 @@ Recommended reverse proxy behavior:
 - Forward traffic to `127.0.0.1:3000`
 - Set `client_max_body_size` to at least the configured `MAX_UPLOAD_MB`
 - Keep ports `80/443` open so Certbot can validate and renew domain certificates
+- On AlmaLinux 8, allow `httpd_can_network_connect` under SELinux and keep `firewalld` open for `http` and `https`
 - Restrict direct access to the published API port if the VPS is exposed to the public internet
 - Restrict network egress so only the chosen model endpoint is reachable if required by policy
 

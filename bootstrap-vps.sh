@@ -5,6 +5,8 @@ set -Eeuo pipefail
 REPO_URL="${REPO_URL:-https://github.com/i2Echo/doc-translator.git}"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/doc-translator}"
+OS_FAMILY=""
+PACKAGE_MANAGER=""
 
 log() {
   printf '==> %s\n' "$*"
@@ -30,17 +32,51 @@ assert_supported_os() {
 
   case "${ID:-}" in
     ubuntu|debian)
+      OS_FAMILY="debian"
+      PACKAGE_MANAGER="apt-get"
+      ;;
+    almalinux|rocky|rhel|centos|ol)
+      OS_FAMILY="rhel"
+      if command -v dnf >/dev/null 2>&1; then
+        PACKAGE_MANAGER="dnf"
+      elif command -v yum >/dev/null 2>&1; then
+        PACKAGE_MANAGER="yum"
+      else
+        die "Could not find dnf or yum on this RHEL-compatible host"
+      fi
       ;;
     *)
-      die "This script currently supports Ubuntu and Debian VPS hosts only"
+      if [[ " ${ID_LIKE:-} " == *" debian "* ]]; then
+        OS_FAMILY="debian"
+        PACKAGE_MANAGER="apt-get"
+      elif [[ " ${ID_LIKE:-} " == *" rhel "* || " ${ID_LIKE:-} " == *" fedora "* ]]; then
+        OS_FAMILY="rhel"
+        if command -v dnf >/dev/null 2>&1; then
+          PACKAGE_MANAGER="dnf"
+        elif command -v yum >/dev/null 2>&1; then
+          PACKAGE_MANAGER="yum"
+        else
+          die "Could not find dnf or yum on this RHEL-compatible host"
+        fi
+      else
+        die "This script currently supports Ubuntu/Debian and AlmaLinux/RHEL-compatible hosts only"
+      fi
       ;;
   esac
 }
 
 ensure_prerequisites() {
   log "Installing bootstrap prerequisites"
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  if [[ "${OS_FAMILY}" == "debian" ]]; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      ca-certificates \
+      git
+    return
+  fi
+
+  "${PACKAGE_MANAGER}" makecache -y >/dev/null 2>&1 || true
+  "${PACKAGE_MANAGER}" install -y \
     ca-certificates \
     git
 }
