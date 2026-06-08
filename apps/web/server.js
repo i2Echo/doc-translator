@@ -1,9 +1,12 @@
-const http = require("node:http");
-const { createReadStream, existsSync, statSync } = require("node:fs");
-const { readFile } = require("node:fs/promises");
-const path = require("node:path");
+import http from "node:http";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = __dirname;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const root = path.join(__dirname, "dist");
 const port = Number(process.env.PORT || 3000);
 const apiHost = process.env.API_PROXY_HOST || "api";
 const apiPort = Number(process.env.API_PROXY_PORT || 8000);
@@ -11,7 +14,9 @@ const apiPort = Number(process.env.API_PROXY_PORT || 8000);
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
   ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
 };

@@ -1,0 +1,347 @@
+<script setup>
+import { computed, reactive, watch } from "vue";
+import { useRouter } from "vue-router";
+import AppSelect from "../components/AppSelect.vue";
+import { copy, createUser, isAdmin, refreshAll, saveSettings, state, testModel, toggleUserState } from "../store";
+import { formatBytes, formatDate, formatRole } from "../utils";
+
+const props = defineProps({
+  page: {
+    type: String,
+    default: "settings",
+  },
+});
+
+const router = useRouter();
+const pages = ["settings", "users", "storage", "audit"];
+
+const settingsForm = reactive({
+  storage_mode: "local",
+  local_storage_path: "",
+  file_retention_days: 30,
+  model_base_url: "",
+  model_api_key: "",
+  model_name: "",
+  model_timeout_seconds: 120,
+  ocr_enabled: true,
+  ocr_language_hint: "chi_sim+eng",
+  max_upload_mb: 100,
+  max_concurrent_jobs: 2,
+});
+
+const userForm = reactive({
+  full_name: "",
+  email: "",
+  password: "",
+  role: "user",
+});
+const roleOptions = computed(() => [
+  { value: "user", label: copy("标准用户", "Standard user") },
+  { value: "admin", label: copy("管理员", "Admin") },
+]);
+
+const activePage = computed(() => (pages.includes(props.page) ? props.page : "settings"));
+
+watch(
+  () => state.settings,
+  (value) => {
+    if (!value) {
+      return;
+    }
+    Object.assign(settingsForm, value);
+  },
+  { immediate: true }
+);
+
+if (isAdmin.value && !state.settings) {
+  void refreshAll();
+}
+
+function navigate(page) {
+  router.replace(`/admin/${page}`);
+}
+
+async function submitSettings() {
+  try {
+    await saveSettings({
+      ...settingsForm,
+      file_retention_days: Number(settingsForm.file_retention_days),
+      model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
+      max_upload_mb: Number(settingsForm.max_upload_mb),
+      max_concurrent_jobs: Number(settingsForm.max_concurrent_jobs),
+    });
+  } catch (error) {
+    state.messages.settings = error.message;
+  }
+}
+
+async function runModelTest() {
+  try {
+    await testModel({
+      model_base_url: settingsForm.model_base_url,
+      model_api_key: settingsForm.model_api_key,
+      model_name: settingsForm.model_name,
+      model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
+    });
+  } catch (error) {
+    state.messages.settings = error.message;
+  }
+}
+
+async function submitUser() {
+  try {
+    await createUser({
+      ...userForm,
+      is_active: true,
+    });
+    userForm.full_name = "";
+    userForm.email = "";
+    userForm.password = "";
+    userForm.role = "user";
+  } catch (error) {
+    state.messages.users = error.message;
+  }
+}
+</script>
+
+<template>
+  <main class="admin-layout">
+    <section v-if="!isAdmin" class="panel empty-state">
+      {{ copy("只有管理员可以访问此页面。", "Only admins can access this page.") }}
+    </section>
+
+    <template v-else>
+      <section class="panel admin-nav-panel">
+        <div class="panel-heading">
+          <p class="eyebrow">{{ copy("管理后台", "Admin") }}</p>
+          <h2>{{ copy("系统设置与运营数据", "Settings and operations") }}</h2>
+        </div>
+
+        <div class="button-row tight">
+          <button
+            v-for="pageName in pages"
+            :key="pageName"
+            class="ghost-button"
+            :class="{ active: activePage === pageName }"
+            type="button"
+            @click="navigate(pageName)"
+          >
+            {{
+              pageName === "settings"
+                ? copy("设置", "Settings")
+                : pageName === "users"
+                  ? copy("用户", "Users")
+                  : pageName === "storage"
+                    ? copy("存储", "Storage")
+                    : copy("审计", "Audit")
+            }}
+          </button>
+        </div>
+      </section>
+
+      <section v-if="activePage === 'settings'" class="panel">
+        <div class="panel-heading">
+          <p class="eyebrow">{{ copy("模型与存储", "Model and storage") }}</p>
+          <h2>{{ copy("修改运行时配置", "Adjust runtime configuration") }}</h2>
+        </div>
+
+        <form class="form-stack" @submit.prevent="submitSettings">
+          <div class="compact-grid two-up">
+            <label class="field">
+              <span>Model base URL</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.model_base_url" type="url" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>Model name</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.model_name" type="text" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>Model API key</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.model_api_key" type="password" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("超时（秒）", "Timeout (seconds)") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.model_timeout_seconds" type="number" min="1" max="3600" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("存储模式", "Storage mode") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.storage_mode" type="text" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("本地存储路径", "Local storage path") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.local_storage_path" type="text" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("保留天数", "Retention days") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.file_retention_days" type="number" min="1" max="3650" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("上传上限（MB）", "Max upload (MB)") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.max_upload_mb" type="number" min="1" max="2048" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("最大并发任务", "Max concurrent jobs") }}</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.max_concurrent_jobs" type="number" min="1" max="16" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>OCR language hint</span>
+              <span class="control-shell">
+                <input v-model="settingsForm.ocr_language_hint" type="text" required />
+              </span>
+            </label>
+          </div>
+
+          <label class="switch-field">
+            <input v-model="settingsForm.ocr_enabled" class="switch-input" type="checkbox" />
+            <span class="switch-indicator" aria-hidden="true">
+              <span class="switch-thumb"></span>
+            </span>
+            <span class="switch-copy">{{ copy("为扫描 PDF 启用 OCR", "Enable OCR for scanned PDFs") }}</span>
+          </label>
+
+          <div class="button-row">
+            <button class="primary-button" type="submit" :disabled="state.pending.settings">
+              {{ state.pending.settings ? copy("保存中…", "Saving...") : copy("保存设置", "Save settings") }}
+            </button>
+            <button class="ghost-button" type="button" :disabled="state.pending.modelTest" @click="runModelTest">
+              {{ state.pending.modelTest ? copy("测试中…", "Testing...") : copy("测试连接", "Test connection") }}
+            </button>
+          </div>
+          <p v-if="state.messages.settings" class="message">{{ state.messages.settings }}</p>
+          <p v-if="state.settings?.privacy_notice" class="subtle">{{ state.settings.privacy_notice }}</p>
+        </form>
+      </section>
+
+      <section v-else-if="activePage === 'users'" class="panel">
+        <div class="panel-heading">
+          <p class="eyebrow">{{ copy("用户管理", "Users") }}</p>
+          <h2>{{ copy("新增账号并调整权限", "Create accounts and adjust access") }}</h2>
+        </div>
+
+        <form class="form-stack" @submit.prevent="submitUser">
+          <div class="compact-grid two-up">
+            <label class="field">
+              <span>{{ copy("姓名", "Full name") }}</span>
+              <span class="control-shell">
+                <input v-model="userForm.full_name" type="text" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("邮箱", "Email") }}</span>
+              <span class="control-shell">
+                <input v-model="userForm.email" type="email" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("密码", "Password") }}</span>
+              <span class="control-shell">
+                <input v-model="userForm.password" type="password" minlength="8" required />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("角色", "Role") }}</span>
+              <AppSelect
+                v-model="userForm.role"
+                :options="roleOptions"
+                :aria-label="copy('角色', 'Role')"
+              />
+            </label>
+          </div>
+          <div class="button-row">
+            <button class="primary-button" type="submit" :disabled="state.pending.userCreate">
+              {{ state.pending.userCreate ? copy("创建中…", "Creating...") : copy("创建用户", "Create user") }}
+            </button>
+          </div>
+          <p v-if="state.messages.users" class="message">{{ state.messages.users }}</p>
+        </form>
+
+        <div class="user-list">
+          <article v-for="user in state.users" :key="user.id" class="user-card">
+            <div>
+              <strong>{{ user.full_name }}</strong>
+              <p class="subtle">{{ user.email }}</p>
+            </div>
+            <div class="user-meta">
+              <span class="status-pill">{{ formatRole(user.role, copy) }}</span>
+              <span class="status-pill" :data-status="user.is_active ? 'completed' : 'cancelled'">
+                {{ user.is_active ? copy("启用中", "Active") : copy("已停用", "Disabled") }}
+              </span>
+            </div>
+            <div class="button-row tight">
+              <button class="ghost-button" type="button" @click="toggleUserState(user.id, { is_active: !user.is_active })">
+                {{ user.is_active ? copy("停用", "Disable") : copy("启用", "Enable") }}
+              </button>
+              <button
+                class="ghost-button"
+                type="button"
+                @click="toggleUserState(user.id, { role: user.role === 'admin' ? 'user' : 'admin' })"
+              >
+                {{ user.role === "admin" ? copy("降为用户", "Make user") : copy("提升管理员", "Make admin") }}
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section v-else-if="activePage === 'storage'" class="panel">
+        <div class="panel-heading">
+          <p class="eyebrow">{{ copy("存储概览", "Storage summary") }}</p>
+          <h2>{{ copy("文件体量与保留情况", "Files and retention footprint") }}</h2>
+        </div>
+
+        <div v-if="!state.storage" class="empty-state">{{ copy("正在加载存储信息…", "Loading storage metrics...") }}</div>
+        <div v-else class="compact-grid three-up">
+          <div class="meta-card">
+            <span>{{ copy("总占用", "Total size") }}</span>
+            <strong>{{ formatBytes(state.storage.total_bytes) }}</strong>
+          </div>
+          <div class="meta-card">
+            <span>{{ copy("有效文件", "Active files") }}</span>
+            <strong>{{ state.storage.active_file_count }}</strong>
+          </div>
+          <div class="meta-card">
+            <span>{{ copy("输出文件", "Output files") }}</span>
+            <strong>{{ state.storage.output_file_count }}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section v-else class="panel">
+        <div class="panel-heading">
+          <p class="eyebrow">{{ copy("审计日志", "Audit log") }}</p>
+          <h2>{{ copy("最近操作记录", "Recent actions") }}</h2>
+        </div>
+
+        <div class="timeline">
+          <article v-for="entry in state.audit" :key="entry.id" class="timeline-item">
+            <div class="timeline-item-head">
+              <strong>{{ entry.action }}</strong>
+              <span class="subtle">{{ formatDate(entry.created_at) }}</span>
+            </div>
+            <p class="subtle">
+              {{ entry.actor?.full_name || "System" }} · {{ entry.entity_type }} · {{ entry.entity_id || "—" }}
+            </p>
+          </article>
+        </div>
+      </section>
+    </template>
+  </main>
+</template>

@@ -1,4 +1,4 @@
-FROM sms-mvp-frontend:latest
+FROM python:3.12-alpine
 
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -9,8 +9,6 @@ ENV PYTHONPATH=/app/apps/api
 WORKDIR /app
 
 RUN apk add --no-cache \
-    python3 \
-    py3-pip \
     font-noto-cjk \
     tesseract-ocr \
     tesseract-ocr-data-eng \

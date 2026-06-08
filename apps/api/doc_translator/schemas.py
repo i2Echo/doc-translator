@@ -140,6 +140,7 @@ class JobPreviewPdfTableCellRead(BaseModel):
     row_span: int = Field(default=1, ge=1)
     col_span: int = Field(default=1, ge=1)
     rect: list[float] = Field(min_length=4, max_length=4)
+    font_name: str
     font_size_original: float
     font_size_current: float
     src_text: str

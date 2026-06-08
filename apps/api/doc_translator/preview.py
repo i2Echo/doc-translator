@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -17,6 +20,12 @@ from doc_translator.storage import file_checksum
 
 DOCX_PREVIEW_PARAGRAPH_LIMIT = 8
 DOCX_PREVIEW_CHAR_LIMIT = 2200
+PREVIEW_SCHEMA_VERSION = 4
+PDF_PREVIEW_TEXT_GRANULARITY = "line"
+PDF_CJK_SERIF_FONTFILE = "/usr/share/fonts/noto/NotoSerifCJK-Regular.ttc"
+PDF_CJK_SANS_FONTFILE = "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"
+PDF_CJK_SERIF_FONTNAME = "noto-serif-cjk"
+PDF_CJK_SANS_FONTNAME = "noto-sans-cjk"
 PDF_MIN_REDRAW_FONT_SIZE = 6.0
 PDF_EDITOR_MIN_FONT_SIZE = 8.0
 PDF_BLOCK_MERGE_IOU_THRESHOLD = 0.3
@@ -30,6 +39,16 @@ PDF_UNKNOWN_SPACING_PATTERN = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205
 PDF_ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]+")
 PDF_UNKNOWN_GLYPH_BLOCK_PATTERN = re.compile(r"[\u25a0-\u25ff\u2610\u2751\u2b1a\u2b1c\ufffd]+")
 PDF_MALFORMED_MULTIPLICATION_PATTERN = re.compile(r"(?<=\d)\s*[xX✕✖╳⨯*＊]\s*(?=\d)")
+PDF_WRAP_TOKEN_PATTERN = re.compile(r"\s+|[A-Za-z0-9_./:%#@&+=-]+|.")
+PDF_FONT_SUBSET_PREFIX_PATTERN = re.compile(r"^[A-Z]{6}\+")
+PDF_FONT_CAMEL_CASE_BOUNDARY_PATTERN = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+PDF_FONT_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
+PDF_FONT_IGNORED_TOKENS = frozenset({"ttf", "ttc", "otf", "psmt"})
+PDF_SERIF_FONT_HINTS = ("serif", "times", "roman", "song", "ming", "mincho", "cambria", "georgia")
+PDF_SANS_FONT_HINTS = ("sans", "arial", "helvetica", "gothic", "hei", "heiti", "grotesk")
+PDF_MONO_FONT_HINTS = ("mono", "courier", "consola", "fixed")
+PDF_SYMBOL_FONT_HINTS = ("symbol", "dingbat", "wingding")
+PDF_BOLD_FONT_HINTS = ("bold", "black", "heavy", "demi", "semibold")
 
 
 @dataclass(slots=True)
@@ -55,6 +74,27 @@ class PdfPreviewWord:
     block_index: int
     line_index: int
     word_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class PdfPageFontResource:
+    resource_name: str
+    display_name: str
+    tokens: tuple[str, ...]
+    normalized_display_name: str
+    normalized_resource_name: str
+    is_bold: bool
+    font_buffer: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PdfRenderFont:
+    render_name: str
+    render_file: str | None = None
+    render_buffer: bytes | None = None
+    metrics_name: str = "helv"
+    metrics_file: str | None = None
+    metrics_buffer: bytes | None = None
 
 
 def preview_sidecar_path(output_path: str) -> Path:
@@ -91,6 +131,58 @@ def _sanitize_pdf_text(text: str) -> str:
     return _normalize_pdf_block_text("\n".join(lines))
 
 
+def _sanitize_pdf_preview_edit_text(text: str) -> tuple[str, bool]:
+    normalized_text = _sanitize_pdf_text(text)
+    if not normalized_text:
+        return "", normalized_text != str(text or "")
+
+    deduped_lines: list[str] = []
+    seen_long_lines: set[str] = set()
+    changed = normalized_text != str(text or "")
+
+    for line in normalized_text.split("\n"):
+        normalized_line = re.sub(r"\s+", "", line)
+        if deduped_lines and normalized_line == re.sub(r"\s+", "", deduped_lines[-1]):
+            changed = True
+            continue
+        if len(deduped_lines) >= 2:
+            recent_normalized_lines = [re.sub(r"\s+", "", existing_line) for existing_line in deduped_lines[-3:]]
+            if len(normalized_line) >= 8 and any(
+                normalized_line == f"{left}{right}"
+                for index, left in enumerate(recent_normalized_lines)
+                for right in recent_normalized_lines[index + 1 :]
+            ):
+                changed = True
+                continue
+        if len(normalized_line) >= 8 and normalized_line in seen_long_lines:
+            changed = True
+            continue
+        if len(normalized_line) >= 8:
+            similar_existing_line = next(
+                (
+                    index
+                    for index, existing_line in enumerate(deduped_lines)
+                    if len(re.sub(r"\s+", "", existing_line)) >= 8
+                    and SequenceMatcher(None, normalized_line, re.sub(r"\s+", "", existing_line)).ratio() >= 0.85
+                ),
+                None,
+            )
+            if similar_existing_line is not None:
+                changed = True
+                existing_line = deduped_lines[similar_existing_line]
+                if len(normalized_line) > len(re.sub(r"\s+", "", existing_line)):
+                    deduped_lines[similar_existing_line] = line
+                    seen_long_lines.discard(re.sub(r"\s+", "", existing_line))
+                    seen_long_lines.add(normalized_line)
+                continue
+        deduped_lines.append(line)
+        if len(normalized_line) >= 8:
+            seen_long_lines.add(normalized_line)
+
+    sanitized = _normalize_pdf_block_text("\n".join(deduped_lines))
+    return sanitized, changed or sanitized != normalized_text
+
+
 def _has_codepoint_in_ranges(text: str, ranges: tuple[tuple[str, str], ...]) -> bool:
     return any(start <= char <= end for char in text for start, end in ranges)
 
@@ -109,9 +201,265 @@ def _select_pdf_font(text: str) -> str:
             ("\uff00", "\uffef"),
             ("\u0400", "\u04ff"),
         ),
-    ):
+        ):
         return "china-s"
     return "helv"
+
+
+def _tokenize_pdf_font_name(font_name: str) -> tuple[str, ...]:
+    if not font_name:
+        return ()
+
+    expanded = PDF_FONT_SUBSET_PREFIX_PATTERN.sub("", str(font_name or ""))
+    expanded = PDF_FONT_CAMEL_CASE_BOUNDARY_PATTERN.sub(" ", expanded)
+    tokens = [
+        token
+        for token in PDF_FONT_SPLIT_PATTERN.split(expanded.casefold())
+        if token and token not in PDF_FONT_IGNORED_TOKENS
+    ]
+    return tuple(tokens)
+
+
+def _normalize_pdf_font_name(font_name: str) -> str:
+    return "".join(_tokenize_pdf_font_name(font_name))
+
+
+def _pdf_font_name_has_hint(font_name: str, hints: tuple[str, ...]) -> bool:
+    normalized_name = _normalize_pdf_font_name(font_name)
+    return any(hint in normalized_name for hint in hints)
+
+
+def _pdf_font_tokens_match(candidate_tokens: tuple[str, ...], preferred_tokens: tuple[str, ...]) -> int:
+    score = 0
+    for preferred in preferred_tokens:
+        if len(preferred) < 3:
+            if preferred in candidate_tokens:
+                score += 4
+            continue
+        if any(
+            candidate == preferred or candidate.startswith(preferred) or preferred.startswith(candidate)
+            for candidate in candidate_tokens
+        ):
+            score += 10
+    return score
+
+
+def _pdf_font_resource_score(
+    resource: PdfPageFontResource,
+    preferred_font_name: str,
+    *,
+    wants_bold: bool,
+) -> int:
+    preferred_tokens = _tokenize_pdf_font_name(preferred_font_name)
+    preferred_normalized = _normalize_pdf_font_name(preferred_font_name)
+    score = _pdf_font_tokens_match(resource.tokens, preferred_tokens)
+    if preferred_normalized:
+        if preferred_normalized == resource.normalized_display_name or preferred_normalized == resource.normalized_resource_name:
+            score += 100
+        elif preferred_normalized in resource.normalized_display_name or preferred_normalized in resource.normalized_resource_name:
+            score += 75
+        elif resource.normalized_display_name and resource.normalized_display_name in preferred_normalized:
+            score += 60
+        elif resource.normalized_resource_name and resource.normalized_resource_name in preferred_normalized:
+            score += 60
+    if wants_bold == resource.is_bold:
+        score += 4
+    elif wants_bold and not resource.is_bold:
+        score -= 4
+    return score
+
+
+def _font_name_is_serif(font_name: str) -> bool:
+    return _pdf_font_name_has_hint(font_name, PDF_SERIF_FONT_HINTS)
+
+
+def _font_name_is_mono(font_name: str) -> bool:
+    return _pdf_font_name_has_hint(font_name, PDF_MONO_FONT_HINTS)
+
+
+def _font_name_is_symbol(font_name: str) -> bool:
+    return _pdf_font_name_has_hint(font_name, PDF_SYMBOL_FONT_HINTS)
+
+
+def _font_name_is_bold(font_name: str) -> bool:
+    return _pdf_font_name_has_hint(font_name, PDF_BOLD_FONT_HINTS)
+
+
+def _extract_page_font_resources(page: fitz.Page) -> tuple[PdfPageFontResource, ...]:
+    resources: list[PdfPageFontResource] = []
+    seen_resource_names: set[str] = set()
+    document = page.parent
+
+    for font_details in page.get_fonts(full=True):
+        font_xref = int(font_details[0])
+        resource_name = str(font_details[4] or font_details[3] or "").strip()
+        if not resource_name or resource_name in seen_resource_names:
+            continue
+        seen_resource_names.add(resource_name)
+
+        display_name = str(font_details[3] or resource_name).strip()
+        tokens = _tokenize_pdf_font_name(f"{display_name} {resource_name}")
+        font_buffer = None
+        if document is not None:
+            try:
+                _, _, _, extracted_buffer = document.extract_font(font_xref)
+            except Exception:
+                extracted_buffer = b""
+            font_buffer = extracted_buffer or None
+        resources.append(
+            PdfPageFontResource(
+                resource_name=resource_name,
+                display_name=display_name,
+                tokens=tokens,
+                normalized_display_name=_normalize_pdf_font_name(display_name),
+                normalized_resource_name=_normalize_pdf_font_name(resource_name),
+                is_bold=_font_name_is_bold(f"{display_name} {resource_name}"),
+                font_buffer=font_buffer,
+            )
+        )
+
+    return tuple(resources)
+
+
+def _match_page_font_resource(
+    page_fonts: tuple[PdfPageFontResource, ...],
+    preferred_font_name: str,
+    *,
+    wants_bold: bool,
+) -> PdfPageFontResource | None:
+    if not preferred_font_name:
+        return None
+
+    best_match: PdfPageFontResource | None = None
+    best_score = 0
+    for resource in page_fonts:
+        score = _pdf_font_resource_score(resource, preferred_font_name, wants_bold=wants_bold)
+        if score > best_score:
+            best_match = resource
+            best_score = score
+    return best_match if best_score >= 20 else None
+
+
+def _fallback_page_font_resource(
+    page_fonts: tuple[PdfPageFontResource, ...],
+    *,
+    wants_serif: bool,
+    wants_mono: bool,
+    wants_symbol: bool,
+    wants_bold: bool,
+) -> PdfPageFontResource | None:
+    best_match: PdfPageFontResource | None = None
+    best_score = 0
+
+    for resource in page_fonts:
+        score = 0
+        name = f"{resource.display_name} {resource.resource_name}"
+        if wants_symbol and _font_name_is_symbol(name):
+            score += 12
+        elif wants_mono and _font_name_is_mono(name):
+            score += 10
+        elif wants_serif and _font_name_is_serif(name):
+            score += 10
+        elif not wants_serif and _pdf_font_name_has_hint(name, PDF_SANS_FONT_HINTS):
+            score += 8
+        if wants_bold == resource.is_bold:
+            score += 3
+        if score > best_score:
+            best_match = resource
+            best_score = score
+
+    return best_match if best_score > 0 else None
+
+
+def _resolve_pdf_render_font(
+    text: str,
+    *,
+    preferred_font_name: str = "",
+    page_fonts: tuple[PdfPageFontResource, ...] = (),
+    prefer_external_cjk_font: bool = False,
+) -> PdfRenderFont:
+    wants_serif = _font_name_is_serif(preferred_font_name)
+    wants_mono = _font_name_is_mono(preferred_font_name)
+    wants_symbol = _font_name_is_symbol(preferred_font_name)
+    wants_bold = _font_name_is_bold(preferred_font_name)
+    script_font = _select_pdf_font(text or preferred_font_name)
+    uses_cjk_font = script_font in {"china-s", "japan", "korea"}
+
+    if uses_cjk_font and prefer_external_cjk_font:
+        font_name = PDF_CJK_SERIF_FONTNAME if wants_serif else PDF_CJK_SANS_FONTNAME
+        font_file = PDF_CJK_SERIF_FONTFILE if wants_serif else PDF_CJK_SANS_FONTFILE
+        return PdfRenderFont(
+            render_name=font_name,
+            render_file=font_file,
+            metrics_name=font_name,
+            metrics_file=font_file,
+        )
+
+    matched_resource = _match_page_font_resource(page_fonts, preferred_font_name, wants_bold=wants_bold)
+    if matched_resource is None:
+        matched_resource = _fallback_page_font_resource(
+            page_fonts,
+            wants_serif=wants_serif,
+            wants_mono=wants_mono,
+            wants_symbol=wants_symbol,
+            wants_bold=wants_bold,
+        )
+
+    if matched_resource is not None:
+        if uses_cjk_font:
+            metrics_name = PDF_CJK_SERIF_FONTNAME if wants_serif else PDF_CJK_SANS_FONTNAME
+            metrics_file = PDF_CJK_SERIF_FONTFILE if wants_serif else PDF_CJK_SANS_FONTFILE
+        elif wants_mono:
+            metrics_name = "cour"
+            metrics_file = None
+        elif wants_symbol:
+            metrics_name = "symbol"
+            metrics_file = None
+        elif wants_serif:
+            metrics_name = "Times-Roman"
+            metrics_file = None
+        else:
+            metrics_name = "helv"
+            metrics_file = None
+
+        render_name = matched_resource.resource_name
+        render_buffer = None
+        metrics_buffer = None
+        if matched_resource.font_buffer:
+            render_name = f"dtf_{matched_resource.normalized_resource_name or matched_resource.normalized_display_name or 'font'}"
+            render_buffer = matched_resource.font_buffer
+            metrics_buffer = matched_resource.font_buffer if not uses_cjk_font else None
+
+        return PdfRenderFont(
+            render_name=render_name,
+            render_buffer=render_buffer,
+            metrics_name=metrics_name,
+            metrics_file=metrics_file,
+            metrics_buffer=metrics_buffer,
+        )
+
+    if uses_cjk_font:
+        return PdfRenderFont(
+            render_name="china-s",
+            metrics_name=PDF_CJK_SERIF_FONTNAME if wants_serif else PDF_CJK_SANS_FONTNAME,
+            metrics_file=PDF_CJK_SERIF_FONTFILE if wants_serif else PDF_CJK_SANS_FONTFILE,
+        )
+    if wants_symbol:
+        return PdfRenderFont(render_name="symbol", metrics_name="symbol")
+    if wants_mono:
+        return PdfRenderFont(render_name="cour", metrics_name="cour")
+    if wants_serif:
+        return PdfRenderFont(render_name="Times-Roman", metrics_name="Times-Roman")
+    return PdfRenderFont(render_name="helv", metrics_name="helv")
+
+
+@lru_cache(maxsize=16)
+def _pdf_metrics_font(font_name: str, font_file: str | None, font_buffer: bytes | None) -> fitz.Font:
+    if font_buffer:
+        return fitz.Font(fontname=font_name or None, fontbuffer=font_buffer)
+    if font_file:
+        return fitz.Font(fontname=font_name, fontfile=font_file)
+    return fitz.Font(fontname=font_name)
 
 
 def _rect_iou(left: fitz.Rect, right: fitz.Rect) -> float:
@@ -240,11 +588,10 @@ def _extract_pdf_text_fragments(page: fitz.Page) -> list[PdfPreviewFragment]:
         if block.get("type") != 0:
             continue
 
-        lines: list[str] = []
-        font_names: list[str] = []
-        font_sizes: list[float] = []
         for line in block.get("lines", []):
             line_parts: list[str] = []
+            font_names: list[str] = []
+            font_sizes: list[float] = []
             for span in line.get("spans", []):
                 span_text = span.get("text", "")
                 if not span_text.strip():
@@ -257,15 +604,11 @@ def _extract_pdf_text_fragments(page: fitz.Page) -> list[PdfPreviewFragment]:
                 if isinstance(span_size, (int, float)):
                     font_sizes.append(float(span_size))
             line_text = _sanitize_pdf_text("".join(line_parts))
-            if line_text:
-                lines.append(line_text)
+            if not line_text:
+                continue
 
-        text = _normalize_pdf_block_text("\n".join(lines))
-        if not text:
-            continue
-
-        bbox = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
-        fragments.append(PdfPreviewFragment(rect=bbox, text=text, font_names=font_names, font_sizes=font_sizes))
+            bbox = fitz.Rect(line.get("bbox") or block.get("bbox", (0, 0, 0, 0)))
+            fragments.append(PdfPreviewFragment(rect=bbox, text=line_text, font_names=font_names, font_sizes=font_sizes))
 
     return fragments
 
@@ -301,7 +644,7 @@ def _extract_page_text_in_rect(
 ) -> str:
     if page is None:
         return ""
-    return _sanitize_pdf_text(page.get_textbox(rect, textpage=textpage))
+    return _sanitize_pdf_preview_edit_text(page.get_textbox(rect, textpage=textpage))[0]
 
 
 def _extract_clipped_words_text_in_rect(
@@ -335,7 +678,8 @@ def _extract_clipped_words_text_in_rect(
         lines.append(current_words)
 
     extracted_text = _normalize_pdf_block_text("\n".join(" ".join(line).strip() for line in lines if line))
-    return extracted_text or _extract_page_text_in_rect(page, rect, textpage=textpage)
+    sanitized_text = _sanitize_pdf_preview_edit_text(extracted_text)[0]
+    return sanitized_text or _extract_page_text_in_rect(page, rect, textpage=textpage)
 
 
 def _word_belongs_to_rect(word: PdfPreviewWord, rect: fitz.Rect) -> bool:
@@ -346,8 +690,31 @@ def _word_belongs_to_rect(word: PdfPreviewWord, rect: fitz.Rect) -> bool:
     return _rect_overlap_ratio(word.rect, rect) >= 0.5 or _rect_overlap_ratio(rect, word.rect) >= 0.5
 
 
+def _fragment_belongs_to_rect(fragment: PdfPreviewFragment, rect: fitz.Rect) -> bool:
+    center_x = (fragment.rect.x0 + fragment.rect.x1) / 2
+    center_y = (fragment.rect.y0 + fragment.rect.y1) / 2
+    if rect.x0 <= center_x <= rect.x1 and rect.y0 <= center_y <= rect.y1:
+        return True
+    return _rect_overlap_ratio(fragment.rect, rect) >= 0.5 or _rect_overlap_ratio(rect, fragment.rect) >= 0.5
+
+
 def _extract_words_text_in_rect(words: list[PdfPreviewWord], rect: fitz.Rect) -> str:
-    selected_words = [word for word in words if _word_belongs_to_rect(word, rect)]
+    selected_words: list[PdfPreviewWord] = []
+    seen_words: set[tuple[float, float, float, float, str]] = set()
+    for word in words:
+        if not _word_belongs_to_rect(word, rect):
+            continue
+        word_key = (
+            round(word.rect.x0, 2),
+            round(word.rect.y0, 2),
+            round(word.rect.x1, 2),
+            round(word.rect.y1, 2),
+            word.text,
+        )
+        if word_key in seen_words:
+            continue
+        seen_words.add(word_key)
+        selected_words.append(word)
     if not selected_words:
         return ""
 
@@ -389,7 +756,8 @@ def _extract_words_text_in_rect(words: list[PdfPreviewWord], rect: fitz.Rect) ->
     if current_line:
         lines.append(current_line)
 
-    return _normalize_pdf_block_text("\n".join(" ".join(line).strip() for line in lines if line))
+    extracted_text = _normalize_pdf_block_text("\n".join(" ".join(line).strip() for line in lines if line))
+    return _sanitize_pdf_preview_edit_text(extracted_text)[0]
 
 
 def _average_font_size_in_rect(fragments: list[PdfPreviewFragment], rect: fitz.Rect) -> float:
@@ -402,6 +770,210 @@ def _average_font_size_in_rect(fragments: list[PdfPreviewFragment], rect: fitz.R
     return round(sum(font_sizes) / len(font_sizes), 2) if font_sizes else 11.0
 
 
+def _dominant_font_name_in_rect(fragments: list[PdfPreviewFragment], rect: fitz.Rect, *, fallback_text: str = "") -> str:
+    font_names = [
+        font_name
+        for fragment in fragments
+        if _rect_overlap_ratio(fragment.rect, rect) >= 0.5 or _rect_overlap_ratio(rect, fragment.rect) >= 0.5
+        for font_name in fragment.font_names
+        if font_name
+    ]
+    if font_names:
+        return Counter(font_names).most_common(1)[0][0]
+    return _select_pdf_font(fallback_text)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _line_fragments_in_rect(fragments: list[PdfPreviewFragment], rect: fitz.Rect) -> list[PdfPreviewFragment]:
+    return sorted((fragment for fragment in fragments if _fragment_belongs_to_rect(fragment, rect)), key=_pdf_fragment_sort_key)
+
+
+def _merge_line_fragments_for_layout(fragments: list[PdfPreviewFragment]) -> list[PdfPreviewFragment]:
+    if not fragments:
+        return []
+
+    merged: list[PdfPreviewFragment] = [fragments[0]]
+    for fragment in fragments[1:]:
+        current = merged[-1]
+        current_center = (current.rect.y0 + current.rect.y1) / 2
+        fragment_center = (fragment.rect.y0 + fragment.rect.y1) / 2
+        horizontal_gap = fragment.rect.x0 - current.rect.x1
+        same_line_band = abs(fragment_center - current_center) <= 2.5
+        if same_line_band and horizontal_gap <= 18.0:
+            merged[-1] = PdfPreviewFragment(
+                rect=fitz.Rect(
+                    min(current.rect.x0, fragment.rect.x0),
+                    min(current.rect.y0, fragment.rect.y0),
+                    max(current.rect.x1, fragment.rect.x1),
+                    max(current.rect.y1, fragment.rect.y1),
+                ),
+                text=_normalize_pdf_block_text(f"{current.text} {fragment.text}"),
+                font_names=[*current.font_names, *fragment.font_names],
+                font_sizes=[*current.font_sizes, *fragment.font_sizes],
+            )
+            continue
+        merged.append(fragment)
+
+    return merged
+
+
+def _build_pdf_line_rects(
+    rect: fitz.Rect,
+    line_fragments: list[PdfPreviewFragment],
+    font_size: float,
+    *,
+    full_width: bool = False,
+) -> tuple[list[fitz.Rect], int]:
+    if not line_fragments:
+        return [], 0
+
+    min_x0 = max(rect.x0, min(fragment.rect.x0 for fragment in line_fragments) - 1.5)
+    max_x1 = min(rect.x1, max(fragment.rect.x1 for fragment in line_fragments) + 1.5)
+    fragment_heights = [fragment.rect.height for fragment in line_fragments if fragment.rect.height > 0]
+    fragment_centers = [(fragment.rect.y0 + fragment.rect.y1) / 2 for fragment in line_fragments]
+    line_height = max(_median(fragment_heights), font_size * 1.12, PDF_MIN_REDRAW_FONT_SIZE + 1.0)
+    vertical_steps = [
+        fragment_centers[index + 1] - fragment_centers[index]
+        for index in range(len(fragment_centers) - 1)
+        if fragment_centers[index + 1] - fragment_centers[index] > 1.0
+    ]
+    vertical_step = max(_median(vertical_steps), font_size * 1.05, PDF_MIN_REDRAW_FONT_SIZE + 0.5)
+
+    line_rects: list[fitz.Rect] = []
+    for fragment, center_y in zip(line_fragments, fragment_centers, strict=False):
+        y0 = max(rect.y0, center_y - line_height / 2)
+        y1 = min(rect.y1, center_y + line_height / 2)
+        if y1 - y0 < font_size:
+            y1 = min(rect.y1, y0 + max(line_height, font_size * 1.1))
+        if full_width:
+            x0 = min_x0
+            x1 = max_x1
+        else:
+            x0 = max(rect.x0, fragment.rect.x0 - 1.5)
+            x1 = min(rect.x1, fragment.rect.x1 + 1.5)
+        line_rects.append(fitz.Rect(x0, y0, x1, y1))
+
+    base_count = len(line_rects)
+    next_center_y = fragment_centers[-1] + vertical_step
+    last_line_rect = line_rects[-1]
+    while next_center_y + line_height / 2 <= rect.y1 + 0.5:
+        y0 = max(rect.y0, next_center_y - line_height / 2)
+        y1 = min(rect.y1, next_center_y + line_height / 2)
+        line_rects.append(fitz.Rect(last_line_rect.x0, y0, last_line_rect.x1, y1))
+        next_center_y += vertical_step
+
+    return line_rects, base_count
+
+
+def _tokenize_pdf_wrap_text(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in PDF_WRAP_TOKEN_PATTERN.findall(text):
+        if token.isspace():
+            if tokens and not tokens[-1].isspace():
+                tokens.append(" ")
+            continue
+        tokens.append(token)
+
+    while tokens and tokens[-1].isspace():
+        tokens.pop()
+    return tokens
+
+
+def _pdf_text_width(text: str, font: PdfRenderFont, font_size: float) -> float:
+    if not text:
+        return 0.0
+    return _pdf_metrics_font(font.metrics_name, font.metrics_file, font.metrics_buffer).text_length(
+        text,
+        fontsize=font_size,
+    )
+
+
+def _split_pdf_wrap_token(token: str, max_width: float, font: PdfRenderFont, font_size: float) -> tuple[str, str]:
+    if not token:
+        return "", ""
+
+    prefix = ""
+    for index, char in enumerate(token, start=1):
+        candidate = prefix + char
+        if _pdf_text_width(candidate, font, font_size) <= max_width:
+            prefix = candidate
+            continue
+        if prefix:
+            return prefix, token[index - 1 :]
+        return "", token
+
+    return prefix, ""
+
+
+def _wrap_pdf_text_to_widths(
+    text: str,
+    widths: list[float],
+    font: PdfRenderFont,
+    font_size: float,
+) -> list[str] | None:
+    paragraphs = text.split("\n")
+    lines: list[str] = []
+    line_index = 0
+
+    for paragraph in paragraphs:
+        if paragraph == "":
+            if line_index >= len(widths):
+                return None
+            lines.append("")
+            line_index += 1
+            continue
+
+        tokens = _tokenize_pdf_wrap_text(paragraph)
+        current = ""
+
+        while tokens:
+            if line_index >= len(widths):
+                return None
+
+            token = tokens.pop(0)
+            width = max(widths[line_index] - 1.0, 1.0)
+            candidate = f"{current}{token}"
+
+            if candidate and _pdf_text_width(candidate, font, font_size) <= width:
+                current = candidate
+                continue
+
+            if current:
+                lines.append(current.rstrip())
+                line_index += 1
+                current = ""
+                stripped_token = token.lstrip()
+                if stripped_token:
+                    tokens.insert(0, stripped_token)
+                continue
+
+            split_token, remainder = _split_pdf_wrap_token(token.lstrip(), width, font, font_size)
+            if not split_token:
+                return None
+            lines.append(split_token.rstrip())
+            line_index += 1
+            if remainder:
+                tokens.insert(0, remainder)
+
+        if current:
+            if line_index >= len(widths):
+                return None
+            lines.append(current.rstrip())
+            line_index += 1
+
+    return lines
+
+
 def _build_pdf_text_blocks(
     fragments: list[PdfPreviewFragment],
     *,
@@ -410,7 +982,7 @@ def _build_pdf_text_blocks(
     source_textpage: fitz.TextPage | None,
     target_textpage: fitz.TextPage | None,
 ) -> list[dict[str, object]]:
-    merged_blocks = _cluster_pdf_fragments(fragments)
+    merged_blocks = sorted(fragments, key=_pdf_fragment_sort_key)
     return [
         {
             "type": "text",
@@ -508,6 +1080,17 @@ def _extract_pdf_table_blocks(
                 col_start = _grid_index_for_position(x_positions, rect.x0)
                 col_end = _grid_index_for_position(x_positions, rect.x1)
                 font_size = _average_font_size_in_rect(font_fragments, rect)
+                source_text = _extract_clipped_words_text_in_rect(
+                    source_page,
+                    rect,
+                    textpage=source_textpage,
+                )
+                target_text = _extract_words_text_in_rect(target_words, rect)
+                font_name = _dominant_font_name_in_rect(
+                    font_fragments,
+                    rect,
+                    fallback_text=target_text or source_text,
+                )
 
                 cells.append(
                     {
@@ -517,14 +1100,11 @@ def _extract_pdf_table_blocks(
                         "row_span": max(row_end - row_start, 1),
                         "col_span": max(col_end - col_start, 1),
                         "rect": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
+                        "font_name": font_name,
                         "font_size_original": font_size,
                         "font_size_current": font_size,
-                        "src_text": _extract_clipped_words_text_in_rect(
-                            source_page,
-                            rect,
-                            textpage=source_textpage,
-                        ),
-                        "tgt_text": _extract_words_text_in_rect(target_words, rect),
+                        "src_text": source_text,
+                        "tgt_text": target_text,
                     }
                 )
 
@@ -719,7 +1299,8 @@ def build_job_preview(job: TranslationJob, *, created_at: str | None = None) -> 
         raise ValueError(f"Unsupported preview format: {extension}")
 
     now = _utcnow_iso()
-    return {
+    payload = {
+        "schema_version": PREVIEW_SCHEMA_VERSION,
         "job_id": job.id,
         "title": job.input_file.original_name,
         "output_name": job.output_file.original_name,
@@ -730,6 +1311,9 @@ def build_job_preview(job: TranslationJob, *, created_at: str | None = None) -> 
         "updated_at": now,
         "pages": pages,
     }
+    if document_kind == "pdf":
+        payload["pdf_text_granularity"] = PDF_PREVIEW_TEXT_GRANULARITY
+    return payload
 
 
 def _write_preview(path: Path, payload: dict) -> None:
@@ -741,6 +1325,9 @@ def _write_preview(path: Path, payload: dict) -> None:
 
 
 def _preview_matches_schema(payload: dict, extension: str) -> bool:
+    schema_version = payload.get("schema_version")
+    if schema_version is not None and not isinstance(schema_version, int):
+        return False
     if extension == ".pdf":
         return payload.get("document_kind") == "pdf" and all(
             isinstance(page, dict)
@@ -763,7 +1350,308 @@ def _preview_matches_schema(payload: dict, extension: str) -> bool:
     return False
 
 
-def load_or_create_preview(job: TranslationJob, *, force: bool = False) -> dict:
+def _preview_uses_line_granularity(payload: dict) -> bool:
+    return payload.get("document_kind") != "pdf" or payload.get("pdf_text_granularity") == PDF_PREVIEW_TEXT_GRANULARITY
+
+
+def _preview_needs_pdf_font_metadata(payload: dict) -> bool:
+    if payload.get("document_kind") != "pdf":
+        return False
+
+    for page in payload.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for block in page.get("blocks", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "table":
+                for cell in block.get("cells", []):
+                    if isinstance(cell, dict) and not str(cell.get("font_name", "")).strip():
+                        return True
+                continue
+            if not str(block.get("font_name", "")).strip():
+                return True
+    return False
+
+
+def _cleanup_pdf_preview_text_content(preview: dict) -> bool:
+    if preview.get("document_kind") != "pdf":
+        return False
+
+    changed = False
+    for page in preview.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for block in page.get("blocks", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "table":
+                for cell in block.get("cells", []):
+                    if not isinstance(cell, dict):
+                        continue
+                    original_size = float(cell.get("font_size_original") or 0.0)
+                    current_size = float(cell.get("font_size_current") or 0.0)
+                    if original_size > current_size:
+                        cell["font_size_current"] = original_size
+                        changed = True
+                    for field_name in ("src_text", "tgt_text"):
+                        sanitized_text, field_changed = _sanitize_pdf_preview_edit_text(str(cell.get(field_name, "")))
+                        if field_changed:
+                            cell[field_name] = sanitized_text
+                            changed = True
+                    continue
+
+            original_size = float(block.get("font_size_original") or 0.0)
+            current_size = float(block.get("font_size_current") or 0.0)
+            if original_size > current_size:
+                block["font_size_current"] = original_size
+                changed = True
+            for field_name in ("src_text", "tgt_text"):
+                sanitized_text, field_changed = _sanitize_pdf_preview_edit_text(str(block.get(field_name, "")))
+                if field_changed:
+                    block[field_name] = sanitized_text
+                    changed = True
+
+    if changed:
+        preview["schema_version"] = PREVIEW_SCHEMA_VERSION
+        preview["updated_at"] = _utcnow_iso()
+    return changed
+
+
+def _enrich_pdf_preview_font_metadata(preview: dict, job: TranslationJob) -> bool:
+    if job.output_file is None:
+        raise ValueError("Preview is unavailable until translation output is created")
+
+    output_path = Path(job.output_file.storage_path)
+    if not output_path.exists():
+        return False
+
+    source_path = Path(job.input_file.storage_path)
+    source_document = fitz.open(source_path) if source_path.exists() else None
+    output_document = fitz.open(output_path)
+    changed = False
+
+    try:
+        for page_index, preview_page in enumerate(preview.get("pages", [])):
+            if not isinstance(preview_page, dict):
+                continue
+
+            output_page = output_document.load_page(page_index) if page_index < output_document.page_count else None
+            source_page = (
+                source_document.load_page(page_index)
+                if source_document is not None and page_index < source_document.page_count
+                else None
+            )
+            font_fragments = _extract_pdf_text_fragments(output_page) if output_page is not None else []
+            if not font_fragments and source_page is not None:
+                font_fragments = _extract_pdf_text_fragments(source_page)
+
+            for block in preview_page.get("blocks", []):
+                if not isinstance(block, dict):
+                    continue
+
+                if block.get("type") == "table":
+                    for cell in block.get("cells", []):
+                        if not isinstance(cell, dict) or str(cell.get("font_name", "")).strip():
+                            continue
+                        rect = fitz.Rect(cell.get("rect") or (0, 0, 0, 0))
+                        cell["font_name"] = _dominant_font_name_in_rect(
+                            font_fragments,
+                            rect,
+                            fallback_text=str(cell.get("tgt_text") or cell.get("src_text") or ""),
+                        )
+                        changed = True
+                    continue
+
+                if str(block.get("font_name", "")).strip():
+                    continue
+                rect = fitz.Rect(block.get("rect") or (0, 0, 0, 0))
+                block["font_name"] = _dominant_font_name_in_rect(
+                    font_fragments,
+                    rect,
+                    fallback_text=str(block.get("tgt_text") or block.get("src_text") or ""),
+                )
+                changed = True
+    finally:
+        output_document.close()
+        if source_document is not None:
+            source_document.close()
+
+    if changed:
+        preview["schema_version"] = PREVIEW_SCHEMA_VERSION
+        preview["updated_at"] = _utcnow_iso()
+    return changed
+
+
+def _copy_preview_table_blocks(page: dict[str, object]) -> list[dict[str, object]]:
+    return [deepcopy(block) for block in page.get("blocks", []) if isinstance(block, dict) and block.get("type") == "table"]
+
+
+def _preview_text_lines(page: dict[str, object], field_name: str) -> list[str]:
+    lines: list[str] = []
+    text_blocks = sorted(
+        [
+            block
+            for block in page.get("blocks", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        ],
+        key=_page_item_sort_key,
+    )
+    for block in text_blocks:
+        for line in _normalize_pdf_block_text(str(block.get(field_name, ""))).split("\n"):
+            if line:
+                lines.append(line)
+    return lines
+
+
+def _fragment_text_for_rect(fragments: list[PdfPreviewFragment], rect: fitz.Rect, fallback_lines: list[str], index: int) -> str:
+    best_text = ""
+    best_overlap = 0.0
+    best_distance = float("inf")
+    target_center_x = (rect.x0 + rect.x1) / 2
+    target_center_y = (rect.y0 + rect.y1) / 2
+
+    for fragment in fragments:
+        overlap = max(_rect_overlap_ratio(fragment.rect, rect), _rect_overlap_ratio(rect, fragment.rect))
+        fragment_center_x = (fragment.rect.x0 + fragment.rect.x1) / 2
+        fragment_center_y = (fragment.rect.y0 + fragment.rect.y1) / 2
+        distance = abs(fragment_center_y - target_center_y) * 4 + abs(fragment_center_x - target_center_x)
+        if overlap > best_overlap or (abs(overlap - best_overlap) <= 0.01 and distance < best_distance):
+            best_text = fragment.text
+            best_overlap = overlap
+            best_distance = distance
+
+    if best_text and (best_overlap >= 0.35 or best_distance <= 14.0):
+        return best_text
+    if index < len(fallback_lines):
+        return fallback_lines[index]
+    return best_text
+
+
+def _build_migrated_pdf_text_blocks(
+    geometry_fragments: list[PdfPreviewFragment],
+    source_fragments: list[PdfPreviewFragment],
+    target_fragments: list[PdfPreviewFragment],
+    legacy_source_lines: list[str],
+    legacy_target_lines: list[str],
+) -> list[dict[str, object]]:
+    blocks: list[dict[str, object]] = []
+    for index, fragment in enumerate(sorted(geometry_fragments, key=_pdf_fragment_sort_key)):
+        src_text = _fragment_text_for_rect(source_fragments, fragment.rect, legacy_source_lines, index)
+        tgt_text = _fragment_text_for_rect(target_fragments, fragment.rect, legacy_target_lines, index)
+        if not src_text and index < len(legacy_source_lines):
+            src_text = legacy_source_lines[index]
+        if not tgt_text and index < len(legacy_target_lines):
+            tgt_text = legacy_target_lines[index]
+        blocks.append(
+            {
+                "type": "text",
+                "rect": [round(fragment.rect.x0, 2), round(fragment.rect.y0, 2), round(fragment.rect.x1, 2), round(fragment.rect.y1, 2)],
+                "font_name": fragment.dominant_font,
+                "font_size_original": fragment.average_font_size,
+                "font_size_current": fragment.average_font_size,
+                "src_text": src_text,
+                "tgt_text": tgt_text,
+            }
+        )
+
+    return blocks
+
+
+def _build_pdf_pages_from_existing_preview(source_path: Path, output_path: Path, existing_pages: list[dict[str, object]]) -> list[dict[str, object]]:
+    source_document = fitz.open(source_path) if source_path.exists() else None
+    output_document = fitz.open(output_path)
+    try:
+        page_count = max(source_document.page_count if source_document is not None else 0, output_document.page_count, len(existing_pages), 1)
+        pages: list[dict[str, object]] = []
+
+        for page_index in range(page_count):
+            existing_page = existing_pages[page_index] if page_index < len(existing_pages) else {}
+            source_page = (
+                source_document.load_page(page_index)
+                if source_document is not None and page_index < source_document.page_count
+                else None
+            )
+            output_page = output_document.load_page(page_index) if page_index < output_document.page_count else None
+            geometry_page = output_page or source_page
+            source_fragments = _extract_pdf_text_fragments(source_page) if source_page is not None else []
+            target_fragments = _extract_pdf_text_fragments(output_page) if output_page is not None else []
+
+            table_blocks = _copy_preview_table_blocks(existing_page if isinstance(existing_page, dict) else {})
+            table_rects = [fitz.Rect(block["table_rect"]) for block in table_blocks if isinstance(block.get("table_rect"), list)]
+            filtered_source_fragments = [fragment for fragment in source_fragments if not _fragment_belongs_to_table(fragment, table_rects)]
+            filtered_target_fragments = [fragment for fragment in target_fragments if not _fragment_belongs_to_table(fragment, table_rects)]
+            geometry_fragments = filtered_target_fragments
+            if filtered_source_fragments and (not filtered_target_fragments or len(filtered_target_fragments) < len(filtered_source_fragments) * 0.7):
+                geometry_fragments = filtered_source_fragments
+            if not geometry_fragments:
+                geometry_fragments = filtered_source_fragments
+
+            text_blocks = _build_migrated_pdf_text_blocks(
+                geometry_fragments,
+                filtered_source_fragments,
+                filtered_target_fragments,
+                _preview_text_lines(existing_page if isinstance(existing_page, dict) else {}, "src_text"),
+                _preview_text_lines(existing_page if isinstance(existing_page, dict) else {}, "tgt_text"),
+            )
+            page_items = sorted([*text_blocks, *table_blocks], key=_page_item_sort_key)
+
+            page_width = round(geometry_page.rect.width, 2) if geometry_page is not None else float(existing_page.get("page_width", 0.0) or 0.0)
+            page_height = round(geometry_page.rect.height, 2) if geometry_page is not None else float(existing_page.get("page_height", 0.0) or 0.0)
+            blocks: list[dict[str, object]] = []
+            text_block_index = 0
+            for block in page_items:
+                if block.get("type") == "table":
+                    blocks.append(block)
+                    continue
+
+                text_block_index += 1
+                blocks.append(
+                    {
+                        "type": "text",
+                        "block_id": f"p{page_index + 1}_b{text_block_index}",
+                        "rect": block["rect"],
+                        "font_name": str(block.get("font_name", "")),
+                        "font_size_original": float(block.get("font_size_original", 12.0) or 12.0),
+                        "font_size_current": float(block.get("font_size_current", 12.0) or 12.0),
+                        "src_text": str(block.get("src_text", "")),
+                        "tgt_text": str(block.get("tgt_text", "")),
+                    }
+                )
+
+            pages.append(
+                {
+                    "page_num": page_index + 1,
+                    "page_width": page_width,
+                    "page_height": page_height,
+                    "blocks": blocks,
+                }
+            )
+
+        return pages
+    finally:
+        output_document.close()
+        if source_document is not None:
+            source_document.close()
+
+
+def _migrate_pdf_preview_payload(preview: dict, job: TranslationJob) -> dict:
+    if job.output_file is None:
+        raise ValueError("Preview is unavailable until translation output is created")
+
+    migrated_preview = dict(preview)
+    migrated_preview["schema_version"] = PREVIEW_SCHEMA_VERSION
+    migrated_preview["pdf_text_granularity"] = PDF_PREVIEW_TEXT_GRANULARITY
+    migrated_preview["updated_at"] = _utcnow_iso()
+    migrated_preview["pages"] = _build_pdf_pages_from_existing_preview(
+        Path(job.input_file.storage_path),
+        Path(job.output_file.storage_path),
+        [page for page in preview.get("pages", []) if isinstance(page, dict)],
+    )
+    return migrated_preview
+
+
+def load_or_create_preview(job: TranslationJob, *, force: bool = False, migrate_pdf_text_blocks: bool = True) -> dict:
     if job.output_file is None:
         raise ValueError("Preview is unavailable until translation output is created")
 
@@ -781,6 +1669,16 @@ def load_or_create_preview(job: TranslationJob, *, force: bool = False) -> dict:
 
     extension = output_path.suffix.lower()
     if not force and existing_preview is not None and _preview_matches_schema(existing_preview, extension):
+        preview_changed = False
+        if migrate_pdf_text_blocks and extension == ".pdf" and not _preview_uses_line_granularity(existing_preview):
+            existing_preview = _migrate_pdf_preview_payload(existing_preview, job)
+            preview_changed = True
+        if extension == ".pdf":
+            preview_changed = _cleanup_pdf_preview_text_content(existing_preview) or preview_changed
+        if extension == ".pdf" and _preview_needs_pdf_font_metadata(existing_preview):
+            preview_changed = _enrich_pdf_preview_font_metadata(existing_preview, job) or preview_changed
+        if preview_changed:
+            _write_preview(sidecar_path, existing_preview)
         return existing_preview
 
     payload = build_job_preview(job, created_at=existing_preview.get("created_at") if existing_preview else None)
@@ -800,38 +1698,156 @@ def _update_docx_preview(preview: dict, page_updates: list[dict[str, str]]) -> d
     return preview
 
 
-def _draw_pdf_block_text(page: fitz.Page, rect: fitz.Rect, text: str, font_size: float) -> None:
-    page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+def _ensure_pdf_render_font(page: fitz.Page, font: PdfRenderFont) -> None:
+    if font.render_buffer:
+        page.insert_font(fontname=font.render_name, fontbuffer=font.render_buffer)
+        return
+    if font.render_file:
+        page.insert_font(fontname=font.render_name, fontfile=font.render_file)
 
+
+def _insert_pdf_text(
+    page: fitz.Page,
+    point: tuple[float, float],
+    text: str,
+    font_size: float,
+    font: PdfRenderFont,
+) -> None:
+    insert_kwargs = {
+        "fontsize": font_size,
+        "fontname": font.render_name,
+        "overlay": True,
+    }
+    if font.render_file:
+        insert_kwargs["fontfile"] = font.render_file
+    page.insert_text(point, text, **insert_kwargs)
+
+
+def _insert_pdf_textbox(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    font_size: float,
+    font: PdfRenderFont,
+) -> float:
+    insert_kwargs = {
+        "fontsize": font_size,
+        "fontname": font.render_name,
+        "overlay": True,
+    }
+    if font.render_file:
+        insert_kwargs["fontfile"] = font.render_file
+    return float(page.insert_textbox(rect, text, **insert_kwargs))
+
+
+def _draw_pdf_text_into_line_rects(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    font_size: float,
+    line_fragments: list[PdfPreviewFragment],
+    render_font: PdfRenderFont,
+    fallback_fragments: list[PdfPreviewFragment] | None = None,
+) -> tuple[str, float] | None:
     normalized_text = _normalize_pdf_block_text(text)
     if not normalized_text:
-        return
+        return "", round(max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE), 2)
 
-    font_name = _select_pdf_font(normalized_text)
     requested_size = max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
-    current_size = round(requested_size, 2)
-    while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
-        remainder = page.insert_textbox(
+    for full_width in (False, True):
+        current_size = round(requested_size, 2)
+        while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
+            line_rects, base_count = _build_pdf_line_rects(rect, line_fragments, current_size, full_width=full_width)
+            if line_rects:
+                widths = [max(line_rect.width, 1.0) for line_rect in line_rects]
+                wrapped_lines = _wrap_pdf_text_to_widths(normalized_text, widths, render_font, current_size)
+                if wrapped_lines is not None and len(wrapped_lines) <= len(line_rects):
+                    clear_count = max(base_count, len(wrapped_lines))
+                    for clear_rect in line_rects[:clear_count]:
+                        page.draw_rect(clear_rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
+                    for line_rect, line_text in zip(line_rects, wrapped_lines, strict=False):
+                        if not line_text:
+                            continue
+                        baseline_y = min(line_rect.y1 - 0.5, line_rect.y0 + current_size)
+                        _insert_pdf_text(page, (line_rect.x0, baseline_y), line_text, current_size, render_font)
+                    return normalized_text, current_size
+            current_size = round(current_size - 0.5, 2)
+
+    if fallback_fragments:
+        current_size = round(requested_size, 2)
+        while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
+            line_rects, base_count = _build_pdf_line_rects(rect, fallback_fragments, current_size, full_width=True)
+            if line_rects:
+                widths = [max(line_rect.width, 1.0) for line_rect in line_rects]
+                wrapped_lines = _wrap_pdf_text_to_widths(normalized_text, widths, render_font, current_size)
+                if wrapped_lines is not None and len(wrapped_lines) <= len(line_rects):
+                    clear_count = max(base_count, len(wrapped_lines))
+                    for clear_rect in line_rects[:clear_count]:
+                        page.draw_rect(clear_rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
+                    for line_rect, line_text in zip(line_rects, wrapped_lines, strict=False):
+                        if not line_text:
+                            continue
+                        baseline_y = min(line_rect.y1 - 0.5, line_rect.y0 + current_size)
+                        _insert_pdf_text(page, (line_rect.x0, baseline_y), line_text, current_size, render_font)
+                    return normalized_text, current_size
+            current_size = round(current_size - 0.5, 2)
+
+    return None
+
+
+def _draw_pdf_block_text(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    text: str,
+    font_size: float,
+    *,
+    preferred_font_name: str = "",
+    page_fonts: tuple[PdfPageFontResource, ...] = (),
+    prefer_external_cjk_font: bool = False,
+    line_fragments: list[PdfPreviewFragment] | None = None,
+    fallback_fragments: list[PdfPreviewFragment] | None = None,
+) -> tuple[str, float]:
+    normalized_text = _normalize_pdf_block_text(text)
+    requested_size = max(float(font_size or PDF_MIN_REDRAW_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
+    if not normalized_text:
+        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+        return "", round(requested_size, 2)
+
+    render_font = _resolve_pdf_render_font(
+        normalized_text,
+        preferred_font_name=preferred_font_name,
+        page_fonts=page_fonts,
+        prefer_external_cjk_font=prefer_external_cjk_font,
+    )
+    _ensure_pdf_render_font(page, render_font)
+    if line_fragments:
+        line_drawn = _draw_pdf_text_into_line_rects(
+            page,
             rect,
             normalized_text,
-            fontsize=current_size,
-            fontname=font_name,
-            overlay=True,
+            requested_size,
+            line_fragments,
+            render_font,
+            fallback_fragments=fallback_fragments,
         )
+        if line_drawn is not None:
+            return line_drawn
+
+    page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+    current_size = round(requested_size, 2)
+    while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
+        remainder = _insert_pdf_textbox(page, rect, normalized_text, current_size, render_font)
         if remainder >= 0:
-            return
+            return normalized_text, current_size
         current_size = round(current_size - 0.5, 2)
 
-    page.insert_textbox(
-        rect,
-        normalized_text,
-        fontsize=PDF_MIN_REDRAW_FONT_SIZE,
-        fontname=font_name,
-        overlay=True,
-    )
+    _insert_pdf_textbox(page, rect, normalized_text, PDF_MIN_REDRAW_FONT_SIZE, render_font)
+    return normalized_text, PDF_MIN_REDRAW_FONT_SIZE
 
 
-def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates: list[dict[str, object]]) -> None:
+def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     if job.output_file is None:
         raise ValueError("Translated PDF does not exist")
 
@@ -840,6 +1856,7 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
         raise ValueError("Translated PDF does not exist")
 
     editable_lookup: dict[str, tuple[int, dict[str, object], str]] = {}
+    applied_updates: dict[str, dict[str, object]] = {}
     for page in preview.get("pages", []):
         page_index = int(page["page_num"]) - 1
         for block in page.get("blocks", []):
@@ -850,26 +1867,79 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
             editable_lookup[str(block["block_id"])] = (page_index, block, "block")
 
     document = fitz.open(output_path)
+    source_path = Path(job.input_file.storage_path)
+    source_document = fitz.open(source_path) if source_path.exists() else None
     with NamedTemporaryFile("wb", suffix=output_path.suffix, dir=output_path.parent, delete=False) as handle:
         temp_path = Path(handle.name)
 
     try:
+        page_cache: dict[int, fitz.Page] = {}
+        page_font_cache: dict[int, tuple[PdfPageFontResource, ...]] = {}
+        page_fragment_cache: dict[int, list[PdfPreviewFragment]] = {}
+        source_fragment_cache: dict[int, list[PdfPreviewFragment]] = {}
+
         for update in block_updates:
             target_id = str(update.get("cell_id") or update.get("block_id") or "")
             lookup = editable_lookup.get(target_id)
             if lookup is None:
                 raise ValueError(f"Preview block '{target_id}' does not exist")
 
-            page_index, block, _ = lookup
-            page = document.load_page(page_index)
+            page_index, block, block_kind = lookup
+            page = page_cache.get(page_index)
+            if page is None:
+                page = document.load_page(page_index)
+                page_cache[page_index] = page
+                page_font_cache[page_index] = _extract_page_font_resources(page)
+                page_fragment_cache[page_index] = _extract_pdf_text_fragments(page)
+            if page_index not in source_fragment_cache:
+                source_page = (
+                    source_document.load_page(page_index)
+                    if source_document is not None and page_index < source_document.page_count
+                    else None
+                )
+                source_fragment_cache[page_index] = _extract_pdf_text_fragments(source_page) if source_page is not None else []
             rect = fitz.Rect(block["rect"])
-            _draw_pdf_block_text(
+            page_fonts = page_font_cache.get(page_index, ())
+            page_fragments = page_fragment_cache.get(page_index, [])
+            source_fragments = source_fragment_cache.get(page_index, [])
+            preferred_font_name = str(
+                block.get("font_name")
+                or _dominant_font_name_in_rect(
+                    page_fragments,
+                    rect,
+                    fallback_text=str(update.get("tgt_text") or block.get("tgt_text") or block.get("src_text") or ""),
+                )
+            )
+            line_fragments = None
+            prefer_external_cjk_font = False
+            if block_kind == "cell":
+                line_fragments = _line_fragments_in_rect(source_fragments or page_fragments, rect) or None
+                prefer_external_cjk_font = _select_pdf_font(
+                    str(update.get("tgt_text") or block.get("tgt_text") or block.get("src_text") or "")
+                ) in {"china-s", "japan", "korea"}
+            requested_font_size = max(
+                float(update.get("font_size_final") or 0.0),
+                float(block.get("font_size_original") or 0.0),
+                float(block.get("font_size_current") or 0.0),
+                PDF_MIN_REDRAW_FONT_SIZE,
+            )
+            normalized_text, applied_font_size = _draw_pdf_block_text(
                 page,
                 rect,
                 str(update.get("tgt_text", "")),
-                float(update.get("font_size_final") or block.get("font_size_current") or block.get("font_size_original") or 12.0),
+                requested_font_size,
+                preferred_font_name=preferred_font_name,
+                page_fonts=page_fonts,
+                prefer_external_cjk_font=prefer_external_cjk_font,
+                line_fragments=line_fragments,
             )
+            applied_updates[target_id] = {
+                "tgt_text": normalized_text,
+                "font_size_current": applied_font_size,
+                "font_name": preferred_font_name,
+            }
 
+        document.subset_fonts()
         document.save(temp_path, garbage=4, deflate=True, clean=True, deflate_fonts=True)
     except Exception:
         if temp_path.exists():
@@ -877,14 +1947,40 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
         raise
     finally:
         document.close()
+        if source_document is not None:
+            source_document.close()
 
     temp_path.replace(output_path)
     job.output_file.size_bytes = output_path.stat().st_size
     job.output_file.checksum = file_checksum(output_path)
+    return applied_updates
+
+
+def _update_pdf_preview(preview: dict, applied_updates: dict[str, dict[str, object]]) -> dict:
+    editable_lookup: dict[str, dict[str, object]] = {}
+    for page in preview.get("pages", []):
+        for block in page.get("blocks", []):
+            if block.get("type") == "table":
+                for cell in block.get("cells", []):
+                    editable_lookup[str(cell["cell_id"])] = cell
+                continue
+            editable_lookup[str(block["block_id"])] = block
+
+    for target_id, applied in applied_updates.items():
+        editable = editable_lookup.get(target_id)
+        if editable is None:
+            raise ValueError(f"Preview block '{target_id}' does not exist")
+        editable["tgt_text"] = str(applied.get("tgt_text", ""))
+        editable["font_size_current"] = float(applied.get("font_size_current") or editable.get("font_size_current") or 12.0)
+        if applied.get("font_name"):
+            editable["font_name"] = str(applied["font_name"])
+
+    preview["updated_at"] = _utcnow_iso()
+    return preview
 
 
 def update_preview(job: TranslationJob, update_payload: dict) -> dict:
-    preview = load_or_create_preview(job)
+    preview = load_or_create_preview(job, migrate_pdf_text_blocks=False)
     sidecar = preview_sidecar_path(job.output_file.storage_path)
 
     if preview["document_kind"] == "pdf":
@@ -893,11 +1989,15 @@ def update_preview(job: TranslationJob, update_payload: dict) -> dict:
         block_updates = update_payload.get("payload")
         if not isinstance(block_updates, list):
             raise ValueError("PDF preview updates require a block payload")
+        if not _preview_uses_line_granularity(preview):
+            migrated_preview = _migrate_pdf_preview_payload(preview, job)
+            _write_preview(sidecar, migrated_preview)
+            raise ValueError("Preview layout was upgraded. Please reopen the preview and save again.")
 
-        _apply_pdf_preview_updates(job, preview, block_updates)
-        refreshed_preview = build_job_preview(job, created_at=preview.get("created_at"))
-        _write_preview(sidecar, refreshed_preview)
-        return refreshed_preview
+        applied_updates = _apply_pdf_preview_updates(job, preview, block_updates)
+        updated_preview = _update_pdf_preview(preview, applied_updates)
+        _write_preview(sidecar, updated_preview)
+        return updated_preview
 
     page_updates = update_payload.get("pages")
     if not isinstance(page_updates, list):
