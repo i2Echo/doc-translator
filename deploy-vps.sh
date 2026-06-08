@@ -66,6 +66,20 @@ install_system_packages() {
     openssl
 }
 
+install_certbot() {
+  if has_command certbot; then
+    log "Certbot is already available"
+  else
+    log "Installing Certbot for Nginx"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      certbot \
+      python3-certbot-nginx
+  fi
+
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+}
+
 install_docker() {
   if has_command docker && docker compose version >/dev/null 2>&1; then
     log "Docker and docker compose are already available"
@@ -251,12 +265,17 @@ resolve_nginx_upload_limit() {
   printf '100m'
 }
 
+is_ip_address() {
+  local host="$1"
+
+  [[ "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${host}" == *:* ]]
+}
+
 write_nginx_config() {
   local server_name="$1"
   local upload_limit="$2"
-  local proxy_scheme="$3"
-  local cert_fullchain_path="$4"
-  local cert_privkey_path="$5"
+  local cert_fullchain_path="$3"
+  local cert_privkey_path="$4"
 
   if [[ -n "${cert_fullchain_path}" && -n "${cert_privkey_path}" ]]; then
     cat > "${NGINX_SITE_PATH}" <<EOF
@@ -290,7 +309,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto ${proxy_scheme};
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 EOF
@@ -314,7 +333,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto ${proxy_scheme};
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 EOF
@@ -340,7 +359,6 @@ resolve_tls_paths() {
 
 configure_nginx() {
   local base_url
-  local scheme
   local host
   local server_name
   local upload_limit
@@ -349,7 +367,6 @@ configure_nginx() {
   local cert_privkey_path
 
   base_url="$(get_env_value APP_BASE_URL 2>/dev/null || printf 'http://localhost')"
-  scheme="$(extract_url_scheme "${base_url}")"
   host="$(extract_url_host "${base_url}")"
   server_name="$(resolve_nginx_server_name "${base_url}")"
   upload_limit="$(resolve_nginx_upload_limit)"
@@ -358,28 +375,85 @@ configure_nginx() {
   cert_privkey_path="$(printf '%s' "${tls_paths}" | sed -n '2p')"
 
   log "Configuring Nginx reverse proxy"
-  write_nginx_config "${server_name}" "${upload_limit}" "${scheme}" "${cert_fullchain_path}" "${cert_privkey_path}"
+  write_nginx_config "${server_name}" "${upload_limit}" "${cert_fullchain_path}" "${cert_privkey_path}"
   ln -sfn "${NGINX_SITE_PATH}" "${NGINX_SITE_LINK}"
   rm -f "${NGINX_DEFAULT_SITE_LINK}"
 
   nginx -t
   systemctl enable --now nginx
   systemctl reload nginx
+}
 
-  if [[ "${scheme}" == "https" && ( -z "${cert_fullchain_path}" || -z "${cert_privkey_path}" ) ]]; then
-    log "APP_BASE_URL uses https, but TLS certificate files were not found. Run Certbot, then rerun deploy-vps.sh."
+ensure_tls_certificate() {
+  local base_url
+  local scheme
+  local host
+  local server_name
+  local certbot_email
+  local tls_paths
+  local cert_fullchain_path
+  local cert_privkey_path
+
+  base_url="$(get_env_value APP_BASE_URL 2>/dev/null || printf 'http://localhost')"
+  scheme="$(extract_url_scheme "${base_url}")"
+  if [[ "${scheme}" != "https" ]]; then
+    return
   fi
+
+  host="$(extract_url_host "${base_url}")"
+  server_name="$(resolve_nginx_server_name "${base_url}")"
+  if [[ "${server_name}" == "_" ]]; then
+    die "APP_BASE_URL must use a public domain name when https is enabled"
+  fi
+
+  if is_ip_address "${host}"; then
+    die "Let's Encrypt cannot issue certificates for IP addresses. Use a domain name in APP_BASE_URL."
+  fi
+
+  certbot_email="$(get_env_value CERTBOT_EMAIL 2>/dev/null || true)"
+  if is_placeholder_value "${certbot_email}"; then
+    certbot_email="$(get_env_value ADMIN_EMAIL 2>/dev/null || true)"
+  fi
+  if is_placeholder_value "${certbot_email}"; then
+    die "Set CERTBOT_EMAIL or ADMIN_EMAIL to a real email address before enabling https"
+  fi
+  [[ -n "${certbot_email}" ]] || die "CERTBOT_EMAIL or ADMIN_EMAIL must be set before enabling https"
+
+  tls_paths="$(resolve_tls_paths "${host}")"
+  cert_fullchain_path="$(printf '%s' "${tls_paths}" | sed -n '1p')"
+  cert_privkey_path="$(printf '%s' "${tls_paths}" | sed -n '2p')"
+  if [[ -n "${cert_fullchain_path}" && -n "${cert_privkey_path}" ]]; then
+    log "TLS certificate already exists for ${host}"
+    install_certbot
+    return
+  fi
+
+  install_certbot
+
+  log "Obtaining TLS certificate for ${host}"
+  certbot certonly \
+    --nginx \
+    --non-interactive \
+    --agree-tos \
+    --no-eff-email \
+    --keep-until-expiring \
+    --email "${certbot_email}" \
+    -d "${host}"
+
+  systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 }
 
 configure_env() {
   local app_secret_key
   local app_base_url
+  local app_base_url_scheme
   local model_base_url
   local model_api_key
   local model_name
   local admin_email
   local admin_password
   local admin_name
+  local certbot_email
 
   log "Preparing production environment settings"
 
@@ -395,12 +469,19 @@ configure_env() {
   admin_email="$(prompt_value ADMIN_EMAIL "Admin email" "admin@example.com")"
   admin_password="$(prompt_value ADMIN_PASSWORD "Admin password" "" true)"
   admin_name="$(prompt_value ADMIN_NAME "Admin display name" "Administrator")"
+  app_base_url_scheme="$(extract_url_scheme "${app_base_url}")"
+
+  certbot_email="$(get_env_value CERTBOT_EMAIL 2>/dev/null || true)"
+  if [[ "${app_base_url_scheme}" == "https" ]] || ! is_placeholder_value "${certbot_email}"; then
+    certbot_email="$(prompt_value CERTBOT_EMAIL "TLS contact email" "${admin_email}")"
+  fi
 
   set_env_value APP_ENV production
   set_env_value APP_BASE_URL "${app_base_url}"
   set_env_value APP_SECRET_KEY "${app_secret_key}"
   set_env_value API_BIND_HOST 127.0.0.1
   set_env_value WEB_BIND_HOST 127.0.0.1
+  set_env_value CERTBOT_EMAIL "${certbot_email}"
   set_env_value MODEL_BASE_URL "${model_base_url}"
   set_env_value MODEL_API_KEY "${model_api_key}"
   set_env_value MODEL_NAME "${model_name}"
@@ -498,6 +579,8 @@ main() {
   configure_env
   start_stack
   wait_for_services
+  configure_nginx
+  ensure_tls_certificate
   configure_nginx
   show_access_info
 }

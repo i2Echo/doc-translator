@@ -14,7 +14,7 @@ For a fresh VPS, the repository now includes:
 
 - `bootstrap-vps.sh`, which clones or updates the repository from GitHub and then starts the project deployment flow
 - `deploy-vps.sh`, which installs Docker on Ubuntu or Debian, prepares `.env`, starts the compose stack, and waits for the health checks
-- `.env.vps.example`, which is the editable production env template used to create `.env` on the VPS
+- `.env.vps.example`, which is the editable production env template used to create `.env` on the VPS, including `CERTBOT_EMAIL`
 
 ## VPS One-Click Deploy
 
@@ -41,7 +41,7 @@ If you want to pin a different branch, pass `BRANCH`. If you already know the pr
 curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstrap-vps.sh | \
   sudo env \
     BRANCH=main \
-    APP_BASE_URL=http://translate.example.com \
+    APP_BASE_URL=https://translate.example.com \
     bash
 ```
 
@@ -56,14 +56,16 @@ curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstra
 - start the stack with `docker-compose.yml` and `docker-compose.vps.yml`
 - wait until `postgres`, `redis`, `api`, `worker`, and `web` report healthy status
 - install and configure a host-level Nginx reverse proxy to `127.0.0.1:3000`
+- automatically obtain a Let's Encrypt certificate and enable `certbot.timer` when `APP_BASE_URL` uses `https://`
 
-You can also run it non-interactively by exporting the required variables before execution, for example `MODEL_API_KEY`, `MODEL_BASE_URL`, `MODEL_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and optionally `APP_BASE_URL`.
+You can also run it non-interactively by exporting the required variables before execution, for example `MODEL_API_KEY`, `MODEL_BASE_URL`, `MODEL_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, optionally `CERTBOT_EMAIL`, and `APP_BASE_URL`.
 
 ## Domain Setup
 
 1. Add an `A` record that points your domain, for example `translate.example.com`, to the VPS public IP.
-2. Set `APP_BASE_URL=http://translate.example.com` before the first deployment, or update it later in `.env` and rerun the deploy script.
-3. `deploy-vps.sh` will install Nginx on the VPS and reverse proxy requests to `127.0.0.1:3000`.
+2. Set `APP_BASE_URL=https://translate.example.com` before the first deployment if DNS is already live and ports `80/443` are open.
+3. `deploy-vps.sh` will install Nginx on the VPS, reverse proxy requests to `127.0.0.1:3000`, and automatically request a Let's Encrypt certificate.
+4. If DNS is not ready yet, deploy once with `http://`, then switch `APP_BASE_URL` to `https://...` later and rerun `deploy-vps.sh`.
 
 On the VPS, the editable production env file is:
 
@@ -83,14 +85,13 @@ The generated Nginx site file is:
 /etc/nginx/sites-available/doc-translator
 ```
 
-After deployment, open `http://translate.example.com`.
+After deployment, open the URL you set in `APP_BASE_URL`.
 
-For HTTPS, obtain a certificate after DNS is live, then update `APP_BASE_URL` to `https://translate.example.com` and rerun the deploy script. `deploy-vps.sh` will detect `/etc/letsencrypt/live/<domain>/` and switch the generated Nginx config to `443`. Example with Certbot on Ubuntu or Debian:
+If HTTPS is enabled, `deploy-vps.sh` uses Certbot and enables automatic renewal through `certbot.timer`. You can verify it with:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d translate.example.com
+sudo systemctl status certbot.timer
+sudo certbot renew --dry-run
 ```
 
 If the VPS is public, also restrict direct access to ports `3000` and `8000` with the VPS firewall or cloud security group so traffic enters only through `80/443`.
@@ -131,6 +132,7 @@ Recommended reverse proxy behavior:
 
 - Forward traffic to `127.0.0.1:3000`
 - Set `client_max_body_size` to at least the configured `MAX_UPLOAD_MB`
+- Keep ports `80/443` open so Certbot can validate and renew domain certificates
 - Restrict direct access to the published API port if the VPS is exposed to the public internet
 - Restrict network egress so only the chosen model endpoint is reachable if required by policy
 
