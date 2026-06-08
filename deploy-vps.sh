@@ -5,9 +5,14 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_ROOT}/.env"
 ENV_EXAMPLE_FILE="${PROJECT_ROOT}/.env.example"
+VPS_ENV_EXAMPLE_FILE="${PROJECT_ROOT}/.env.vps.example"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-600}"
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.vps.yml)
 SERVICES=(postgres redis api worker web)
+NGINX_SITE_NAME="doc-translator"
+NGINX_SITE_PATH="/etc/nginx/sites-available/${NGINX_SITE_NAME}"
+NGINX_SITE_LINK="/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
+NGINX_DEFAULT_SITE_LINK="/etc/nginx/sites-enabled/default"
 
 log() {
   printf '==> %s\n' "$*"
@@ -30,6 +35,7 @@ assert_project_root() {
   [[ -f "${PROJECT_ROOT}/docker-compose.yml" ]] || die "Missing docker-compose.yml in ${PROJECT_ROOT}"
   [[ -f "${PROJECT_ROOT}/docker-compose.vps.yml" ]] || die "Missing docker-compose.vps.yml in ${PROJECT_ROOT}"
   [[ -f "${ENV_EXAMPLE_FILE}" ]] || die "Missing .env.example in ${PROJECT_ROOT}"
+  [[ -f "${VPS_ENV_EXAMPLE_FILE}" ]] || die "Missing .env.vps.example in ${PROJECT_ROOT}"
 }
 
 load_os_release() {
@@ -56,6 +62,7 @@ install_system_packages() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates \
     curl \
+    nginx \
     openssl
 }
 
@@ -91,11 +98,14 @@ ensure_docker_ready() {
 }
 
 ensure_env_file() {
+  local source_env_example
+
   if [[ -f "${ENV_FILE}" ]]; then
     log "Using existing .env file"
   else
-    log "Creating .env from .env.example"
-    cp "${ENV_EXAMPLE_FILE}" "${ENV_FILE}"
+    source_env_example="${VPS_ENV_EXAMPLE_FILE}"
+    log "Creating .env from $(basename "${source_env_example}")"
+    cp "${source_env_example}" "${ENV_FILE}"
   fi
 
   chmod 600 "${ENV_FILE}"
@@ -194,7 +204,171 @@ detect_default_base_url() {
     public_host="127.0.0.1"
   fi
 
-  printf 'http://%s:3000' "${public_host}"
+  printf 'http://%s' "${public_host}"
+}
+
+extract_url_scheme() {
+  local url="$1"
+
+  if [[ "${url}" == *"://"* ]]; then
+    printf '%s' "${url%%://*}"
+    return
+  fi
+
+  printf 'http'
+}
+
+extract_url_host() {
+  local url="$1"
+  local without_scheme="${url#*://}"
+  local host_port="${without_scheme%%/*}"
+
+  printf '%s' "${host_port%%:*}"
+}
+
+resolve_nginx_server_name() {
+  local base_url="$1"
+  local host
+
+  host="$(extract_url_host "${base_url}")"
+  if [[ -z "${host}" || "${host}" == "127.0.0.1" || "${host}" == "localhost" ]]; then
+    printf '_'
+    return
+  fi
+
+  printf '%s' "${host}"
+}
+
+resolve_nginx_upload_limit() {
+  local max_upload_mb
+
+  max_upload_mb="$(get_env_value MAX_UPLOAD_MB 2>/dev/null || true)"
+  if [[ "${max_upload_mb}" =~ ^[0-9]+$ ]] && (( max_upload_mb > 0 )); then
+    printf '%sm' "${max_upload_mb}"
+    return
+  fi
+
+  printf '100m'
+}
+
+write_nginx_config() {
+  local server_name="$1"
+  local upload_limit="$2"
+  local proxy_scheme="$3"
+  local cert_fullchain_path="$4"
+  local cert_privkey_path="$5"
+
+  if [[ -n "${cert_fullchain_path}" && -n "${cert_privkey_path}" ]]; then
+    cat > "${NGINX_SITE_PATH}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name};
+
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${server_name};
+
+    ssl_certificate ${cert_fullchain_path};
+    ssl_certificate_key ${cert_privkey_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:DocTranslatorSSL:10m;
+
+    client_max_body_size ${upload_limit};
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_request_buffering off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto ${proxy_scheme};
+    }
+}
+EOF
+    return
+  fi
+
+  cat > "${NGINX_SITE_PATH}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name};
+
+    client_max_body_size ${upload_limit};
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_request_buffering off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto ${proxy_scheme};
+    }
+}
+EOF
+}
+
+resolve_tls_paths() {
+  local host="$1"
+  local fullchain_path=""
+  local privkey_path=""
+
+  if [[ -n "${host}" && "${host}" != "_" ]]; then
+    fullchain_path="/etc/letsencrypt/live/${host}/fullchain.pem"
+    privkey_path="/etc/letsencrypt/live/${host}/privkey.pem"
+  fi
+
+  if [[ -f "${fullchain_path}" && -f "${privkey_path}" ]]; then
+    printf '%s\n%s\n' "${fullchain_path}" "${privkey_path}"
+    return
+  fi
+
+  printf '\n\n'
+}
+
+configure_nginx() {
+  local base_url
+  local scheme
+  local host
+  local server_name
+  local upload_limit
+  local tls_paths
+  local cert_fullchain_path
+  local cert_privkey_path
+
+  base_url="$(get_env_value APP_BASE_URL 2>/dev/null || printf 'http://localhost')"
+  scheme="$(extract_url_scheme "${base_url}")"
+  host="$(extract_url_host "${base_url}")"
+  server_name="$(resolve_nginx_server_name "${base_url}")"
+  upload_limit="$(resolve_nginx_upload_limit)"
+  tls_paths="$(resolve_tls_paths "${host}")"
+  cert_fullchain_path="$(printf '%s' "${tls_paths}" | sed -n '1p')"
+  cert_privkey_path="$(printf '%s' "${tls_paths}" | sed -n '2p')"
+
+  log "Configuring Nginx reverse proxy"
+  write_nginx_config "${server_name}" "${upload_limit}" "${scheme}" "${cert_fullchain_path}" "${cert_privkey_path}"
+  ln -sfn "${NGINX_SITE_PATH}" "${NGINX_SITE_LINK}"
+  rm -f "${NGINX_DEFAULT_SITE_LINK}"
+
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+
+  if [[ "${scheme}" == "https" && ( -z "${cert_fullchain_path}" || -z "${cert_privkey_path}" ) ]]; then
+    log "APP_BASE_URL uses https, but TLS certificate files were not found. Run Certbot, then rerun deploy-vps.sh."
+  fi
 }
 
 configure_env() {
@@ -225,6 +399,8 @@ configure_env() {
   set_env_value APP_ENV production
   set_env_value APP_BASE_URL "${app_base_url}"
   set_env_value APP_SECRET_KEY "${app_secret_key}"
+  set_env_value API_BIND_HOST 127.0.0.1
+  set_env_value WEB_BIND_HOST 127.0.0.1
   set_env_value MODEL_BASE_URL "${model_base_url}"
   set_env_value MODEL_API_KEY "${model_api_key}"
   set_env_value MODEL_NAME "${model_name}"
@@ -322,6 +498,7 @@ main() {
   configure_env
   start_stack
   wait_for_services
+  configure_nginx
   show_access_info
 }
 

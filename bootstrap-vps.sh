@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-REPO_URL="${REPO_URL:-}"
+REPO_URL="${REPO_URL:-https://github.com/i2Echo/doc-translator.git}"
 BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/doc-translator}"
 
@@ -20,7 +20,7 @@ require_root() {
 }
 
 require_repo_url() {
-  [[ -n "${REPO_URL}" ]] || die "REPO_URL is required, for example: https://github.com/<owner>/<repo>.git"
+  [[ -n "${REPO_URL}" ]] || die "REPO_URL is required"
 }
 
 assert_supported_os() {

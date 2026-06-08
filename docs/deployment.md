@@ -14,6 +14,7 @@ For a fresh VPS, the repository now includes:
 
 - `bootstrap-vps.sh`, which clones or updates the repository from GitHub and then starts the project deployment flow
 - `deploy-vps.sh`, which installs Docker on Ubuntu or Debian, prepares `.env`, starts the compose stack, and waits for the health checks
+- `.env.vps.example`, which is the editable production env template used to create `.env` on the VPS
 
 ## VPS One-Click Deploy
 
@@ -30,18 +31,17 @@ sudo bash ./deploy-vps.sh
 Run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<branch>/bootstrap-vps.sh | \
-  sudo env REPO_URL=https://github.com/<owner>/<repo>.git BRANCH=<branch> bash
+curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstrap-vps.sh | \
+  sudo bash
 ```
 
-If you already know the production domain, pass `APP_BASE_URL` at the same time:
+If you want to pin a different branch, pass `BRANCH`. If you already know the production domain, pass `APP_BASE_URL` at the same time:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<branch>/bootstrap-vps.sh | \
+curl -fsSL https://raw.githubusercontent.com/i2Echo/doc-translator/main/bootstrap-vps.sh | \
   sudo env \
-    REPO_URL=https://github.com/<owner>/<repo>.git \
-    BRANCH=<branch> \
-    APP_BASE_URL=https://translate.example.com \
+    BRANCH=main \
+    APP_BASE_URL=http://translate.example.com \
     bash
 ```
 
@@ -50,29 +50,48 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<branch>/bootstrap-v
 ### What `deploy-vps.sh` does
 
 - install Docker Engine and the compose plugin if missing
-- create `.env` from `.env.example` when needed
+- create `.env` from `.env.vps.example` when needed
 - prompt for the model endpoint, API key, admin email, and admin password unless already set
 - switch `APP_ENV` to `production`
 - start the stack with `docker-compose.yml` and `docker-compose.vps.yml`
 - wait until `postgres`, `redis`, `api`, `worker`, and `web` report healthy status
+- install and configure a host-level Nginx reverse proxy to `127.0.0.1:3000`
 
 You can also run it non-interactively by exporting the required variables before execution, for example `MODEL_API_KEY`, `MODEL_BASE_URL`, `MODEL_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and optionally `APP_BASE_URL`.
 
 ## Domain Setup
 
 1. Add an `A` record that points your domain, for example `translate.example.com`, to the VPS public IP.
-2. Set `APP_BASE_URL=https://translate.example.com` before the first deployment, or update it later in `.env` and rerun the deploy script.
-3. Put a reverse proxy with HTTPS in front of the `web` service.
+2. Set `APP_BASE_URL=http://translate.example.com` before the first deployment, or update it later in `.env` and rerun the deploy script.
+3. `deploy-vps.sh` will install Nginx on the VPS and reverse proxy requests to `127.0.0.1:3000`.
 
-Example Caddy site block:
+On the VPS, the editable production env file is:
 
-```caddyfile
-translate.example.com {
-    reverse_proxy 127.0.0.1:3000
-}
+```text
+/opt/doc-translator/.env
 ```
 
-After the proxy is reloaded, open `https://translate.example.com`.
+It is created automatically from:
+
+```text
+/opt/doc-translator/.env.vps.example
+```
+
+The generated Nginx site file is:
+
+```text
+/etc/nginx/sites-available/doc-translator
+```
+
+After deployment, open `http://translate.example.com`.
+
+For HTTPS, obtain a certificate after DNS is live, then update `APP_BASE_URL` to `https://translate.example.com` and rerun the deploy script. `deploy-vps.sh` will detect `/etc/letsencrypt/live/<domain>/` and switch the generated Nginx config to `443`. Example with Certbot on Ubuntu or Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d translate.example.com
+```
 
 If the VPS is public, also restrict direct access to ports `3000` and `8000` with the VPS firewall or cloud security group so traffic enters only through `80/443`.
 
@@ -106,12 +125,12 @@ Useful commands:
 
 ## Reverse Proxy and HTTPS
 
-This MVP expects HTTPS to be terminated by a customer-managed reverse proxy in front of the `web` service.
+This MVP expects reverse proxy traffic to terminate on the VPS host and then forward to the `web` service over loopback.
 
 Recommended reverse proxy behavior:
 
-- Terminate TLS at the proxy
-- Forward traffic to `web:3000`
+- Forward traffic to `127.0.0.1:3000`
+- Set `client_max_body_size` to at least the configured `MAX_UPLOAD_MB`
 - Restrict direct access to the published API port if the VPS is exposed to the public internet
 - Restrict network egress so only the chosen model endpoint is reachable if required by policy
 
