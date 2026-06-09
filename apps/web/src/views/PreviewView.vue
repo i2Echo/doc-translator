@@ -231,6 +231,8 @@ async function renderPageIntoCanvas(kind, doc, pageNumber, canvas) {
   const context = canvas.getContext("2d");
   canvas.parentElement?.style.setProperty("--pdf-page-aspect", String(viewport.width / viewport.height));
 
+  canvas.dataset.rendered = "false";
+  canvas.dataset.renderedWidth = "";
   canvas.width = Math.floor(viewport.width * ratio);
   canvas.height = Math.floor(viewport.height * ratio);
   canvas.style.width = `${viewport.width}px`;
@@ -521,8 +523,8 @@ onUnmounted(async () => {
           </svg>
         </button>
         <div class="preview-fixed-bar__copy">
-          <h1>{{ title || copy("加载预览中…", "Loading preview...") }}</h1>
-          <p>{{ subtitle }}</p>
+          <h1 :title="title">{{ title || copy("加载预览中…", "Loading preview...") }}</h1>
+          <p :title="subtitle">{{ subtitle }}</p>
         </div>
       </div>
 
@@ -563,7 +565,7 @@ onUnmounted(async () => {
       <article class="preview-column preview-column--canvas">
         <div class="preview-column__head">
           <strong>{{ copy("原文", "Source") }}</strong>
-          <span>{{ state.previewJob?.input_file?.original_name }}</span>
+          <span :title="state.previewJob?.input_file?.original_name">{{ state.previewJob?.input_file?.original_name }}</span>
         </div>
 
         <div class="preview-zoom-control">
@@ -602,6 +604,10 @@ onUnmounted(async () => {
           >
             <div class="pdf-canvas-shell">
               <canvas class="pdf-canvas" :data-page="page.page_num"></canvas>
+              <div class="pdf-page-loader" aria-hidden="true">
+                <span class="pdf-page-spinner"></span>
+                <span>{{ copy("页面加载中", "Loading page") }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -613,7 +619,7 @@ onUnmounted(async () => {
       <article v-if="!isEditing" class="preview-column preview-column--canvas">
         <div class="preview-column__head">
           <strong>{{ copy("译文", "Translated") }}</strong>
-          <span>{{ title }}</span>
+          <span :title="title">{{ title }}</span>
         </div>
 
         <div class="preview-zoom-control">
@@ -652,6 +658,10 @@ onUnmounted(async () => {
           >
             <div class="pdf-canvas-shell">
               <canvas class="pdf-canvas" :data-page="page.page_num"></canvas>
+              <div class="pdf-page-loader" aria-hidden="true">
+                <span class="pdf-page-spinner"></span>
+                <span>{{ copy("页面加载中", "Loading page") }}</span>
+              </div>
             </div>
           </div>
         </div>

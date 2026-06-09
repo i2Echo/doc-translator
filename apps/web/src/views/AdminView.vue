@@ -2,7 +2,18 @@
 import { computed, reactive, watch } from "vue";
 import { useRouter } from "vue-router";
 import AppSelect from "../components/AppSelect.vue";
-import { copy, createUser, isAdmin, refreshAll, saveSettings, state, testModel, toggleUserState } from "../store";
+import {
+  copy,
+  createUser,
+  isAdmin,
+  loadAuditPage,
+  loadMoreUsers,
+  refreshAll,
+  saveSettings,
+  state,
+  testModel,
+  toggleUserState,
+} from "../store";
 import { formatBytes, formatDate, formatRole } from "../utils";
 
 const props = defineProps({
@@ -41,6 +52,10 @@ const roleOptions = computed(() => [
 ]);
 
 const activePage = computed(() => (pages.includes(props.page) ? props.page : "settings"));
+const visibleUserCount = computed(() => state.users.length);
+const auditTotalPages = computed(() => Math.max(1, Math.ceil(state.auditPage.total / state.auditPage.limit)));
+const auditPageStart = computed(() => (state.auditPage.total ? state.auditPage.offset + 1 : 0));
+const auditPageEnd = computed(() => Math.min(state.auditPage.offset + state.audit.length, state.auditPage.total));
 
 watch(
   () => state.settings,
@@ -101,6 +116,34 @@ async function submitUser() {
   } catch (error) {
     state.messages.users = error.message;
   }
+}
+
+function handleUserListScroll(event) {
+  const element = event.currentTarget;
+  if (!element || state.pending.userList || !state.usersPage.hasMore) {
+    return;
+  }
+  const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+  if (remaining <= 120) {
+    loadMoreUsers().catch((error) => {
+      state.messages.users = error.message;
+    });
+  }
+}
+
+function requestMoreUsers() {
+  loadMoreUsers().catch((error) => {
+    state.messages.users = error.message;
+  });
+}
+
+function changeAuditPage(page) {
+  if (page < 1 || page > auditTotalPages.value || page === state.auditPage.page || state.pending.audit) {
+    return;
+  }
+  loadAuditPage(page).catch((error) => {
+    state.messages.audit = error.message;
+  });
 }
 </script>
 
@@ -230,14 +273,14 @@ async function submitUser() {
         </form>
       </section>
 
-      <section v-else-if="activePage === 'users'" class="panel">
-        <div class="panel-heading">
-          <p class="eyebrow">{{ copy("用户管理", "Users") }}</p>
-          <h2>{{ copy("新增账号并调整权限", "Create accounts and adjust access") }}</h2>
-        </div>
+      <section v-else-if="activePage === 'users'" class="admin-users-panel">
+        <aside class="panel admin-user-sidebar">
+          <div class="panel-heading">
+            <p class="eyebrow">{{ copy("用户管理", "Users") }}</p>
+            <h2>{{ copy("新增账号", "Create account") }}</h2>
+          </div>
 
-        <form class="form-stack" @submit.prevent="submitUser">
-          <div class="compact-grid two-up">
+          <form class="form-stack" @submit.prevent="submitUser">
             <label class="field">
               <span>{{ copy("姓名", "Full name") }}</span>
               <span class="control-shell">
@@ -264,41 +307,61 @@ async function submitUser() {
                 :aria-label="copy('角色', 'Role')"
               />
             </label>
-          </div>
-          <div class="button-row">
             <button class="primary-button" type="submit" :disabled="state.pending.userCreate">
               {{ state.pending.userCreate ? copy("创建中…", "Creating...") : copy("创建用户", "Create user") }}
             </button>
-          </div>
-          <p v-if="state.messages.users" class="message">{{ state.messages.users }}</p>
-        </form>
+            <p v-if="state.messages.users" class="message">{{ state.messages.users }}</p>
+          </form>
+        </aside>
 
-        <div class="user-list">
-          <article v-for="user in state.users" :key="user.id" class="user-card">
+        <section class="panel admin-user-list-panel">
+          <div class="admin-list-heading">
             <div>
-              <strong>{{ user.full_name }}</strong>
-              <p class="subtle">{{ user.email }}</p>
+              <p class="eyebrow">{{ copy("账号列表", "Accounts") }}</p>
+              <h2>{{ copy("权限与状态", "Access and status") }}</h2>
             </div>
-            <div class="user-meta">
-              <span class="status-pill">{{ formatRole(user.role, copy) }}</span>
-              <span class="status-pill" :data-status="user.is_active ? 'completed' : 'cancelled'">
-                {{ user.is_active ? copy("启用中", "Active") : copy("已停用", "Disabled") }}
-              </span>
-            </div>
-            <div class="button-row tight">
-              <button class="ghost-button" type="button" @click="toggleUserState(user.id, { is_active: !user.is_active })">
-                {{ user.is_active ? copy("停用", "Disable") : copy("启用", "Enable") }}
-              </button>
-              <button
-                class="ghost-button"
-                type="button"
-                @click="toggleUserState(user.id, { role: user.role === 'admin' ? 'user' : 'admin' })"
-              >
-                {{ user.role === "admin" ? copy("降为用户", "Make user") : copy("提升管理员", "Make admin") }}
-              </button>
-            </div>
-          </article>
-        </div>
+            <span class="status-pill">{{ visibleUserCount }} / {{ state.usersPage.total }}</span>
+          </div>
+
+          <div class="user-list admin-scroll-list" @scroll="handleUserListScroll">
+            <article v-for="user in state.users" :key="user.id" class="user-card user-card--row">
+              <div class="user-card-main">
+                <div>
+                  <strong>{{ user.full_name }}</strong>
+                  <p class="subtle">{{ user.email }}</p>
+                </div>
+                <div class="user-meta">
+                  <span class="status-pill">{{ formatRole(user.role, copy) }}</span>
+                  <span class="status-pill" :data-status="user.is_active ? 'completed' : 'cancelled'">
+                    {{ user.is_active ? copy("启用中", "Active") : copy("已停用", "Disabled") }}
+                  </span>
+                </div>
+              </div>
+              <div class="button-row tight user-card-actions">
+                <button class="ghost-button" type="button" @click="toggleUserState(user.id, { is_active: !user.is_active })">
+                  {{ user.is_active ? copy("停用", "Disable") : copy("启用", "Enable") }}
+                </button>
+                <button
+                  class="ghost-button"
+                  type="button"
+                  @click="toggleUserState(user.id, { role: user.role === 'admin' ? 'user' : 'admin' })"
+                >
+                  {{ user.role === "admin" ? copy("降为用户", "Make user") : copy("提升管理员", "Make admin") }}
+                </button>
+              </div>
+            </article>
+
+            <div v-if="state.pending.userList" class="list-footer">{{ copy("加载中…", "Loading...") }}</div>
+            <button
+              v-else-if="state.usersPage.hasMore"
+              class="ghost-button list-footer-button"
+              type="button"
+              @click="requestMoreUsers"
+            >
+              {{ copy("加载更多", "Load more") }}
+            </button>
+          </div>
+        </section>
       </section>
 
       <section v-else-if="activePage === 'storage'" class="panel">
@@ -324,13 +387,16 @@ async function submitUser() {
         </div>
       </section>
 
-      <section v-else class="panel">
-        <div class="panel-heading">
-          <p class="eyebrow">{{ copy("审计日志", "Audit log") }}</p>
-          <h2>{{ copy("最近操作记录", "Recent actions") }}</h2>
+      <section v-else class="panel admin-audit-panel">
+        <div class="admin-list-heading">
+          <div>
+            <p class="eyebrow">{{ copy("审计日志", "Audit log") }}</p>
+            <h2>{{ copy("最近操作记录", "Recent actions") }}</h2>
+          </div>
+          <span class="status-pill">{{ auditPageStart }}-{{ auditPageEnd }} / {{ state.auditPage.total }}</span>
         </div>
 
-        <div class="timeline">
+        <div class="timeline admin-scroll-list">
           <article v-for="entry in state.audit" :key="entry.id" class="timeline-item">
             <div class="timeline-item-head">
               <strong>{{ entry.action }}</strong>
@@ -340,7 +406,19 @@ async function submitUser() {
               {{ entry.actor?.full_name || "System" }} · {{ entry.entity_type }} · {{ entry.entity_id || "—" }}
             </p>
           </article>
+          <div v-if="state.pending.audit" class="list-footer">{{ copy("加载中…", "Loading...") }}</div>
+          <div v-else-if="!state.audit.length" class="empty-state">{{ copy("暂无审计记录。", "No audit records.") }}</div>
         </div>
+
+        <footer class="admin-pagination-bar">
+          <button class="ghost-button" type="button" :disabled="state.auditPage.page <= 1 || state.pending.audit" @click="changeAuditPage(state.auditPage.page - 1)">
+            {{ copy("上一页", "Previous") }}
+          </button>
+          <span>{{ state.auditPage.page }} / {{ auditTotalPages }}</span>
+          <button class="ghost-button" type="button" :disabled="state.auditPage.page >= auditTotalPages || state.pending.audit" @click="changeAuditPage(state.auditPage.page + 1)">
+            {{ copy("下一页", "Next") }}
+          </button>
+        </footer>
       </section>
     </template>
   </main>

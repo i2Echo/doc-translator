@@ -136,6 +136,15 @@ svg {
   overflow: hidden;
 }
 
+.app-frame--admin {
+  height: 100vh;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding-bottom: 18px;
+  overflow: hidden;
+}
+
 .app-frame--preview {
   width: 100vw;
   height: 100vh;
@@ -263,6 +272,23 @@ svg {
 .brand-block {
   display: grid;
   gap: 2px;
+  min-width: 0;
+}
+
+.brand-block h1,
+.brand-block .subtle,
+.upload-copy .subtle,
+.job-card-copy .subtle,
+.job-file,
+.meta-card strong,
+.mini-stat strong,
+.preview-fixed-bar__copy h1,
+.preview-fixed-bar__copy p,
+.preview-column__head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .topbar-actions {
@@ -473,6 +499,18 @@ svg {
   gap: 18px;
 }
 
+.admin-layout {
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.admin-layout > .panel:not(.admin-nav-panel) {
+  min-height: 0;
+  overflow: auto;
+}
+
 .workspace-grid {
   grid-template-columns: minmax(300px, 0.92fr) minmax(340px, 1.05fr) minmax(300px, 0.95fr);
   grid-template-areas: "upload jobs detail";
@@ -530,6 +568,7 @@ svg {
   display: grid;
   gap: 6px;
   align-content: center;
+  min-width: 0;
 }
 
 .upload-dropzone input[type="file"] {
@@ -566,6 +605,7 @@ svg {
   flex: 1;
   display: grid;
   gap: 4px;
+  min-width: 0;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -580,6 +620,12 @@ svg {
   letter-spacing: 0.08em;
 }
 
+.mini-stat strong,
+.meta-card strong {
+  display: block;
+  max-width: 100%;
+}
+
 .job-list,
 .timeline,
 .user-list {
@@ -591,6 +637,102 @@ svg {
   overflow: auto;
   padding-right: 4px;
   margin-top: 8px;
+}
+
+.admin-users-panel {
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 18px;
+  overflow: hidden;
+}
+
+.admin-user-sidebar,
+.admin-user-list-panel,
+.admin-audit-panel {
+  min-height: 0;
+  height: 100%;
+}
+
+.admin-user-sidebar {
+  overflow: auto;
+}
+
+.admin-user-list-panel,
+.admin-audit-panel {
+  display: grid;
+  overflow: hidden;
+}
+
+.admin-user-list-panel {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.admin-audit-panel {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.admin-list-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.admin-scroll-list {
+  min-height: 0;
+  margin-top: 0;
+  overflow: auto;
+}
+
+.user-card--row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+}
+
+.user-card-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+}
+
+.user-card-actions {
+  justify-content: flex-end;
+}
+
+.list-footer,
+.list-footer-button {
+  justify-self: center;
+  margin: 8px 0 2px;
+}
+
+.list-footer {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 250, 244, 0.74), rgba(255, 250, 244, 0.98));
+}
+
+.admin-pagination-bar span {
+  min-width: 72px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .card-scroll-body,
@@ -725,7 +867,6 @@ svg {
 
 .job-file {
   margin: 0;
-  line-break: anywhere;
 }
 
 .job-progress-inline {
@@ -799,6 +940,7 @@ svg {
 .preview-fixed-bar__copy {
   display: grid;
   gap: 2px;
+  min-width: 0;
 }
 
 .preview-fixed-bar__copy h1 {
@@ -858,14 +1000,17 @@ svg {
 .preview-column__head {
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
+  min-width: 0;
 }
 
 .preview-column__head strong {
+  flex: 0 0 auto;
   font-size: 12px;
   font-family: var(--font-display);
 }
 
 .preview-column__head span {
+  flex: 1 1 auto;
   color: var(--muted);
   font-size: 11px;
 }
@@ -918,6 +1063,7 @@ svg {
 }
 
 .pdf-canvas-shell {
+  position: relative;
   width: 100%;
   aspect-ratio: var(--pdf-page-aspect, var(--pdf-stage-aspect, 0.772));
   display: flex;
@@ -932,6 +1078,48 @@ svg {
   border-radius: 12px;
   box-shadow: 0 20px 44px rgba(47, 33, 20, 0.12);
   background: #fff;
+}
+
+.pdf-page-loader {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  color: var(--muted);
+  background:
+    linear-gradient(90deg, rgba(255, 250, 242, 0), rgba(255, 255, 255, 0.78), rgba(255, 250, 242, 0)),
+    #fffaf2;
+  border-radius: 12px;
+  box-shadow: 0 20px 44px rgba(47, 33, 20, 0.1);
+  opacity: 1;
+  transition: opacity 160ms ease;
+  pointer-events: none;
+}
+
+.pdf-page-loader span:last-child {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pdf-page-spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid rgba(15, 110, 106, 0.18);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pdf-page-spin 800ms linear infinite;
+}
+
+.pdf-canvas[data-rendered="true"] + .pdf-page-loader {
+  opacity: 0;
+}
+
+@keyframes pdf-page-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .floating-page-chip {

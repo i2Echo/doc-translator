@@ -9,6 +9,7 @@ const route = useRoute();
 const router = useRouter();
 const isPreviewRoute = computed(() => route.name === "preview");
 const isWorkspaceRoute = computed(() => isAuthenticated.value && route.name === "workspace");
+const isAdminRoute = computed(() => isAuthenticated.value && route.name === "admin");
 const uiLanguageOptions = [
   { value: "zh-CN", label: "简体中文" },
   { value: "en", label: "English" },
@@ -43,7 +44,7 @@ onMounted(() => {
 
     <div
       class="app-frame"
-      :class="{ 'app-frame--preview': isPreviewRoute, 'app-frame--workspace': isWorkspaceRoute }"
+      :class="{ 'app-frame--preview': isPreviewRoute, 'app-frame--workspace': isWorkspaceRoute, 'app-frame--admin': isAdminRoute }"
     >
       <LoginView v-if="!isAuthenticated" />
 

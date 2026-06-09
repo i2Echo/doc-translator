@@ -1,3 +1,7 @@
+x-backend-build: &backend-build
+  context: .
+  dockerfile: infra/docker/backend.Dockerfile
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -27,9 +31,8 @@ services:
       retries: 5
 
   api:
-    build:
-      context: .
-      dockerfile: infra/docker/backend.Dockerfile
+    image: doc-translator-backend:latest
+    build: *backend-build
     env_file:
       - .env
     environment:
@@ -48,6 +51,7 @@ services:
       - "${API_BIND_HOST:-0.0.0.0}:8000:8000"
     volumes:
       - files_data:/data/files
+      - babeldoc_cache:/root/.cache/babeldoc
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live')"]
       interval: 15s
@@ -55,9 +59,8 @@ services:
       retries: 5
 
   worker:
-    build:
-      context: .
-      dockerfile: infra/docker/backend.Dockerfile
+    image: doc-translator-backend:latest
+    build: *backend-build
     env_file:
       - .env
     environment:

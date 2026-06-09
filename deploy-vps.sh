@@ -8,6 +8,7 @@ ENV_EXAMPLE_FILE="${PROJECT_ROOT}/.env.example"
 VPS_ENV_EXAMPLE_FILE="${PROJECT_ROOT}/.env.vps.example"
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-600}"
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.vps.yml)
+COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT:-1}"
 SERVICES=(postgres redis api worker web)
 NGINX_SITE_NAME="doc-translator"
 OS_FAMILY=""
@@ -240,6 +241,29 @@ EOF
       docker-ce-cli
     try_package_install docker-buildx-plugin || true
     try_package_install docker-compose-plugin || try_package_install docker-compose || true
+  fi
+}
+
+ensure_swap() {
+  local swap_file="/swapfile"
+
+  if swapon --show --noheadings | grep -q .; then
+    log "Swap is already available"
+    return
+  fi
+
+  log "Creating 2G swap file for Docker builds"
+  if has_command fallocate; then
+    fallocate -l 2G "${swap_file}" || dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
+  else
+    dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
+  fi
+  chmod 600 "${swap_file}"
+  mkswap "${swap_file}"
+  swapon "${swap_file}"
+
+  if ! grep -qE "^[^#[:space:]]+[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+    printf '%s none swap sw 0 0\n' "${swap_file}" >> /etc/fstab
   fi
 }
 
@@ -654,7 +678,7 @@ configure_env() {
 run_compose() {
   (
     cd "${PROJECT_ROOT}"
-    "${COMPOSE_COMMAND[@]}" "${COMPOSE_FILES[@]}" "$@"
+    COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT}" "${COMPOSE_COMMAND[@]}" "${COMPOSE_FILES[@]}" "$@"
   )
 }
 
@@ -742,6 +766,7 @@ main() {
   install_system_packages
   install_docker
   ensure_docker_ready
+  ensure_swap
   ensure_env_file
   configure_env
   start_stack

@@ -6,6 +6,8 @@ const UI_LANGUAGE_STORAGE_KEY = "doc-translator.ui-language";
 const DEFAULT_SOURCE_LANGUAGE = "auto";
 const DEFAULT_TARGET_LANGUAGE = "Chinese";
 const POLL_INTERVAL_MS = 15000;
+const USER_PAGE_SIZE = 20;
+const AUDIT_PAGE_SIZE = 10;
 
 export const state = reactive({
   token: window.localStorage.getItem(TOKEN_STORAGE_KEY) || "",
@@ -16,8 +18,21 @@ export const state = reactive({
   selectedJob: null,
   settings: null,
   users: [],
+  usersPage: {
+    total: 0,
+    offset: 0,
+    limit: USER_PAGE_SIZE,
+    hasMore: false,
+  },
   storage: null,
   audit: [],
+  auditPage: {
+    total: 0,
+    offset: 0,
+    limit: AUDIT_PAGE_SIZE,
+    hasMore: false,
+    page: 1,
+  },
   previewJob: null,
   previewData: null,
   previewDraft: null,
@@ -35,6 +50,8 @@ export const state = reactive({
     previewSave: false,
     settings: false,
     userCreate: false,
+    userList: false,
+    audit: false,
     modelTest: false,
   },
   messages: {
@@ -43,6 +60,7 @@ export const state = reactive({
     preview: "",
     settings: "",
     users: "",
+    audit: "",
   },
   pollHandle: null,
 });
@@ -122,8 +140,21 @@ function clearSessionState() {
   state.selectedJob = null;
   state.settings = null;
   state.users = [];
+  state.usersPage = {
+    total: 0,
+    offset: 0,
+    limit: USER_PAGE_SIZE,
+    hasMore: false,
+  };
   state.storage = null;
   state.audit = [];
+  state.auditPage = {
+    total: 0,
+    offset: 0,
+    limit: AUDIT_PAGE_SIZE,
+    hasMore: false,
+    page: 1,
+  };
 }
 
 function clonePreview(preview) {
@@ -282,9 +313,9 @@ export async function refreshAll() {
     const adminPromise = isAdmin.value
       ? Promise.all([
           authedRequest("/settings"),
-          authedRequest("/users"),
+          authedRequest(`/users?offset=0&limit=${USER_PAGE_SIZE}`),
           authedRequest("/storage/summary"),
-          authedRequest("/audit-logs"),
+          authedRequest(`/audit-logs?offset=0&limit=${AUDIT_PAGE_SIZE}`),
         ])
       : Promise.resolve(null);
 
@@ -297,14 +328,86 @@ export async function refreshAll() {
     await refreshSelectedJob();
 
     if (adminData) {
-      const [settings, users, storage, audit] = adminData;
+      const [settings, usersPage, storage, auditPage] = adminData;
       state.settings = settings;
-      state.users = users;
+      state.users = usersPage.items;
+      state.usersPage = {
+        total: usersPage.total,
+        offset: usersPage.offset,
+        limit: usersPage.limit,
+        hasMore: usersPage.has_more,
+      };
       state.storage = storage;
-      state.audit = audit;
+      state.audit = auditPage.items;
+      state.auditPage = {
+        total: auditPage.total,
+        offset: auditPage.offset,
+        limit: auditPage.limit,
+        hasMore: auditPage.has_more,
+        page: Math.floor(auditPage.offset / auditPage.limit) + 1,
+      };
     }
   } finally {
     state.pending.refresh = false;
+  }
+}
+
+export async function loadMoreUsers() {
+  if (state.pending.userList || !state.usersPage.hasMore) {
+    return;
+  }
+
+  state.pending.userList = true;
+  state.messages.users = "";
+  try {
+    const result = await authedRequest(`/users?offset=${state.users.length}&limit=${USER_PAGE_SIZE}`);
+    state.users = [...state.users, ...result.items];
+    state.usersPage = {
+      total: result.total,
+      offset: result.offset,
+      limit: result.limit,
+      hasMore: result.has_more,
+    };
+  } finally {
+    state.pending.userList = false;
+  }
+}
+
+export async function loadUsersPage() {
+  state.pending.userList = true;
+  state.messages.users = "";
+  try {
+    const result = await authedRequest(`/users?offset=0&limit=${USER_PAGE_SIZE}`);
+    state.users = result.items;
+    state.usersPage = {
+      total: result.total,
+      offset: result.offset,
+      limit: result.limit,
+      hasMore: result.has_more,
+    };
+  } finally {
+    state.pending.userList = false;
+  }
+}
+
+export async function loadAuditPage(page = state.auditPage.page) {
+  const nextPage = Math.max(1, page);
+  const offset = (nextPage - 1) * AUDIT_PAGE_SIZE;
+
+  state.pending.audit = true;
+  state.messages.audit = "";
+  try {
+    const result = await authedRequest(`/audit-logs?offset=${offset}&limit=${AUDIT_PAGE_SIZE}`);
+    state.audit = result.items;
+    state.auditPage = {
+      total: result.total,
+      offset: result.offset,
+      limit: result.limit,
+      hasMore: result.has_more,
+      page: Math.floor(result.offset / result.limit) + 1,
+    };
+  } finally {
+    state.pending.audit = false;
   }
 }
 
@@ -392,20 +495,20 @@ export async function createUser(payload) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    await loadUsersPage();
     state.messages.users = copy("用户已创建。", "User created.");
-    await refreshAll();
   } finally {
     state.pending.userCreate = false;
   }
 }
 
 export async function toggleUserState(userId, payload) {
-  await authedRequest(`/users/${userId}`, {
+  const updatedUser = await authedRequest(`/users/${userId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  await refreshAll();
+  state.users = state.users.map((user) => (user.id === updatedUser.id ? updatedUser : user));
 }
 
 function loadPreviewDocuments(jobId, revision) {

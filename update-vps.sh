@@ -7,6 +7,7 @@ COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.vps.yml)
 SERVICES=(postgres redis api worker web)
 STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-600}"
 BRANCH="${BRANCH:-}"
+COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT:-1}"
 COMPOSE_COMMAND=()
 
 log() {
@@ -76,10 +77,33 @@ update_repo() {
   git -C "${PROJECT_ROOT}" pull --ff-only origin "${branch}"
 }
 
+ensure_swap() {
+  local swap_file="/swapfile"
+
+  if swapon --show --noheadings | grep -q .; then
+    log "Swap is already available"
+    return
+  fi
+
+  log "Creating 2G swap file for Docker builds"
+  if has_command fallocate; then
+    fallocate -l 2G "${swap_file}" || dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
+  else
+    dd if=/dev/zero of="${swap_file}" bs=1M count=2048 status=none
+  fi
+  chmod 600 "${swap_file}"
+  mkswap "${swap_file}"
+  swapon "${swap_file}"
+
+  if ! grep -qE "^[^#[:space:]]+[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+    printf '%s none swap sw 0 0\n' "${swap_file}" >> /etc/fstab
+  fi
+}
+
 run_compose() {
   (
     cd "${PROJECT_ROOT}"
-    "${COMPOSE_COMMAND[@]}" "${COMPOSE_FILES[@]}" "$@"
+    COMPOSE_PARALLEL_LIMIT="${COMPOSE_PARALLEL_LIMIT}" "${COMPOSE_COMMAND[@]}" "${COMPOSE_FILES[@]}" "$@"
   )
 }
 
@@ -157,6 +181,7 @@ main() {
   assert_project_root
   detect_compose_command
   assert_clean_worktree
+  ensure_swap
   branch="$(resolve_branch)"
   update_repo "${branch}"
   update_stack

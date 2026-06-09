@@ -10,7 +10,7 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        fonts-noto-cjk \
+        fonts-wqy-zenhei \
         libglib2.0-0 \
         libgl1 \
         libgomp1 \
@@ -28,6 +28,8 @@ RUN python -m pip install --break-system-packages --no-cache-dir -i "${PIP_INDEX
     && python -m pip install --break-system-packages --no-cache-dir --only-binary=onnx,onnxruntime,opencv-python-headless,scikit-learn,scipy -i "${PIP_INDEX_URL}" BabelDOC==0.6.2 \
     && python /tmp/patch_babeldoc.py
 
-COPY . /app
+COPY alembic.ini /app/alembic.ini
+COPY apps/api /app/apps/api
+COPY apps/worker /app/apps/worker
 
 EXPOSE 8000 8001

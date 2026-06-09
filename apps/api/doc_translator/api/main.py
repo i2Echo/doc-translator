@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import func
@@ -20,6 +20,7 @@ from doc_translator.preview import load_or_create_preview, update_preview
 from doc_translator.queueing import enqueue_job, get_redis_client
 from doc_translator.schemas import (
     AuditLogRead,
+    AuditLogListRead,
     JobDetail,
     JobPreviewRead,
     JobPreviewUpdate,
@@ -31,6 +32,7 @@ from doc_translator.schemas import (
     StorageSummary,
     TokenResponse,
     UserCreate,
+    UserListRead,
     UserRead,
     UserUpdate,
 )
@@ -149,10 +151,23 @@ def ready() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/api/v1/users", response_model=list[UserRead])
-def list_users(_: User = Depends(require_admin), session: Session = Depends(get_db)) -> list[UserRead]:
-    users = session.query(User).order_by(User.created_at.desc()).all()
-    return [UserRead.model_validate(user) for user in users]
+@app.get("/api/v1/users", response_model=UserListRead)
+def list_users(
+    _: User = Depends(require_admin),
+    session: Session = Depends(get_db),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> UserListRead:
+    query = session.query(User)
+    total = session.query(func.count(User.id)).scalar() or 0
+    users = query.order_by(User.created_at.desc()).offset(offset).limit(limit).all()
+    return UserListRead(
+        items=[UserRead.model_validate(user) for user in users],
+        total=total,
+        offset=offset,
+        limit=limit,
+        has_more=offset + len(users) < total,
+    )
 
 
 @app.post("/api/v1/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
@@ -481,10 +496,23 @@ def save_job_preview(
     return JobPreviewRead.model_validate(preview)
 
 
-@app.get("/api/v1/audit-logs", response_model=list[AuditLogRead])
-def list_audit_logs(_: User = Depends(require_admin), session: Session = Depends(get_db)) -> list[AuditLogRead]:
-    logs = session.query(AuditLog).options(selectinload(AuditLog.actor)).order_by(AuditLog.created_at.desc()).limit(250).all()
-    return [AuditLogRead.model_validate(log) for log in logs]
+@app.get("/api/v1/audit-logs", response_model=AuditLogListRead)
+def list_audit_logs(
+    _: User = Depends(require_admin),
+    session: Session = Depends(get_db),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=100),
+) -> AuditLogListRead:
+    query = session.query(AuditLog).options(selectinload(AuditLog.actor))
+    total = session.query(func.count(AuditLog.id)).scalar() or 0
+    logs = query.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit).all()
+    return AuditLogListRead(
+        items=[AuditLogRead.model_validate(log) for log in logs],
+        total=total,
+        offset=offset,
+        limit=limit,
+        has_more=offset + len(logs) < total,
+    )
 
 
 @app.get("/api/v1/storage/summary", response_model=StorageSummary)

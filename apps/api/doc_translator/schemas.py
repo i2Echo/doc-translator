@@ -19,6 +19,14 @@ class UserRead(ORMModel):
     created_at: datetime
 
 
+class UserListRead(BaseModel):
+    items: list[UserRead]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=1, max_length=255)
@@ -212,6 +220,14 @@ class AuditLogRead(ORMModel):
     details: dict[str, Any] | None
     created_at: datetime
     actor: UserRead | None = None
+
+
+class AuditLogListRead(BaseModel):
+    items: list[AuditLogRead]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
 
 
 class StorageSummary(BaseModel):

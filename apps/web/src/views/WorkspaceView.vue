@@ -185,7 +185,7 @@ function canCancel(job) {
         >
           <div class="job-card-main">
             <div class="job-card-copy">
-              <p class="job-file">{{ job.input_file.original_name }}</p>
+              <p class="job-file" :title="job.input_file.original_name">{{ job.input_file.original_name }}</p>
               <p class="subtle">{{ fileKindLabel(job.input_file.original_name) }} · {{ formatDate(job.created_at) }}</p>
               <p class="subtle">
                 {{ languageName(job.source_language) }} → {{ languageName(job.target_language) }}
@@ -262,15 +262,15 @@ function canCancel(job) {
             </div>
             <div class="meta-card">
               <span>{{ copy("模型", "Model") }}</span>
-              <strong>{{ state.selectedJob.model_name_snapshot }}</strong>
+              <strong :title="state.selectedJob.model_name_snapshot">{{ state.selectedJob.model_name_snapshot }}</strong>
             </div>
             <div class="meta-card">
               <span>{{ copy("原文件", "Input file") }}</span>
-              <strong>{{ state.selectedJob.input_file.original_name }}</strong>
+              <strong :title="state.selectedJob.input_file.original_name">{{ state.selectedJob.input_file.original_name }}</strong>
             </div>
             <div class="meta-card">
               <span>{{ copy("输出文件", "Output file") }}</span>
-              <strong>{{ state.selectedJob.output_file?.original_name || "—" }}</strong>
+              <strong :title="state.selectedJob.output_file?.original_name || ''">{{ state.selectedJob.output_file?.original_name || "—" }}</strong>
             </div>
           </div>
 
