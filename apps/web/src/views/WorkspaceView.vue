@@ -11,13 +11,13 @@ import {
   retryJob,
   selectJob,
   state,
-  uploadJob,
+  uploadJobs,
 } from "../store";
 import { fileKindLabel, formatBytes, formatDate, formatJobStatus, languageName, sourceLanguageOptions, targetLanguageOptions } from "../utils";
 
 const router = useRouter();
 const uploadForm = reactive({
-  file: null,
+  files: [],
   ...defaultUploadState(),
 });
 const fileInputRef = ref(null);
@@ -26,35 +26,69 @@ const activeJobs = computed(() =>
 );
 const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
 const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
+const supportedUploadExtensions = new Set([".pdf", ".docx"]);
 
 const workspaceModel = computed(() => {
   return state.settings?.model_name || state.jobs[0]?.model_name_snapshot || copy("托管模型", "Managed model");
 });
 
+function fileKey(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function isSupportedUploadFile(file) {
+  const extensionIndex = file.name.lastIndexOf(".");
+  const extension = extensionIndex >= 0 ? file.name.slice(extensionIndex).toLowerCase() : "";
+  return supportedUploadExtensions.has(extension);
+}
+
+function addFiles(fileList) {
+  const existingKeys = new Set(uploadForm.files.map(fileKey));
+  const selectedFiles = Array.from(fileList || []);
+  const nextFiles = selectedFiles.filter((file) => {
+    const key = fileKey(file);
+    if (!isSupportedUploadFile(file) || existingKeys.has(key)) {
+      return false;
+    }
+    existingKeys.add(key);
+    return true;
+  });
+  uploadForm.files.push(...nextFiles);
+  if (selectedFiles.length && !nextFiles.length) {
+    state.messages.upload = copy("没有新的 PDF 或 DOCX 文件可加入。", "No new PDF or DOCX files to add.");
+  } else if (nextFiles.length) {
+    state.messages.upload = "";
+  }
+}
+
 function onFileChange(event) {
-  const [file] = event.target.files || [];
-  uploadForm.file = file || null;
+  addFiles(event.target.files);
+  event.target.value = "";
+}
+
+function onFileDrop(event) {
+  addFiles(event.dataTransfer?.files);
 }
 
 function openFilePicker() {
   fileInputRef.value?.click();
 }
 
+function removeUploadFile(index) {
+  uploadForm.files.splice(index, 1);
+}
+
 async function submitUpload() {
-  if (!uploadForm.file) {
+  if (!uploadForm.files.length) {
     state.messages.upload = copy("请先选择 PDF 或 DOCX 文件。", "Choose a PDF or DOCX file first.");
     return;
   }
 
   try {
-    await uploadJob(uploadForm.file, uploadForm.sourceLanguage, uploadForm.targetLanguage);
-    uploadForm.file = null;
+    await uploadJobs(uploadForm.files, uploadForm.sourceLanguage, uploadForm.targetLanguage);
+    uploadForm.files = [];
     uploadForm.sourceLanguage = "auto";
     uploadForm.targetLanguage = "Chinese";
-    const fileInput = document.getElementById("upload-file-input");
-    if (fileInput) {
-      fileInput.value = "";
-    }
   } catch (error) {
     state.messages.upload = error.message;
   }
@@ -91,20 +125,21 @@ function canCancel(job) {
       </div>
 
       <form class="form-stack card-scroll-body" @submit.prevent="submitUpload">
-        <label class="upload-dropzone" for="upload-file-input">
+        <label class="upload-dropzone" for="upload-file-input" @dragover.prevent @drop.prevent="onFileDrop">
           <input
             id="upload-file-input"
             ref="fileInputRef"
             type="file"
+            multiple
             accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             @change="onFileChange"
           />
           <div class="upload-copy">
-            <strong>{{ copy("拖拽或选择 PDF / DOCX", "Drop or choose a PDF / DOCX") }}</strong>
+            <strong>{{ copy("拖拽或选择 PDF / DOCX", "Drop or choose PDF / DOCX files") }}</strong>
             <p class="subtle">
               {{
-                uploadForm.file
-                  ? `${uploadForm.file.name} · ${formatBytes(uploadForm.file.size)}`
+                uploadForm.files.length
+                  ? copy(`已加入 ${uploadForm.files.length} 个待翻译文件。`, `${uploadForm.files.length} files ready to translate.`)
                   : copy("支持直接排队翻译并进入在线校对。", "Queue translation and review online.")
               }}
             </p>
@@ -113,6 +148,28 @@ function canCancel(job) {
             {{ copy("选择文件", "Choose file") }}
           </button>
         </label>
+
+        <div v-if="uploadForm.files.length" class="upload-file-list">
+          <article v-for="(file, index) in uploadForm.files" :key="`${fileKey(file)}:${index}`" class="upload-file-card">
+            <button
+              class="icon-button icon-button--bare icon-button--tiny upload-file-remove"
+              type="button"
+              :aria-label="copy('移除文件', 'Remove file')"
+              :title="copy('移除文件', 'Remove file')"
+              :disabled="state.pending.upload"
+              @click="removeUploadFile(index)"
+            >
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <path d="m5.5 5.5 9 9" />
+                <path d="m14.5 5.5-9 9" />
+              </svg>
+            </button>
+            <div class="upload-file-copy">
+              <strong :title="file.name">{{ file.name }}</strong>
+              <span>{{ fileKindLabel(file.name) }} · {{ formatBytes(file.size) }}</span>
+            </div>
+          </article>
+        </div>
 
         <div class="compact-grid two-up">
           <label class="field">

@@ -583,6 +583,55 @@ svg {
   font-size: 13px;
 }
 
+.upload-file-list {
+  display: grid;
+  gap: 8px;
+}
+
+.upload-file-card {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  padding: 12px 40px 12px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 252, 246, 0.78);
+}
+
+.upload-file-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.upload-file-copy strong,
+.upload-file-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-file-copy strong {
+  font-size: 12px;
+}
+
+.upload-file-copy span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.upload-file-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  color: var(--muted);
+}
+
+.upload-file-remove:hover {
+  background: rgba(157, 58, 40, 0.08);
+  color: var(--danger);
+}
+
 .compact-grid {
   display: grid;
   gap: 10px;
@@ -1307,6 +1356,36 @@ svg {
     justify-items: end;
     justify-content: flex-end;
   }
+
+  .app-frame--admin {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .admin-layout {
+    height: auto;
+    grid-template-rows: auto;
+    overflow: visible;
+  }
+
+  .admin-layout > .panel:not(.admin-nav-panel),
+  .admin-users-panel,
+  .admin-user-sidebar,
+  .admin-user-list-panel,
+  .admin-audit-panel {
+    min-width: 0;
+    height: auto;
+    overflow: visible;
+  }
+
+  .admin-users-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-scroll-list {
+    overflow: visible;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1337,5 +1416,19 @@ svg {
 
   .editor-fixed-pagination {
     flex-wrap: wrap;
+  }
+
+  .admin-list-heading,
+  .user-card-main {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .user-card--row {
+    grid-template-columns: 1fr;
+  }
+
+  .user-card-actions {
+    justify-content: flex-start;
   }
 }

@@ -421,20 +421,24 @@ export async function selectJob(jobId) {
   await refreshSelectedJob();
 }
 
-export async function uploadJob(file, sourceLanguage, targetLanguage) {
-  const formData = new FormData();
-  formData.set("file", file);
-  formData.set("source_language", sourceLanguage || DEFAULT_SOURCE_LANGUAGE);
-  formData.set("target_language", targetLanguage || DEFAULT_TARGET_LANGUAGE);
-
+export async function uploadJobs(files, sourceLanguage, targetLanguage) {
+  const queue = Array.from(files);
   state.pending.upload = true;
   state.messages.upload = "";
   try {
-    await authedRequest("/jobs/upload", {
-      method: "POST",
-      body: formData,
-    });
-    state.messages.upload = copy("任务已加入队列。", "Job queued.");
+    for (const file of queue) {
+      const formData = new FormData();
+      formData.set("file", file);
+      formData.set("source_language", sourceLanguage || DEFAULT_SOURCE_LANGUAGE);
+      formData.set("target_language", targetLanguage || DEFAULT_TARGET_LANGUAGE);
+
+      await authedRequest("/jobs/upload", {
+        method: "POST",
+        body: formData,
+      });
+    }
+    state.messages.upload =
+      queue.length === 1 ? copy("任务已加入队列。", "Job queued.") : copy(`${queue.length} 个任务已加入队列。`, `${queue.length} jobs queued.`);
     await refreshAll();
   } finally {
     state.pending.upload = false;
