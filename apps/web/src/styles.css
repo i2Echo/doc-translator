@@ -787,7 +787,7 @@ svg {
   display: grid;
   justify-items: end;
   gap: 8px;
-  min-width: 120px;
+  min-width: 70px;
 }
 
 .job-card-head,
@@ -1298,14 +1298,14 @@ svg {
   }
 
   .job-card-main {
-    grid-template-columns: 1fr;
-    align-items: flex-start;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
   }
 
   .job-card-side,
   .job-actions {
-    justify-items: start;
-    justify-content: flex-start;
+    justify-items: end;
+    justify-content: flex-end;
   }
 }
 

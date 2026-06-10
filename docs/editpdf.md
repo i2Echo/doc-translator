@@ -166,3 +166,63 @@ Industrial semiconductor data sheets cannot tolerate numerical or unit truncatio
 * **Frontend Validator:** For fields parsed as electrical specs, parameters, or tolerances (e.g., matching Regex `\d+\s*(V|mA|µA|°C|MHz|Ω)`), the input component must activate a strict validation lock:
   * **Rule:** If the user accidental deletes the unit (e.g., changing "3.3V" to "3.3"), the input field turns red, blocks the update save, and prompts: "Warning: Engineering unit missing."
   * **Overrun Prevention:** If font auto-downsizing hits the minimum threshold (`7pt`) inside a pin-header or ball-grid array map, the system must trigger an immediate modal popup blocking the compilation, forcing either translation truncation or page layout geometric manual override.
+
+## 9. Multilingual Character Set & Font Injection Protocol
+
+### 9.1 Dynamic Font Overriding Engine (Global Fallback)
+The backend MUST NOT use the PDF's original embedded fonts for drawing translated text, as they lack the required glyphs for target languages (e.g., CJK characters or specific technical Greek symbols like `Ω`, `µ`).
+* **System Map:** Establish a strict Target-Language-to-Font routing table within the backend configuration:
+  * `zh` (Chinese): Inject **Noto Sans CJK SC** or **Source Han Sans** (TrueType/OpenType).
+  * `de/es/fr` (European): Inject **Liberation Sans** or Standard **Arial** with full Latin-Extended-A support.
+  * `ja` (Japanese): Inject **Noto Sans CJK JP**.
+* **PyMuPDF Implementation Constraint:** Before executing `page.insert_textbox()`, the backend must explicitly register the external font file via `doc.add_font()` or `page.insert_font()`. Never use the default PDF "Standard 14" fonts (like `helv`, `times`) for multi-language backfilling.
+
+### 9.2 Mixed-Character String Splitting & Universal Typeface Stack
+Industrial datasheets often contain mixed strings like `"Max 50V @ 25°C 模拟输入电流"`. A pure Chinese font might render English symbols poorly, while a Western font will choke on Chinese.
+* **Agent Execution Rule:** If the target language contains mixed character sets, instruct the rendering script to use a **Pan-Unicode Composite Font** (such as Google Noto Sans Universal) that natively encapsulates Western typography, technical metrics, and Asian glyphs within a single font file.
+* **Alternative Tokenizer (Optional):** If a universal font is unavailable, implement an automated string tokenizer that splits the text block into `[Latin]` and `[Non-Latin]` arrays, rendering them sequentially using their respective coordinate offsets and matched fonts.
+
+### 9.3 Font Subsetting to Prevent File Explosion (Optimization)
+Embedding a full CJK (Chinese-Japanese-Korean) font package into every processed PDF will cause the output file size to explode (e.g., a 2MB datasheet ballooning into 40MB).
+* **Font Subsetting Core:** The backend pipeline MUST enforce font subsetting.
+* **Mechanism:** When invoking `PyMuPDF` to embed the external `.ttf` or `.otf` font, ensure the `embedding` parameter is set to subset mode (`font.is_embedded = True` or using `PyMuPDF`'s built-in subset engine). This ensures that *only* the specific character glyphs used in the text are compressed and injected into the target PDF structure.
+
+### 9.4 UTF-8 Normalization Pre-flight Check
+* **Rule:** Before any string is sent to the coordinate writing array, pass it through a strict Unicode Normalization wrapper (Python `unicodedata.normalize('NFKC', text)`). This converts full-width alphanumeric anomalies and rogue technical ligatures into standard, globally compatible Unicode code points.
+
+## 11. Comprehensive Global Language Matrix & Font Subsetting Specification
+
+### 11.1 Omnichannel Language Routing Table
+The backend rendering pipeline MUST intercept the `target_language` variable and dynamically apply the exact font assets, scaling multipliers, and layout properties according to this standardized routing dictionary:
+
+| Language Code | Language Name | Target Typeface File (Open-Source / Commercial Free) | Line-Height Multiplier | Default Letter-Spacing | Min Allowed Font-Size | Special Engine Flags |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `zh` | Simplified Chinese | `NotoSansCJKsc-Regular.ttf` | 1.4 | `0` | `8.0pt` | None |
+| `en` | English | `NotoSans-Regular.ttf` | 1.5 | `0` | `6.5pt` | None |
+| `ja` | Japanese | `NotoSansCJKjp-Regular.ttf` | 1.3 | `-0.2px` | `7.5pt` | `Hanjaku_Punctuation_Compress` |
+| `ko` | Korean | `NotoSansCJKkr-Regular.ttf` | 1.4 | `-0.3px` | `8.0pt` | `Kerning_Tight` |
+| `ms` | Malay | `NotoSans-Regular.ttf` | 1.5 | `-0.1px` | `6.0pt` | `Aggressive_Word_Wrap` |
+| `th` | Thai | `NotoSansThai-Regular.ttf` | 1.2 | `0` | `7.5pt` | `Complex_Text_Shaping_Thai` |
+| `vi` | Vietnamese | `NotoSans-Regular.ttf` | 1.25 | `0` | `7.0pt` | `Double_Diacritic_Buffer` |
+
+### 11.2 Specific Language Layout Injectors (Agent Rules)
+
+#### [JAPANESE] Hanjaku Punctuation Compress Rule
+* **Logic:** If `target_language == 'ja'`, the table rendering engine must compress full-width Japanese punctuation marks to half-width equivalents (`font-variant-east-asian: ruby;` in HTML, or custom tracking logic in PyMuPDF) when rendering inside table cells with width $< 80px$.
+
+#### [KOREAN] Hangul Kerning Tight Rule
+* **Logic:** If `target_language == 'ko'`, the strict boundary box algorithm must automatically inject a native negative text-margin/letter-spacing asset to prevent adjacent Korean syllables from visual overlapping inside high-density PCB pinout annotations.
+
+#### [MALAY] Aggressive Word Wrap Rule
+* **Logic:** If `target_language == 'ms'`, the character length expansion factor threshold is set to **1.5x**.
+* **Constraint:** The absolute drawing engine (`insert_textbox` or frontend grid) MUST force `word-break: break-word;` and allow multi-line wrapping even if the original English source was a single line. If vertical space overflows $H_{max}$, the algorithm must step-down font size by `0.8pt` iterations instead of the standard `0.5pt` to rapidly handle the string expansion.
+
+### 11.3 Multi-Font Fallback Pipeline (The Safety Lock)
+In case an industrial file contains mixed global languages (e.g., Japanese technical text containing Vietnamese sample data or German remarks), the rendering library must construct a prioritized fallback array:
+```python
+# Font Stack Blueprint for Backend Agent
+FONT_FALLBACK_STACK = {
+    "primary": CURRENT_TARGET_FONT,
+    "fallback_1": "NotoSans-Regular.ttf",      # Handles western typography/units
+    "fallback_2": "NotoSansCJKsc-Regular.ttf", # Handles CJK and generic symbols
+}

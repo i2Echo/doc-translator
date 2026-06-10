@@ -54,7 +54,7 @@ const subtitle = computed(() => {
   if (!state.previewJob) {
     return "";
   }
-  return `${fileKindLabel(state.previewJob.input_file.original_name)} · ${languageName(state.previewJob.source_language)} → ${languageName(state.previewJob.target_language)}`;
+  return `${fileKindLabel(state.previewJob.input_file.original_name)} · ${languageName(state.previewJob.source_language, copy)} → ${languageName(state.previewJob.target_language, copy)}`;
 });
 
 const pdfPages = computed(() => {

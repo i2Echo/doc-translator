@@ -13,7 +13,7 @@ import {
   state,
   uploadJob,
 } from "../store";
-import { fileKindLabel, formatBytes, formatDate, formatJobStatus, languageName } from "../utils";
+import { fileKindLabel, formatBytes, formatDate, formatJobStatus, languageName, sourceLanguageOptions, targetLanguageOptions } from "../utils";
 
 const router = useRouter();
 const uploadForm = reactive({
@@ -21,21 +21,11 @@ const uploadForm = reactive({
   ...defaultUploadState(),
 });
 const fileInputRef = ref(null);
-const languageOptions = [
-  { value: "auto", label: "Auto / 自动检测" },
-  { value: "Chinese", label: "Chinese / 中文" },
-  { value: "English", label: "English" },
-  { value: "Japanese", label: "Japanese / 日本語" },
-  { value: "Korean", label: "Korean / 한국어" },
-  { value: "German", label: "German / Deutsch" },
-  { value: "French", label: "French / Français" },
-  { value: "Spanish", label: "Spanish / Español" },
-];
-const targetLanguageOptions = languageOptions.filter((option) => option.value !== "auto");
-
 const activeJobs = computed(() =>
   state.jobs.filter((job) => job.status === "queued" || job.status === "running").length
 );
+const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
+const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
 
 const workspaceModel = computed(() => {
   return state.settings?.model_name || state.jobs[0]?.model_name_snapshot || copy("托管模型", "Managed model");
@@ -129,7 +119,7 @@ function canCancel(job) {
             <span>{{ copy("源语言", "Source language") }}</span>
             <AppSelect
               v-model="uploadForm.sourceLanguage"
-              :options="languageOptions"
+              :options="localizedSourceLanguageOptions"
               :aria-label="copy('源语言', 'Source language')"
             />
           </label>
@@ -137,7 +127,7 @@ function canCancel(job) {
             <span>{{ copy("目标语言", "Target language") }}</span>
             <AppSelect
               v-model="uploadForm.targetLanguage"
-              :options="targetLanguageOptions"
+              :options="localizedTargetLanguageOptions"
               :aria-label="copy('目标语言', 'Target language')"
             />
           </label>
@@ -188,7 +178,7 @@ function canCancel(job) {
               <p class="job-file" :title="job.input_file.original_name">{{ job.input_file.original_name }}</p>
               <p class="subtle">{{ fileKindLabel(job.input_file.original_name) }} · {{ formatDate(job.created_at) }}</p>
               <p class="subtle">
-                {{ languageName(job.source_language) }} → {{ languageName(job.target_language) }}
+                {{ languageName(job.source_language, copy) }} → {{ languageName(job.target_language, copy) }}
               </p>
             </div>
 

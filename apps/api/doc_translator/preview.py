@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -30,14 +31,49 @@ PDF_CJK_SERIF_FONTFILES = (
     r"C:\Windows\Fonts\msyh.ttc",
 )
 PDF_CJK_SANS_FONTFILES = (
+    "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansCJKsc-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
+)
+PDF_LATIN_FONTFILES = (
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+)
+PDF_THAI_FONTFILES = (
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+    r"C:\Windows\Fonts\NotoSansThai-Regular.ttf",
+    r"C:\Windows\Fonts\LeelawUI.ttf",
+)
+PDF_CJK_JP_FONTFILES = (
+    "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansCJKjp-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+    r"C:\Windows\Fonts\YuGothM.ttc",
+)
+PDF_CJK_KR_FONTFILES = (
+    "/usr/share/fonts/truetype/noto/NotoSansCJKkr-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansCJKkr-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+    r"C:\Windows\Fonts\malgun.ttf",
 )
 PDF_CJK_SERIF_CACHE_FONTFILES = (
     "SourceHanSerifCN-Regular.ttf",
@@ -46,13 +82,33 @@ PDF_CJK_SERIF_CACHE_FONTFILES = (
     "LXGWWenKaiGB-Regular.1.520.ttf",
 )
 PDF_CJK_SANS_CACHE_FONTFILES = (
+    "NotoSansCJKsc-Regular.ttf",
     "SourceHanSansCN-Regular.ttf",
     "SourceHanSansCN-Bold.ttf",
     "NotoSansCJK-Regular.ttc",
     "LXGWWenKaiGB-Regular.1.520.ttf",
 )
+PDF_LATIN_CACHE_FONTFILES = (
+    "NotoSans-Regular.ttf",
+    "LiberationSans-Regular.ttf",
+)
+PDF_THAI_CACHE_FONTFILES = (
+    "NotoSansThai-Regular.ttf",
+)
+PDF_CJK_JP_CACHE_FONTFILES = (
+    "NotoSansCJKjp-Regular.ttf",
+    "NotoSansCJK-Regular.ttc",
+)
+PDF_CJK_KR_CACHE_FONTFILES = (
+    "NotoSansCJKkr-Regular.ttf",
+    "NotoSansCJK-Regular.ttc",
+)
 PDF_CJK_SERIF_FONTNAME = "noto-serif-cjk"
 PDF_CJK_SANS_FONTNAME = "noto-sans-cjk"
+PDF_LATIN_FONTNAME = "noto-sans-latin"
+PDF_THAI_FONTNAME = "noto-sans-thai"
+PDF_CJK_JP_FONTNAME = "noto-sans-cjk-jp"
+PDF_CJK_KR_FONTNAME = "noto-sans-cjk-kr"
 PDF_MIN_REDRAW_FONT_SIZE = 6.0
 PDF_EDITOR_MIN_FONT_SIZE = 8.0
 PDF_BLOCK_MERGE_IOU_THRESHOLD = 0.3
@@ -134,6 +190,100 @@ class PdfRenderFont:
     metrics_buffer: bytes | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PdfLanguageProfile:
+    code: str
+    font_name: str
+    font_files: tuple[str, ...]
+    cache_font_files: tuple[str, ...]
+    min_font_size: float
+    step_down: float = 0.5
+    line_height_multiplier: float = 1.4
+    prefer_external_font: bool = True
+    aggressive_word_wrap: bool = False
+
+
+PDF_LANGUAGE_ALIASES = {
+    "zh": "zh",
+    "zh-cn": "zh",
+    "chinese": "zh",
+    "simplified chinese": "zh",
+    "en": "en",
+    "english": "en",
+    "ja": "ja",
+    "japanese": "ja",
+    "ko": "ko",
+    "korean": "ko",
+    "ms": "ms",
+    "malay": "ms",
+    "th": "th",
+    "thai": "th",
+    "vi": "vi",
+    "vietnamese": "vi",
+}
+
+PDF_LANGUAGE_PROFILES = {
+    "zh": PdfLanguageProfile(
+        code="zh",
+        font_name=PDF_CJK_SANS_FONTNAME,
+        font_files=PDF_CJK_SANS_FONTFILES,
+        cache_font_files=PDF_CJK_SANS_CACHE_FONTFILES,
+        min_font_size=8.0,
+        line_height_multiplier=1.4,
+    ),
+    "en": PdfLanguageProfile(
+        code="en",
+        font_name=PDF_LATIN_FONTNAME,
+        font_files=PDF_LATIN_FONTFILES,
+        cache_font_files=PDF_LATIN_CACHE_FONTFILES,
+        min_font_size=6.5,
+        line_height_multiplier=1.5,
+    ),
+    "ja": PdfLanguageProfile(
+        code="ja",
+        font_name=PDF_CJK_JP_FONTNAME,
+        font_files=PDF_CJK_JP_FONTFILES,
+        cache_font_files=PDF_CJK_JP_CACHE_FONTFILES,
+        min_font_size=7.5,
+        line_height_multiplier=1.3,
+    ),
+    "ko": PdfLanguageProfile(
+        code="ko",
+        font_name=PDF_CJK_KR_FONTNAME,
+        font_files=PDF_CJK_KR_FONTFILES,
+        cache_font_files=PDF_CJK_KR_CACHE_FONTFILES,
+        min_font_size=8.0,
+        line_height_multiplier=1.4,
+    ),
+    "ms": PdfLanguageProfile(
+        code="ms",
+        font_name=PDF_LATIN_FONTNAME,
+        font_files=PDF_LATIN_FONTFILES,
+        cache_font_files=PDF_LATIN_CACHE_FONTFILES,
+        min_font_size=6.0,
+        step_down=0.8,
+        line_height_multiplier=1.5,
+        aggressive_word_wrap=True,
+    ),
+    "th": PdfLanguageProfile(
+        code="th",
+        font_name=PDF_THAI_FONTNAME,
+        font_files=PDF_THAI_FONTFILES,
+        cache_font_files=PDF_THAI_CACHE_FONTFILES,
+        min_font_size=7.5,
+        line_height_multiplier=1.2,
+    ),
+    "vi": PdfLanguageProfile(
+        code="vi",
+        font_name=PDF_LATIN_FONTNAME,
+        font_files=PDF_LATIN_FONTFILES,
+        cache_font_files=PDF_LATIN_CACHE_FONTFILES,
+        min_font_size=7.0,
+        line_height_multiplier=1.25,
+    ),
+}
+
+
 def preview_sidecar_path(output_path: str) -> Path:
     path = Path(output_path)
     return path.with_name(f"{path.name}.preview.json")
@@ -144,7 +294,8 @@ def _utcnow_iso() -> str:
 
 
 def _normalize_pdf_block_text(text: str) -> str:
-    return "\n".join(line.rstrip() for line in str(text or "").replace("\r\n", "\n").split("\n")).strip()
+    normalized = unicodedata.normalize("NFKC", str(text or "")).replace("\r\n", "\n")
+    return "\n".join(line.rstrip() for line in normalized.split("\n")).strip()
 
 
 def _replace_unknown_spacing_block(match: re.Match[str]) -> str:
@@ -158,7 +309,7 @@ def _replace_unknown_spacing_block(match: re.Match[str]) -> str:
 
 
 def _sanitize_pdf_text(text: str) -> str:
-    normalized = str(text or "").replace("\r\n", "\n")
+    normalized = unicodedata.normalize("NFKC", str(text or "")).replace("\r\n", "\n")
     normalized = PDF_CONTROL_CHAR_PATTERN.sub("", normalized)
     normalized = PDF_ZERO_WIDTH_PATTERN.sub("", normalized)
     normalized = PDF_UNKNOWN_SPACING_PATTERN.sub(" ", normalized)
@@ -265,6 +416,28 @@ def _existing_pdf_cached_font_file(candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+def _pdf_language_profile(language: str | None) -> PdfLanguageProfile | None:
+    code = PDF_LANGUAGE_ALIASES.get(str(language or "").strip().casefold())
+    return PDF_LANGUAGE_PROFILES.get(code or "")
+
+
+def _pdf_external_profile_render_font(profile: PdfLanguageProfile | None) -> PdfRenderFont | None:
+    if profile is None:
+        return None
+
+    font_file = _existing_pdf_cached_font_file(profile.cache_font_files)
+    if font_file is None:
+        font_file = _existing_pdf_font_file(profile.font_files)
+    if font_file:
+        return PdfRenderFont(
+            render_name=profile.font_name,
+            render_file=font_file,
+            metrics_name=profile.font_name,
+            metrics_file=font_file,
+        )
+    return None
+
+
 def _pdf_external_cjk_render_font(script_font: str, *, wants_serif: bool) -> PdfRenderFont | None:
     font_name = PDF_CJK_SERIF_FONTNAME if wants_serif else PDF_CJK_SANS_FONTNAME
     font_file = _existing_pdf_cached_font_file(
@@ -282,6 +455,20 @@ def _pdf_external_cjk_render_font(script_font: str, *, wants_serif: bool) -> Pdf
             render_name=font_name,
             render_file=font_file,
             metrics_name=font_name,
+            metrics_file=font_file,
+        )
+    return None
+
+
+def _pdf_external_latin_render_font() -> PdfRenderFont | None:
+    font_file = _existing_pdf_cached_font_file(PDF_LATIN_CACHE_FONTFILES)
+    if font_file is None:
+        font_file = _existing_pdf_font_file(PDF_LATIN_FONTFILES)
+    if font_file:
+        return PdfRenderFont(
+            render_name=PDF_LATIN_FONTNAME,
+            render_file=font_file,
+            metrics_name=PDF_LATIN_FONTNAME,
             metrics_file=font_file,
         )
     return None
@@ -469,6 +656,7 @@ def _resolve_pdf_render_font(
     preferred_font_name: str = "",
     page_fonts: tuple[PdfPageFontResource, ...] = (),
     prefer_external_cjk_font: bool = False,
+    language_profile: PdfLanguageProfile | None = None,
 ) -> PdfRenderFont:
     wants_serif = _font_name_is_serif(preferred_font_name)
     wants_mono = _font_name_is_mono(preferred_font_name)
@@ -477,6 +665,11 @@ def _resolve_pdf_render_font(
     script_font = _select_pdf_font(text or preferred_font_name)
     uses_cjk_font = script_font in {"china-s", "japan", "korea"}
     needs_embedded_font = _pdf_text_needs_embedded_font(text)
+
+    if language_profile is not None and language_profile.prefer_external_font and not wants_mono and not wants_symbol:
+        external_font = _pdf_external_profile_render_font(language_profile)
+        if external_font is not None:
+            return external_font
 
     if ((prefer_external_cjk_font and uses_cjk_font) or needs_embedded_font) and not wants_mono and not wants_symbol:
         external_font = _pdf_external_cjk_render_font(script_font, wants_serif=wants_serif)
@@ -548,6 +741,60 @@ def _pdf_metrics_font(font_name: str, font_file: str | None, font_buffer: bytes 
     if font_file:
         return fitz.Font(fontname=font_name, fontfile=font_file)
     return fitz.Font(fontname=font_name)
+
+
+def _pdf_char_uses_cjk_font(char: str) -> bool:
+    return _select_pdf_font(char) in {"china-s", "japan", "korea"}
+
+
+def _pdf_render_font_supports_cjk(font: PdfRenderFont) -> bool:
+    return font.render_name in {
+        PDF_CJK_SERIF_FONTNAME,
+        PDF_CJK_SANS_FONTNAME,
+        PDF_CJK_JP_FONTNAME,
+        PDF_CJK_KR_FONTNAME,
+        "china-s",
+        "japan",
+        "korea",
+    }
+
+
+def _pdf_should_split_noto_runs(text: str, font: PdfRenderFont) -> bool:
+    return bool(font.render_file or font.render_buffer) and any(_pdf_char_uses_cjk_font(char) for char in text) and any(
+        not _pdf_char_uses_cjk_font(char) for char in text
+    )
+
+
+def _pdf_latin_render_font(font: PdfRenderFont) -> PdfRenderFont:
+    return _pdf_external_latin_render_font() or font
+
+
+def _pdf_cjk_fallback_render_font(font: PdfRenderFont) -> PdfRenderFont:
+    return _pdf_external_cjk_render_font("china-s", wants_serif=False) or font
+
+
+def _pdf_text_font_runs(text: str, font: PdfRenderFont) -> list[tuple[str, PdfRenderFont]]:
+    if not _pdf_should_split_noto_runs(text, font):
+        return [(text, font)]
+
+    cjk_font = font if _pdf_render_font_supports_cjk(font) else _pdf_cjk_fallback_render_font(font)
+    latin_font = _pdf_latin_render_font(font) if _pdf_render_font_supports_cjk(font) else font
+    if cjk_font == latin_font:
+        return [(text, font)]
+
+    runs: list[tuple[str, PdfRenderFont]] = []
+    current: list[str] = []
+    current_font = cjk_font if _pdf_char_uses_cjk_font(text[0]) else latin_font
+    for char in text:
+        next_font = cjk_font if _pdf_char_uses_cjk_font(char) else latin_font
+        if next_font != current_font:
+            runs.append(("".join(current), current_font))
+            current = []
+            current_font = next_font
+        current.append(char)
+    if current:
+        runs.append(("".join(current), current_font))
+    return runs
 
 
 def _rect_iou(left: fitz.Rect, right: fitz.Rect) -> float:
@@ -1008,6 +1255,7 @@ def _build_pdf_line_rects(
     *,
     full_width: bool = False,
     allow_extra_lines: bool = False,
+    line_height_multiplier: float = 1.12,
 ) -> tuple[list[fitz.Rect], int]:
     if not line_fragments:
         return [], 0
@@ -1017,7 +1265,7 @@ def _build_pdf_line_rects(
     max_x1 = min(rect.x1, max(fragment.rect.x1 for fragment in layout_fragments) + 1.5)
     fragment_heights = [fragment.rect.height for fragment in layout_fragments if fragment.rect.height > 0]
     fragment_centers = [(fragment.rect.y0 + fragment.rect.y1) / 2 for fragment in layout_fragments]
-    line_height = max(_median(fragment_heights), font_size * 1.12, PDF_MIN_REDRAW_FONT_SIZE + 1.0)
+    line_height = max(_median(fragment_heights), font_size * line_height_multiplier, PDF_MIN_REDRAW_FONT_SIZE + 1.0)
     vertical_steps = [
         fragment_centers[index + 1] - fragment_centers[index]
         for index in range(len(fragment_centers) - 1)
@@ -1071,6 +1319,10 @@ def _tokenize_pdf_wrap_text(text: str) -> list[str]:
 def _pdf_text_width(text: str, font: PdfRenderFont, font_size: float) -> float:
     if not text:
         return 0.0
+    if _pdf_should_split_noto_runs(text, font):
+        runs = _pdf_text_font_runs(text, font)
+        if len(runs) > 1 or runs[0][1] != font:
+            return sum(_pdf_text_width(run_text, run_font, font_size) for run_text, run_font in runs)
     return _pdf_metrics_font(font.metrics_name, font.metrics_file, font.metrics_buffer).text_length(
         text,
         fontsize=font_size,
@@ -1815,14 +2067,18 @@ def _insert_pdf_text(
     font_size: float,
     font: PdfRenderFont,
 ) -> None:
-    insert_kwargs = {
-        "fontsize": font_size,
-        "fontname": font.render_name,
-        "overlay": True,
-    }
-    if font.render_file:
-        insert_kwargs["fontfile"] = font.render_file
-    page.insert_text(point, text, **insert_kwargs)
+    x, y = point
+    for run_text, run_font in _pdf_text_font_runs(text, font):
+        _ensure_pdf_render_font(page, run_font)
+        insert_kwargs = {
+            "fontsize": font_size,
+            "fontname": run_font.render_name,
+            "overlay": True,
+        }
+        if run_font.render_file:
+            insert_kwargs["fontfile"] = run_font.render_file
+        page.insert_text((x, y), run_text, **insert_kwargs)
+        x += _pdf_text_width(run_text, run_font, font_size)
 
 
 def _insert_pdf_textbox(
@@ -1832,6 +2088,9 @@ def _insert_pdf_textbox(
     font_size: float,
     font: PdfRenderFont,
 ) -> float:
+    runs = _pdf_text_font_runs(text, font)
+    if len(runs) > 1 or runs[0][1] != font:
+        return -1.0
     insert_kwargs = {
         "fontsize": font_size,
         "fontname": font.render_name,
@@ -1850,11 +2109,15 @@ def _force_insert_pdf_text_lines(
     font: PdfRenderFont,
     *,
     max_lines: int = 1,
+    min_font_size: float = PDF_MIN_REDRAW_FONT_SIZE,
+    step_down: float = 0.5,
+    line_height_multiplier: float = 1.15,
 ) -> float:
     line_limit = max(1, int(max_lines or 1))
-    current_size = round(max(float(font_size or PDF_MIN_REDRAW_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE), 2)
-    while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
-        line_step = max(current_size * 1.15, current_size + 1.0)
+    minimum_size = max(float(min_font_size or PDF_MIN_REDRAW_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
+    current_size = round(max(float(font_size or minimum_size), minimum_size), 2)
+    while current_size >= minimum_size:
+        line_step = max(current_size * line_height_multiplier, current_size + 1.0)
         line_count = min(line_limit, max(1, int(max(rect.height, line_step) // line_step)))
         wrapped_lines = _wrap_pdf_text_to_widths(text, [max(rect.width - 1.0, 1.0)] * line_count, font, current_size)
         if wrapped_lines is not None:
@@ -1864,10 +2127,10 @@ def _force_insert_pdf_text_lines(
                 baseline_y = min(rect.y0 + current_size + index * line_step, rect.y1 - 0.5)
                 _insert_pdf_text(page, (rect.x0, baseline_y), line_text, current_size, font)
             return current_size
-        current_size = round(current_size - 0.5, 2)
+        current_size = round(current_size - step_down, 2)
 
-    _insert_pdf_text(page, (rect.x0, max(rect.y0 + PDF_MIN_REDRAW_FONT_SIZE, rect.y1 - 0.5)), text, PDF_MIN_REDRAW_FONT_SIZE, font)
-    return PDF_MIN_REDRAW_FONT_SIZE
+    _insert_pdf_text(page, (rect.x0, max(rect.y0 + minimum_size, rect.y1 - 0.5)), text, minimum_size, font)
+    return minimum_size
 
 
 def _draw_pdf_text_into_line_rects(
@@ -1879,16 +2142,26 @@ def _draw_pdf_text_into_line_rects(
     render_font: PdfRenderFont,
     fallback_fragments: list[PdfPreviewFragment] | None = None,
     clear_full_rect: bool = False,
+    min_font_size: float = PDF_MIN_REDRAW_FONT_SIZE,
+    step_down: float = 0.5,
+    line_height_multiplier: float = 1.12,
 ) -> tuple[str, float] | None:
+    minimum_size = max(float(min_font_size or PDF_MIN_REDRAW_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
     normalized_text = _normalize_pdf_block_text(text)
     if not normalized_text:
-        return "", round(max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE), 2)
+        return "", round(max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), minimum_size), 2)
 
-    requested_size = max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
+    requested_size = max(float(font_size or PDF_EDITOR_MIN_FONT_SIZE), minimum_size)
     for full_width in (False, True):
         current_size = round(requested_size, 2)
-        while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
-            line_rects, base_count = _build_pdf_line_rects(rect, line_fragments, current_size, full_width=full_width)
+        while current_size >= minimum_size:
+            line_rects, base_count = _build_pdf_line_rects(
+                rect,
+                line_fragments,
+                current_size,
+                full_width=full_width,
+                line_height_multiplier=line_height_multiplier,
+            )
             if line_rects:
                 widths = [max(line_rect.width, 1.0) for line_rect in line_rects]
                 wrapped_lines = _wrap_pdf_text_to_widths(normalized_text, widths, render_font, current_size)
@@ -1906,12 +2179,18 @@ def _draw_pdf_text_into_line_rects(
                         baseline_y = min(line_rect.y1 - 0.5, line_rect.y0 + current_size)
                         _insert_pdf_text(page, (line_rect.x0, baseline_y), line_text, current_size, render_font)
                     return normalized_text, current_size
-            current_size = round(current_size - 0.5, 2)
+            current_size = round(current_size - step_down, 2)
 
     if fallback_fragments:
         current_size = round(requested_size, 2)
-        while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
-            line_rects, base_count = _build_pdf_line_rects(rect, fallback_fragments, current_size, full_width=True)
+        while current_size >= minimum_size:
+            line_rects, base_count = _build_pdf_line_rects(
+                rect,
+                fallback_fragments,
+                current_size,
+                full_width=True,
+                line_height_multiplier=line_height_multiplier,
+            )
             if line_rects:
                 widths = [max(line_rect.width, 1.0) for line_rect in line_rects]
                 wrapped_lines = _wrap_pdf_text_to_widths(normalized_text, widths, render_font, current_size)
@@ -1929,7 +2208,7 @@ def _draw_pdf_text_into_line_rects(
                         baseline_y = min(line_rect.y1 - 0.5, line_rect.y0 + current_size)
                         _insert_pdf_text(page, (line_rect.x0, baseline_y), line_text, current_size, render_font)
                     return normalized_text, current_size
-            current_size = round(current_size - 0.5, 2)
+            current_size = round(current_size - step_down, 2)
 
     return None
 
@@ -1943,12 +2222,16 @@ def _draw_pdf_block_text(
     preferred_font_name: str = "",
     page_fonts: tuple[PdfPageFontResource, ...] = (),
     prefer_external_cjk_font: bool = False,
+    language_profile: PdfLanguageProfile | None = None,
     line_fragments: list[PdfPreviewFragment] | None = None,
     fallback_fragments: list[PdfPreviewFragment] | None = None,
     clear_full_rect: bool = False,
 ) -> tuple[str, float]:
+    minimum_size = language_profile.min_font_size if language_profile is not None else PDF_MIN_REDRAW_FONT_SIZE
+    step_down = language_profile.step_down if language_profile is not None else 0.5
+    line_height_multiplier = language_profile.line_height_multiplier if language_profile is not None else 1.12
     normalized_text = _normalize_pdf_block_text(text)
-    requested_size = max(float(font_size or PDF_MIN_REDRAW_FONT_SIZE), PDF_MIN_REDRAW_FONT_SIZE)
+    requested_size = max(float(font_size or minimum_size), minimum_size)
     if not normalized_text:
         page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
         return "", round(requested_size, 2)
@@ -1958,6 +2241,7 @@ def _draw_pdf_block_text(
         preferred_font_name=preferred_font_name,
         page_fonts=page_fonts,
         prefer_external_cjk_font=prefer_external_cjk_font,
+        language_profile=language_profile,
     )
     _ensure_pdf_render_font(page, render_font)
     if line_fragments:
@@ -1970,26 +2254,32 @@ def _draw_pdf_block_text(
             render_font,
             fallback_fragments=fallback_fragments,
             clear_full_rect=clear_full_rect,
+            min_font_size=minimum_size,
+            step_down=step_down,
+            line_height_multiplier=line_height_multiplier,
         )
         if line_drawn is not None:
             return line_drawn
 
     page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
     current_size = round(requested_size, 2)
-    while current_size >= PDF_MIN_REDRAW_FONT_SIZE:
+    while current_size >= minimum_size:
         remainder = _insert_pdf_textbox(page, rect, normalized_text, current_size, render_font)
         if remainder >= 0:
             return normalized_text, current_size
-        current_size = round(current_size - 0.5, 2)
+        current_size = round(current_size - step_down, 2)
 
     fallback_line_count = len(line_fragments or fallback_fragments or ()) or 1
     applied_font_size = _force_insert_pdf_text_lines(
         page,
         rect,
         normalized_text,
-        PDF_MIN_REDRAW_FONT_SIZE,
+        minimum_size,
         render_font,
         max_lines=fallback_line_count,
+        min_font_size=minimum_size,
+        step_down=step_down,
+        line_height_multiplier=line_height_multiplier,
     )
     return normalized_text, applied_font_size
 
@@ -2004,6 +2294,7 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
 
     editable_lookup: dict[str, tuple[int, dict[str, object], str]] = {}
     applied_updates: dict[str, dict[str, object]] = {}
+    language_profile = _pdf_language_profile(job.target_language)
     for page in preview.get("pages", []):
         page_index = int(page["page_num"]) - 1
         for block in page.get("blocks", []):
@@ -2076,6 +2367,7 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
                 preferred_font_name=preferred_font_name,
                 page_fonts=page_fonts,
                 prefer_external_cjk_font=prefer_external_cjk_font,
+                language_profile=language_profile,
                 line_fragments=line_fragments,
                 fallback_fragments=fallback_fragments,
                 clear_full_rect=block_kind != "cell",

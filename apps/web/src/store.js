@@ -9,9 +9,14 @@ const POLL_INTERVAL_MS = 15000;
 const USER_PAGE_SIZE = 20;
 const AUDIT_PAGE_SIZE = 10;
 
+function defaultUiLanguage() {
+  const language = window.navigator.language || "";
+  return language.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+}
+
 export const state = reactive({
   token: window.localStorage.getItem(TOKEN_STORAGE_KEY) || "",
-  uiLanguage: window.localStorage.getItem(UI_LANGUAGE_STORAGE_KEY) || "zh-CN",
+  uiLanguage: window.localStorage.getItem(UI_LANGUAGE_STORAGE_KEY) || defaultUiLanguage(),
   user: null,
   jobs: [],
   selectedJobId: null,

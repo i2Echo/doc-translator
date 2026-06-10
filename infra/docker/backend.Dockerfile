@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -10,7 +10,6 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        fonts-wqy-zenhei \
         libglib2.0-0 \
         libgl1 \
         libgomp1 \
@@ -18,6 +17,13 @@ RUN apt-get update \
         tesseract-ocr-chi-sim \
         tesseract-ocr-eng \
         tesseract-ocr-osd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
 COPY apps/api/requirements.txt /tmp/requirements.txt

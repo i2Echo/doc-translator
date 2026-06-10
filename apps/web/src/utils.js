@@ -1,15 +1,23 @@
 export const languageOptions = [
-  { value: "auto", label: "Auto / 自动检测" },
-  { value: "Chinese", label: "Chinese / 中文" },
-  { value: "English", label: "English" },
-  { value: "Japanese", label: "Japanese / 日本語" },
-  { value: "Korean", label: "Korean / 한국어" },
-  { value: "German", label: "German / Deutsch" },
-  { value: "French", label: "French / Français" },
-  { value: "Spanish", label: "Spanish / Español" },
-  { value: "Portuguese", label: "Portuguese / Português" },
-  { value: "Russian", label: "Russian / Русский" },
+  { value: "Chinese", zh: "中文", en: "Chinese" },
+  { value: "English", zh: "英语", en: "English" },
+  { value: "Japanese", zh: "日语", en: "Japanese" },
+  { value: "Korean", zh: "韩语", en: "Korean" },
+  { value: "Malay", zh: "马来语", en: "Malay" },
+  { value: "Thai", zh: "泰语", en: "Thai" },
+  { value: "Vietnamese", zh: "越南语", en: "Vietnamese" },
 ];
+
+export function sourceLanguageOptions(copy) {
+  return [{ value: "auto", label: copy("自动检测", "Auto") }, ...targetLanguageOptions(copy)];
+}
+
+export function targetLanguageOptions(copy) {
+  return languageOptions.map((option) => ({
+    value: option.value,
+    label: copy(option.zh, option.en),
+  }));
+}
 
 export function formatBytes(value) {
   const bytes = Number(value || 0);
@@ -35,8 +43,13 @@ export function formatDate(value) {
 export function formatJobStatus(status, copy) {
   const label = String(status || "").toLowerCase();
   const map = {
+    uploaded: copy("已上传", "Uploaded"),
     queued: copy("排队中", "Queued"),
     running: copy("进行中", "Running"),
+    parsing: copy("解析中", "Parsing"),
+    ocr_running: copy("OCR 处理中", "Running OCR"),
+    translating: copy("翻译中", "Translating"),
+    rebuilding: copy("生成中", "Building"),
     completed: copy("已完成", "Completed"),
     failed: copy("失败", "Failed"),
     cancelled: copy("已取消", "Cancelled"),
@@ -48,8 +61,8 @@ export function formatRole(role, copy) {
   return role === "admin" ? copy("管理员", "Admin") : copy("标准用户", "Standard user");
 }
 
-export function languageName(value) {
-  return languageOptions.find((option) => option.value === value)?.label || value || "—";
+export function languageName(value, copy) {
+  return sourceLanguageOptions(copy).find((option) => option.value === value)?.label || value || "—";
 }
 
 export function fileKindLabel(fileName) {

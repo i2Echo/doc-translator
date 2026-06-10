@@ -42,6 +42,14 @@ BABELDOC_LANGUAGE_CODES = {
     "chinese": "zh-CN",
     "ja": "ja",
     "japanese": "ja",
+    "ko": "ko",
+    "korean": "ko",
+    "ms": "ms",
+    "malay": "ms",
+    "th": "th",
+    "thai": "th",
+    "vi": "vi",
+    "vietnamese": "vi",
     "es": "es",
     "spanish": "es",
     "fr": "fr",
@@ -50,6 +58,14 @@ BABELDOC_LANGUAGE_CODES = {
     "german": "de",
 }
 PDF_OCR_DPI = 300
+PDF_BACKGROUND_ANALYSIS_DPI = 24
+PDF_OCR_WORKAROUND_MIN_LUMINANCE = 235.0
+PDF_OCR_WORKAROUND_MIN_BRIGHT_RATIO = 0.6
+PDF_OCR_WORKAROUND_PAGE_SAMPLE_LIMIT = 5
+PDF_OCR_WORKAROUND_MAX_AVERAGE_DRAWING_ITEMS = 80.0
+PDF_OCR_WORKAROUND_MAX_AVERAGE_LINE_DRAWINGS = 25.0
+PDF_OCR_TEXT_MASK_HORIZONTAL_PADDING = 1.5
+PDF_OCR_TEXT_MASK_VERTICAL_PADDING = 1.0
 BABELDOC_QPS = max(1, int(os.getenv("BABELDOC_QPS", "6")))
 BABELDOC_PROGRESS_REPORT_INTERVAL_SECONDS = 0.5
 _BABELDOC_PROGRESS_START = 20
@@ -262,7 +278,7 @@ def _babeldoc_language_code(language: str, *, allow_auto: bool) -> str | None:
     normalized = _normalize_language(language)
     code = BABELDOC_LANGUAGE_CODES.get(normalized)
     if normalized not in BABELDOC_LANGUAGE_CODES:
-        supported = "English, Chinese, Japanese, Spanish, French, German"
+        supported = "English, Chinese, Japanese, Korean, Malay, Thai, Vietnamese, Spanish, French, German"
         raise RuntimeError(f"Unsupported PDF language '{language}'. Supported values: {supported}")
     if code is None:
         if allow_auto:
@@ -273,6 +289,10 @@ def _babeldoc_language_code(language: str, *, allow_auto: bool) -> str | None:
 
 def _page_has_extractable_text(page: fitz.Page) -> bool:
     return bool(page.get_text("words"))
+
+
+def _page_has_text_resources(page: fitz.Page) -> bool:
+    return bool(page.get_fonts(full=True))
 
 
 def _ocr_language(runtime: RuntimeSettings) -> str | None:
@@ -338,6 +358,20 @@ def _insert_background_text_best_fit(
     )
 
 
+def _mask_ocr_text_lines(page: fitz.Page, lines: list[tuple[fitz.Rect, str]]) -> None:
+    for rect, text in lines:
+        if not text.strip():
+            continue
+
+        mask_rect = fitz.Rect(
+            max(page.rect.x0, rect.x0 - PDF_OCR_TEXT_MASK_HORIZONTAL_PADDING),
+            max(page.rect.y0, rect.y0 - PDF_OCR_TEXT_MASK_VERTICAL_PADDING),
+            min(page.rect.x1, rect.x1 + PDF_OCR_TEXT_MASK_HORIZONTAL_PADDING),
+            min(page.rect.y1, rect.y1 + PDF_OCR_TEXT_MASK_VERTICAL_PADDING),
+        )
+        page.draw_rect(mask_rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
+
 def _ocr_page_lines(page: fitz.Page, runtime: RuntimeSettings) -> list[tuple[fitz.Rect, str]]:
     pixmap = page.get_pixmap(dpi=PDF_OCR_DPI, alpha=False)
     image = _pixmap_to_image(pixmap)
@@ -392,6 +426,73 @@ def _pdf_has_any_extractable_text(path: Path) -> bool:
         document.close()
 
 
+def _page_luminance_metrics(page: fitz.Page) -> tuple[float, float]:
+    pixmap = page.get_pixmap(dpi=PDF_BACKGROUND_ANALYSIS_DPI, alpha=False)
+    samples = pixmap.samples
+    pixel_count = len(samples) // 3
+    if pixel_count == 0:
+        return 0.0, 0.0
+
+    total_luminance = 0.0
+    bright_pixels = 0
+    for index in range(0, len(samples), 3):
+        red = samples[index]
+        green = samples[index + 1]
+        blue = samples[index + 2]
+        luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
+        total_luminance += luminance
+        if luminance >= 245:
+            bright_pixels += 1
+
+    return total_luminance / pixel_count, bright_pixels / pixel_count
+
+
+def _page_vector_content_metrics(page: fitz.Page) -> tuple[int, int]:
+    drawing_items = 0
+    line_drawings = 0
+    for drawing in page.get_drawings():
+        items = drawing.get("items", ())
+        drawing_items += len(items)
+        rect = drawing.get("rect")
+        if rect and (rect.width < 2 or rect.height < 2):
+            line_drawings += 1
+    return drawing_items, line_drawings
+
+
+def _pdf_prefers_ocr_workaround(path: Path) -> bool:
+    document = fitz.open(path)
+    try:
+        sample_count = min(document.page_count, PDF_OCR_WORKAROUND_PAGE_SAMPLE_LIMIT)
+        if sample_count == 0:
+            return False
+
+        total_luminance = 0.0
+        total_bright_ratio = 0.0
+        total_drawing_items = 0
+        total_line_drawings = 0
+        for page_index in range(sample_count):
+            page = document[page_index]
+            luminance, bright_ratio = _page_luminance_metrics(page)
+            drawing_items, line_drawings = _page_vector_content_metrics(page)
+            total_luminance += luminance
+            total_bright_ratio += bright_ratio
+            total_drawing_items += drawing_items
+            total_line_drawings += line_drawings
+
+        average_luminance = total_luminance / sample_count
+        average_bright_ratio = total_bright_ratio / sample_count
+        average_drawing_items = total_drawing_items / sample_count
+        average_line_drawings = total_line_drawings / sample_count
+        return (
+            average_luminance >= PDF_OCR_WORKAROUND_MIN_LUMINANCE
+            and average_bright_ratio >= PDF_OCR_WORKAROUND_MIN_BRIGHT_RATIO
+            and average_drawing_items <= PDF_OCR_WORKAROUND_MAX_AVERAGE_DRAWING_ITEMS
+            and average_line_drawings <= PDF_OCR_WORKAROUND_MAX_AVERAGE_LINE_DRAWINGS
+        )
+    finally:
+        document.close()
+
+
 def _prepare_pdf_for_babeldoc(
     input_path: str,
     prepared_path: Path,
@@ -400,8 +501,15 @@ def _prepare_pdf_for_babeldoc(
     document = fitz.open(input_path)
     try:
         has_text_by_page = [_page_has_extractable_text(page) for page in document]
+        has_text_resources_by_page = [_page_has_text_resources(page) for page in document]
         page_count = document.page_count
         if all(has_text_by_page):
+            return page_count, False
+
+        # PDFs with broken or custom embedded fonts may not yield words via
+        # PyMuPDF, but BabelDOC can still process their text objects correctly.
+        # Treat them as native PDFs instead of rebuilding them through OCR.
+        if any(has_text_resources_by_page):
             return page_count, False
 
         # Some native PDFs still contain a few pages that PyMuPDF cannot extract
@@ -424,9 +532,11 @@ def _prepare_pdf_for_babeldoc(
 
                 source_page = document[index]
                 target_page = prepared_document.new_page(width=source_page.rect.width, height=source_page.rect.height)
-                for rect, text in _ocr_page_lines(source_page, runtime):
-                    _insert_background_text_best_fit(target_page, rect, text)
+                ocr_lines = _ocr_page_lines(source_page, runtime)
                 target_page.show_pdf_page(source_page.rect, document, index)
+                _mask_ocr_text_lines(target_page, ocr_lines)
+                for rect, text in ocr_lines:
+                    _insert_background_text_best_fit(target_page, rect, text)
             prepared_document.save(prepared_path)
         finally:
             prepared_document.close()
@@ -697,20 +807,6 @@ def _find_babeldoc_mono_output(output_dir: Path, input_stem: str) -> Path:
     return max(matches, key=lambda candidate: candidate.stat().st_mtime)
 
 
-def _optimize_pdf_in_place(path: Path, working_root: Path) -> None:
-    optimized_path = working_root / f"{path.stem}.optimized{path.suffix}"
-    document = fitz.open(path)
-    try:
-        try:
-            document.subset_fonts()
-        except Exception:
-            pass
-        document.save(optimized_path, garbage=4, deflate=True, clean=True, deflate_fonts=True)
-    finally:
-        document.close()
-    shutil.move(str(optimized_path), path)
-
-
 def _paragraph_targets(document: Document) -> list:
     targets = [paragraph for paragraph in document.paragraphs if paragraph.text.strip()]
     for table in document.tables:
@@ -779,8 +875,9 @@ def translate_pdf(
         page_count, used_ocr = _prepare_pdf_for_babeldoc(input_path, prepared_input_path, runtime)
         babeldoc_input_path = prepared_input_path if used_ocr else Path(input_path)
         # OCR workaround paints over original content before re-typesetting it.
-        # Restrict it to OCR-prepared PDFs so native-text diagrams and rotated labels are not erased.
-        use_ocr_workaround = used_ocr
+        # Use it for OCR-prepared PDFs and white-background native PDFs where
+        # BabelDOC may otherwise leave the original text visible under the translation.
+        use_ocr_workaround = used_ocr or _pdf_prefers_ocr_workaround(babeldoc_input_path)
 
         if used_ocr:
             update_job_state(session, job, status=JobStatus.OCR_RUNNING, progress=18, message="Prepared searchable PDF for scanned pages")
@@ -810,9 +907,8 @@ def translate_pdf(
             use_ocr_workaround=use_ocr_workaround,
         )
 
-        update_job_state(session, job, status=JobStatus.REBUILDING, progress=92, message="Optimizing translated PDF")
+        update_job_state(session, job, status=JobStatus.REBUILDING, progress=92, message="Saving translated PDF")
         shutil.move(str(mono_output), output_path)
-        _optimize_pdf_in_place(output_path, temp_root)
 
     output_document = fitz.open(output_path)
     try:
