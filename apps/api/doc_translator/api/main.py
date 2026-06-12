@@ -417,6 +417,8 @@ def download_job(
     session: Session = Depends(get_db),
 ):
     job = load_job_or_404(session, job_id, current_user)
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Download is available after translation completes")
     if job.output_file is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No translated file is available yet")
     if job.output_file.deleted_at is not None:

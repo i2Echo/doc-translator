@@ -31,6 +31,7 @@ RECOVERABLE_JOB_STATUSES = {
     JobStatus.OCR_RUNNING,
     JobStatus.TRANSLATING,
     JobStatus.REBUILDING,
+    JobStatus.VALIDATING,
 }
 
 

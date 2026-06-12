@@ -23,6 +23,9 @@ const props = defineProps({
 const router = useRouter();
 const sourceScroller = ref(null);
 const translatedScroller = ref(null);
+const editorScroller = ref(null);
+const layoutSandbox = ref(null);
+const activePdfItemId = ref("");
 const currentPdfPage = ref(1);
 const pdfStageAspect = reactive({
   source: 0.772,
@@ -46,6 +49,7 @@ let resizeTimer = null;
 let renderQueue = Promise.resolve();
 let syncingScroll = false;
 let resetPdfOnNextDocumentsChange = false;
+let layoutMeasureTimer = null;
 
 const isPdf = computed(() => state.previewData?.document_kind === "pdf");
 const isEditing = computed(() => state.previewMode === "edit");
@@ -66,6 +70,16 @@ const pdfPages = computed(() => {
 
 const pageCount = computed(() => pdfPages.value.length || 1);
 const currentDraftPage = computed(() => pdfPages.value.find((page) => page.page_num === currentPdfPage.value) || pdfPages.value[0] || null);
+const currentPdfItems = computed(() => editablePdfItems(currentDraftPage.value));
+const activePdfItem = computed(() => currentPdfItems.value.find((item) => item.id === activePdfItemId.value) || currentPdfItems.value[0] || null);
+const layoutOverflowCount = computed(() =>
+  pdfPages.value.reduce(
+    (count, page) =>
+      count +
+      editablePdfItems(page).filter((item) => item.model.layout_status === "overflow").length,
+    0
+  )
+);
 
 function editablePdfItems(page) {
   if (!page) {
@@ -78,6 +92,7 @@ function editablePdfItems(page) {
         id: cell.cell_id,
         label: `${copy("单元格", "Cell")} R${cell.row_index} C${cell.col_index}`,
         source: cell.src_text,
+        pageNum: page.page_num,
         model: cell,
       }));
     }
@@ -87,10 +102,147 @@ function editablePdfItems(page) {
         id: block.block_id,
         label: `${copy("文本块", "Text block")} ${block.block_id.slice(0, 8)}`,
         source: block.src_text,
+        pageNum: page.page_num,
         model: block,
       },
     ];
   });
+}
+
+function pdfBlockStyle(page, item) {
+  const rect = item.model.rect || [0, 0, 0, 0];
+  const pageWidth = page.page_width || 1;
+  const pageHeight = page.page_height || 1;
+  return {
+    left: `${(rect[0] / pageWidth) * 100}%`,
+    top: `${(rect[1] / pageHeight) * 100}%`,
+    width: `${Math.max(((rect[2] - rect[0]) / pageWidth) * 100, 0.2)}%`,
+    height: `${Math.max(((rect[3] - rect[1]) / pageHeight) * 100, 0.2)}%`,
+  };
+}
+
+function escapeHtml(text) {
+  return String(text || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function itemRectSize(item) {
+  const rect = item.model.rect || [0, 0, 0, 0];
+  return {
+    width: Math.max(rect[2] - rect[0], 1),
+    height: Math.max(rect[3] - rect[1], 1),
+  };
+}
+
+function canonicalImmunityText(text) {
+  return String(text ?? "")
+    .normalize("NFKC")
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/[\s\n\r]/g, "")
+    .replace(/^[,;:|，；：、]+|[,;:|，；：、]+$/g, "");
+}
+
+function isEligibleForImmunity(item) {
+  const sourceText = item.model.src_text ?? item.source ?? "";
+  const targetText = item.model.tgt_text ?? "";
+  return canonicalImmunityText(sourceText) === canonicalImmunityText(targetText);
+}
+
+function isSingleLineText(text) {
+  return !String(text ?? "").includes("\n");
+}
+
+function measurePdfItem(item) {
+  const sandbox = layoutSandbox.value;
+  if (!sandbox || !item?.model) {
+    return;
+  }
+
+  if (isEligibleForImmunity(item)) {
+    item.model.layout_status = "ok";
+    return;
+  }
+
+  const { width, height } = itemRectSize(item);
+  const allowedWidth = width + (height < 15 || width < 80 ? 3 : 0);
+  const diagramLabel = height < 18 && isSingleLineText(item.model.tgt_text);
+  const multilineBlock = !isSingleLineText(item.model.tgt_text);
+  const allowedHeight = multilineBlock ? height + Math.max(4, height * 0.1) : height;
+  const minFontSize = 7.5;
+  const originalSize = Number(item.model.font_size_original || item.model.font_size_current || 10);
+  let fontSize = Math.max(Number(item.model.font_size_current || originalSize), minFontSize);
+  let overflow = false;
+
+  sandbox.style.width = `${allowedWidth}px`;
+  sandbox.style.maxWidth = `${allowedWidth}px`;
+  sandbox.style.height = `${allowedHeight}px`;
+  sandbox.style.fontFamily = "Arial, Helvetica, sans-serif";
+  sandbox.style.fontWeight = item.model.font_style === "BOLD" ? "700" : "400";
+  sandbox.style.letterSpacing = "-0.02em";
+  sandbox.style.setProperty("padding", "0", "important");
+  sandbox.style.setProperty("margin", "0", "important");
+  sandbox.style.textAlign = item.model.alignment === "CENTER" ? "center" : "left";
+  sandbox.innerHTML = escapeHtml(item.model.tgt_text).replaceAll("\n", "<br>");
+
+  while (fontSize >= minFontSize) {
+    sandbox.style.fontSize = `${fontSize}px`;
+    if (diagramLabel) {
+      sandbox.style.setProperty("line-height", "1", "important");
+    } else {
+      sandbox.style.setProperty("line-height", `${Math.max(fontSize * 1.18, fontSize + 1)}px`);
+    }
+    overflow = sandbox.scrollWidth > allowedWidth + 0.5 || sandbox.scrollHeight > allowedHeight + 0.5;
+    if (!overflow || fontSize === minFontSize) {
+      break;
+    }
+    fontSize = Math.max(minFontSize, Math.round((fontSize - 0.5) * 10) / 10);
+  }
+
+  item.model.font_size_current = Math.round(fontSize * 10) / 10;
+  item.model.layout_status = overflow ? "overflow" : "ok";
+}
+
+function measureCurrentPageItems() {
+  for (const item of currentPdfItems.value) {
+    measurePdfItem(item);
+  }
+}
+
+function scheduleLayoutMeasure(item = null) {
+  window.clearTimeout(layoutMeasureTimer);
+  layoutMeasureTimer = window.setTimeout(async () => {
+    await nextTick();
+    if (item) {
+      measurePdfItem(item);
+      return;
+    }
+    measureCurrentPageItems();
+  }, 40);
+}
+
+function selectPdfItem(item, behavior = "smooth") {
+  if (!item) {
+    return;
+  }
+  activePdfItemId.value = item.id;
+  if (item.pageNum && item.pageNum !== currentPdfPage.value) {
+    scrollToPage(item.pageNum, behavior);
+  }
+  nextTick(() => {
+    editorScroller.value?.querySelector(`[data-editor-id="${CSS.escape(item.id)}"]`)?.scrollIntoView({
+      block: "nearest",
+      behavior,
+    });
+  });
+}
+
+function handlePdfTextInput(item) {
+  activePdfItemId.value = item.id;
+  scheduleLayoutMeasure(item);
 }
 
 async function ensurePdfJs() {
@@ -340,7 +492,7 @@ function queuePdfRender() {
 }
 
 async function loadPdfPreview({ resetView = false } = {}) {
-  if (!state.previewDocuments.sourceUrl || !state.previewDocuments.translatedUrl) {
+  if (!state.previewDocuments.sourceUrl) {
     return;
   }
 
@@ -353,7 +505,7 @@ async function loadPdfPreview({ resetView = false } = {}) {
   const sourceUrl = state.previewDocuments.sourceUrl;
   const translatedUrl = state.previewDocuments.translatedUrl;
   const sourceChanged = !pdfDocs.source || loadedPdfUrls.source !== sourceUrl;
-  const translatedChanged = !pdfDocs.translated || loadedPdfUrls.translated !== translatedUrl;
+  const translatedChanged = translatedUrl && (!pdfDocs.translated || loadedPdfUrls.translated !== translatedUrl);
 
   if (sourceChanged) {
     await pdfDocs.source?.destroy?.();
@@ -367,6 +519,10 @@ async function loadPdfPreview({ resetView = false } = {}) {
     pdfDocs.translated = await loadPdfDocument(translatedUrl);
     loadedPdfUrls.translated = translatedUrl;
     await primePdfAspect("translated", pdfDocs.translated);
+  } else if (!translatedUrl) {
+    await pdfDocs.translated?.destroy?.();
+    pdfDocs.translated = null;
+    loadedPdfUrls.translated = null;
   }
 
   const activeDocument = pdfDocs.source || pdfDocs.translated;
@@ -432,6 +588,8 @@ function scrollToPage(pageNumber, behavior = "smooth") {
       behavior,
     });
   }
+
+  schedulePdfRender();
 }
 
 function handlePdfScroll(kind) {
@@ -443,6 +601,7 @@ function handlePdfScroll(kind) {
   }
 
   currentPdfPage.value = detectCurrentPage(activeScroller);
+  schedulePdfRender();
   if (syncingScroll || !passiveScroller || isEditing.value) {
     return;
   }
@@ -452,8 +611,28 @@ function handlePdfScroll(kind) {
   window.requestAnimationFrame(() => {
     syncingScroll = false;
   });
+}
 
-  schedulePdfRender();
+function handleEditorScroll() {
+  const rows = [...(editorScroller.value?.querySelectorAll("[data-editor-id]") || [])];
+  if (!rows.length) {
+    return;
+  }
+
+  const viewportTop = editorScroller.value.scrollTop;
+  let closest = rows[0];
+  let closestDistance = Number.POSITIVE_INFINITY;
+  for (const row of rows) {
+    const distance = Math.abs(row.offsetTop - viewportTop);
+    if (distance < closestDistance) {
+      closest = row;
+      closestDistance = distance;
+    }
+  }
+  const item = currentPdfItems.value.find((candidate) => candidate.id === closest.dataset.editorId);
+  if (item) {
+    activePdfItemId.value = item.id;
+  }
 }
 
 function schedulePdfRender() {
@@ -478,13 +657,15 @@ watch(
   () => currentPdfPage.value,
   () => {
     state.messages.preview = "";
+    activePdfItemId.value = "";
+    scheduleLayoutMeasure();
   }
 );
 
 watch(
   () => [state.previewDocuments.sourceUrl, state.previewDocuments.translatedUrl],
   async () => {
-    if (!isPdf.value || !state.previewDocuments.sourceUrl || !state.previewDocuments.translatedUrl) {
+    if (!isPdf.value || !state.previewDocuments.sourceUrl) {
       return;
     }
     const resetView = resetPdfOnNextDocumentsChange;
@@ -499,7 +680,18 @@ watch(
     if (!isPdf.value || state.pending.preview) {
       return;
     }
+    if (isEditing.value) {
+      scheduleLayoutMeasure();
+    }
     void queuePdfRender();
+  }
+);
+
+watch(
+  () => state.previewDraft,
+  () => {
+    activePdfItemId.value = "";
+    scheduleLayoutMeasure();
   }
 );
 
@@ -508,6 +700,7 @@ window.addEventListener("resize", schedulePdfRender);
 onUnmounted(async () => {
   window.removeEventListener("resize", schedulePdfRender);
   window.clearTimeout(resizeTimer);
+  window.clearTimeout(layoutMeasureTimer);
   await resetPdfDocs();
   clearPreviewState();
 });
@@ -604,6 +797,20 @@ onUnmounted(async () => {
           >
             <div class="pdf-canvas-shell">
               <canvas class="pdf-canvas" :data-page="page.page_num"></canvas>
+              <div v-if="isEditing" class="pdf-block-overlay" aria-hidden="true">
+                <button
+                  v-for="item in editablePdfItems(page)"
+                  :key="`source-overlay-${item.id}`"
+                  class="pdf-block-hotspot"
+                  :class="{
+                    active: activePdfItem?.id === item.id,
+                    overflow: item.model.layout_status === 'overflow',
+                  }"
+                  type="button"
+                  :style="pdfBlockStyle(page, item)"
+                  @click.stop="selectPdfItem(item)"
+                ></button>
+              </div>
               <div class="pdf-page-loader" aria-hidden="true">
                 <span class="pdf-page-spinner"></span>
                 <span>{{ copy("页面加载中", "Loading page") }}</span>
@@ -672,24 +879,62 @@ onUnmounted(async () => {
 
       <article v-else class="preview-column preview-column--editor">
         <div class="preview-column__head">
-          <strong>{{ copy("右侧编辑区", "Editor") }}</strong>
-          <span>{{ currentDraftPage ? `${copy("第", "Page")} ${currentDraftPage.page_num} ${copy("页", "")}` : "" }}</span>
+          <div class="preview-column-title">
+            <strong>{{ copy("右侧编辑区", "Editor") }}</strong>
+            <span>
+              {{
+                currentDraftPage
+                  ? `${copy("第", "Page")} ${currentDraftPage.page_num} ${copy("页", "")} · ${currentPdfItems.length} ${copy("块", "blocks")}`
+                  : ""
+              }}
+            </span>
+          </div>
+          <div class="pdf-editor-status-row">
+            <span>{{ previewDirty ? copy("草稿未保存", "Unsaved draft") : copy("无待保存修改", "No pending edits") }}</span>
+            <strong :class="{ danger: layoutOverflowCount > 0 }">
+              {{
+                layoutOverflowCount
+                  ? copy(`${layoutOverflowCount} 个块溢出`, `${layoutOverflowCount} blocks overflow`)
+                  : copy("版面正常", "Layout OK")
+              }}
+            </strong>
+          </div>
         </div>
 
-        <div class="editor-scroll-area">
+        <div ref="editorScroller" class="editor-scroll-area pdf-editor-grid" @scroll="handleEditorScroll">
           <template v-if="currentDraftPage">
-            <article v-for="item in editablePdfItems(currentDraftPage)" :key="item.id" class="editor-item editor-item--compact">
+            <article
+              v-for="item in currentPdfItems"
+              :key="item.id"
+              class="editor-item editor-item--compact pdf-editor-row"
+              :class="{
+                active: activePdfItem?.id === item.id,
+                overflow: item.model.layout_status === 'overflow',
+              }"
+              :data-editor-id="item.id"
+              @click="selectPdfItem(item)"
+            >
               <div class="editor-item-head">
                 <strong>{{ item.label }}</strong>
-                <span class="subtle">{{ item.id }}</span>
+                <span class="pdf-editor-meta">
+                  <span>{{ item.model.font_size_current || item.model.font_size_original }}pt</span>
+                  <span v-if="item.model.alignment === 'CENTER'">{{ copy("居中", "Center") }}</span>
+                  <span v-if="item.model.font_style === 'BOLD'">{{ copy("加粗", "Bold") }}</span>
+                  <span v-if="item.model.rotation">{{ item.model.rotation }}°</span>
+                </span>
               </div>
               <p class="editor-source">{{ item.source || copy("没有原文可参考。", "No source text available.") }}</p>
               <span class="control-shell control-shell--textarea">
-                <textarea v-model="item.model.tgt_text" rows="5"></textarea>
+                <textarea v-model="item.model.tgt_text" rows="5" @input="handlePdfTextInput(item)" @focus="selectPdfItem(item, 'auto')"></textarea>
               </span>
+              <p v-if="item.model.layout_status === 'overflow'" class="pdf-layout-alert">
+                {{ copy("已降至最小字号，仍超出目标边界。", "Minimum font size reached and the text still exceeds the target bounds.") }}
+              </p>
             </article>
           </template>
         </div>
+
+        <div ref="layoutSandbox" class="layout-sandbox" aria-hidden="true"></div>
 
         <footer class="editor-fixed-pagination">
           <button class="icon-button icon-button--small" type="button" :disabled="currentPdfPage <= 1" @click="movePage(-1)">‹</button>

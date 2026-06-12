@@ -50,6 +50,7 @@ export function formatJobStatus(status, copy) {
     ocr_running: copy("OCR 处理中", "Running OCR"),
     translating: copy("翻译中", "Translating"),
     rebuilding: copy("生成中", "Building"),
+    validating: copy("校验中", "Validating"),
     completed: copy("已完成", "Completed"),
     failed: copy("失败", "Failed"),
     cancelled: copy("已取消", "Cancelled"),

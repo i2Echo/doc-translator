@@ -384,6 +384,10 @@ svg {
   background: rgba(15, 110, 106, 0.08);
 }
 
+.icon-button--bare.danger-text:hover {
+  background: rgba(157, 58, 40, 0.1);
+}
+
 .danger-text {
   color: var(--danger);
 }
@@ -669,6 +673,12 @@ svg {
   letter-spacing: 0.08em;
 }
 
+.meta-card small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .mini-stat strong,
 .meta-card strong {
   display: block;
@@ -847,6 +857,37 @@ svg {
   justify-content: space-between;
 }
 
+.timeline-item-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.timeline-item-head strong {
+  min-width: 0;
+}
+
+.timeline-item-meta {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+  flex: 0 0 auto;
+  max-width: 48%;
+  text-align: right;
+}
+
+.duration-pill {
+  width: max-content;
+  max-width: 100%;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #0f6e6a;
+  background: rgba(15, 110, 106, 0.1);
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .progress-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -960,7 +1001,12 @@ svg {
 }
 
 .status-pill[data-status="running"],
-.status-pill[data-status="queued"] {
+.status-pill[data-status="queued"],
+.status-pill[data-status="parsing"],
+.status-pill[data-status="ocr_running"],
+.status-pill[data-status="translating"],
+.status-pill[data-status="rebuilding"],
+.status-pill[data-status="validating"] {
   color: #94640c;
   background: rgba(222, 170, 58, 0.16);
 }
@@ -1052,13 +1098,22 @@ svg {
   min-width: 0;
 }
 
-.preview-column__head strong {
+.preview-column-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.preview-column__head strong,
+.preview-column-title strong {
   flex: 0 0 auto;
   font-size: 12px;
   font-family: var(--font-display);
 }
 
-.preview-column__head span {
+.preview-column__head span,
+.preview-column-title span {
   flex: 1 1 auto;
   color: var(--muted);
   font-size: 11px;
@@ -1121,6 +1176,36 @@ svg {
   overflow: hidden;
 }
 
+.pdf-block-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.pdf-block-hotspot {
+  position: absolute;
+  min-width: 8px;
+  min-height: 8px;
+  padding: 0;
+  border: 1px solid rgba(15, 110, 106, 0.28);
+  border-radius: 4px;
+  background: rgba(15, 110, 106, 0.045);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.pdf-block-hotspot:hover,
+.pdf-block-hotspot.active {
+  border-color: rgba(15, 110, 105, 0.8);
+  background: rgba(15, 110, 105, 0.4);
+}
+
+.pdf-block-hotspot.overflow {
+  border-color: rgba(183, 64, 45, 0.58);
+  background: rgba(183, 64, 45, 0.09);
+}
+
 .pdf-canvas {
   display: block;
   max-width: 100%;
@@ -1161,7 +1246,7 @@ svg {
   animation: pdf-page-spin 800ms linear infinite;
 }
 
-.pdf-canvas[data-rendered="true"] + .pdf-page-loader {
+.pdf-canvas[data-rendered="true"] ~ .pdf-page-loader {
   opacity: 0;
 }
 
@@ -1209,6 +1294,88 @@ svg {
   gap: 10px;
   padding: 14px 16px 90px;
   overflow: auto;
+}
+
+.pdf-editor-status-row {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: min(260px, 42%);
+  padding: 0;
+  border-bottom: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pdf-editor-status-row span {
+  flex: 0 1 auto;
+}
+
+.pdf-editor-status-row strong {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  white-space: nowrap;
+}
+
+.pdf-editor-status-row strong.danger {
+  color: var(--danger);
+}
+
+.pdf-editor-grid {
+  align-content: start;
+}
+
+.pdf-editor-row {
+  border: 1px solid rgba(126, 113, 93, 0.24);
+  border-radius: 12px;
+}
+
+.pdf-editor-row.active {
+  border-color: rgba(15, 110, 106, 0.8);
+  box-shadow: 0 0 0 3px rgba(15, 110, 106, 0.1);
+}
+
+.pdf-editor-row.overflow {
+  border-color: rgba(183, 64, 45, 0.58);
+}
+
+.pdf-editor-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+  min-width: 96px;
+}
+
+.pdf-editor-meta span {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.pdf-layout-alert {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.layout-sandbox {
+  position: fixed;
+  left: -10000px;
+  top: -10000px;
+  z-index: -1;
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-family: Arial, Helvetica, sans-serif;
+  letter-spacing: -0.02em;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .editor-fixed-pagination {

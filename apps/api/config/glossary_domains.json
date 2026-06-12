@@ -1,0 +1,23 @@
+{
+  "pcb_semiconductor": {
+    "PCB": "PCB",
+    "printed circuit board": "printed circuit board",
+    "semiconductor": "semiconductor",
+    "wafer": "wafer",
+    "die": "die",
+    "substrate": "substrate",
+    "solder mask": "solder mask",
+    "silkscreen": "silkscreen",
+    "via": "via",
+    "blind via": "blind via",
+    "buried via": "buried via",
+    "impedance": "impedance",
+    "trace width": "trace width",
+    "etching": "etching",
+    "photolithography": "photolithography",
+    "BGA": "BGA",
+    "QFN": "QFN",
+    "lead frame": "lead frame",
+    "wire bonding": "wire bonding"
+  }
+}

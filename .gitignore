@@ -21,3 +21,4 @@ uploads/
 storage/
 *.sqlite3
 *.db
+.tmp*

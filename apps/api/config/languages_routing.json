@@ -1,0 +1,94 @@
+{
+  "zh": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+      "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+      "C:\\Windows\\Fonts\\msyh.ttc"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Bold.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+      "C:\\Windows\\Fonts\\msyhbd.ttc"
+    ],
+    "scale": 1.0
+  },
+  "en": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+      "C:\\Windows\\Fonts\\arial.ttf"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+      "C:\\Windows\\Fonts\\arialbd.ttf"
+    ],
+    "scale": 1.0
+  },
+  "ja": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+      "C:\\Windows\\Fonts\\YuGothM.ttc"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Bold.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+      "C:\\Windows\\Fonts\\YuGothB.ttc"
+    ],
+    "scale": 1.0
+  },
+  "ko": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKkr-Regular.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+      "C:\\Windows\\Fonts\\malgun.ttf"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSansCJKkr-Bold.ttf",
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+      "C:\\Windows\\Fonts\\malgunbd.ttf"
+    ],
+    "scale": 0.96
+  },
+  "ms": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+      "C:\\Windows\\Fonts\\arial.ttf"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+      "C:\\Windows\\Fonts\\arialbd.ttf"
+    ],
+    "scale": 0.98
+  },
+  "th": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+      "C:\\Windows\\Fonts\\NotoSansThai-Regular.ttf",
+      "C:\\Windows\\Fonts\\LeelawUI.ttf"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
+      "C:\\Windows\\Fonts\\NotoSansThai-Bold.ttf",
+      "C:\\Windows\\Fonts\\LeelUIsl.ttf"
+    ],
+    "scale": 0.94
+  },
+  "vi": {
+    "regular": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+      "C:\\Windows\\Fonts\\arial.ttf"
+    ],
+    "bold": [
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+      "C:\\Windows\\Fonts\\arialbd.ttf"
+    ],
+    "scale": 0.98
+  }
+}

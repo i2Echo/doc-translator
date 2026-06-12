@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 import AppSelect from "../components/AppSelect.vue";
 import {
@@ -21,9 +21,11 @@ const uploadForm = reactive({
   ...defaultUploadState(),
 });
 const fileInputRef = ref(null);
-const activeJobs = computed(() =>
-  state.jobs.filter((job) => job.status === "queued" || job.status === "running").length
-);
+const activeJobStatuses = new Set(["queued", "running", "parsing", "ocr_running", "translating", "rebuilding", "validating"]);
+const terminalJobStatuses = new Set(["completed", "failed", "cancelled"]);
+const nowMs = ref(Date.now());
+let clockHandle = null;
+const activeJobs = computed(() => state.jobs.filter((job) => activeJobStatuses.has(job.status)).length);
 const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
 const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
 const supportedUploadExtensions = new Set([".pdf", ".docx"]);
@@ -31,6 +33,68 @@ const supportedUploadExtensions = new Set([".pdf", ".docx"]);
 const workspaceModel = computed(() => {
   return state.settings?.model_name || state.jobs[0]?.model_name_snapshot || copy("托管模型", "Managed model");
 });
+
+const selectedJobTimeline = computed(() => {
+  const job = state.selectedJob;
+  if (!job?.events?.length) {
+    return [];
+  }
+  const events = [...job.events].sort((left, right) => timestampMs(left.created_at) - timestampMs(right.created_at));
+  const jobEndMs = jobEndTimestampMs(job);
+  return events.map((event, index) => {
+    const startedMs = timestampMs(event.created_at);
+    const nextStartedMs = timestampMs(events[index + 1]?.created_at);
+    const endedMs = nextStartedMs || jobEndMs || nowMs.value;
+    const running = !nextStartedMs && !jobEndMs;
+    return {
+      ...event,
+      durationLabel: formatDuration(Math.max(endedMs - startedMs, 0)),
+      durationState: running ? copy("进行中", "Running") : copy("耗时", "Duration"),
+    };
+  });
+});
+
+const selectedJobElapsedLabel = computed(() => {
+  if (!state.selectedJob) {
+    return "—";
+  }
+  return formatDuration(jobElapsedMs(state.selectedJob));
+});
+
+function timestampMs(value) {
+  if (!value) {
+    return 0;
+  }
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function jobEndTimestampMs(job) {
+  if (!terminalJobStatuses.has(job.status)) {
+    return 0;
+  }
+  return timestampMs(job.completed_at) || timestampMs(job.updated_at);
+}
+
+function jobElapsedMs(job) {
+  const startedMs = timestampMs(job.started_at) || timestampMs(job.created_at);
+  const endedMs = jobEndTimestampMs(job) || nowMs.value;
+  return Math.max(endedMs - startedMs, 0);
+}
+
+function formatDuration(valueMs) {
+  const totalSeconds = Math.max(0, Math.floor(Number(valueMs || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+  if (minutes) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
+}
 
 function fileKey(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
@@ -102,13 +166,30 @@ function canPreview(job) {
   return job.status === "completed" && job.output_file;
 }
 
+function canDownload(job) {
+  return job.status === "completed" && job.output_file;
+}
+
 function canRetry(job) {
   return job.status === "failed" || job.status === "cancelled";
 }
 
 function canCancel(job) {
-  return job.status === "queued" || job.status === "running";
+  return activeJobStatuses.has(job.status);
 }
+
+onMounted(() => {
+  clockHandle = window.setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
+});
+
+onBeforeUnmount(() => {
+  if (clockHandle) {
+    window.clearInterval(clockHandle);
+    clockHandle = null;
+  }
+});
 </script>
 
 <template>
@@ -264,7 +345,7 @@ function canCancel(job) {
                   </svg>
                 </button>
                 <button
-                  v-if="job.output_file"
+                  v-if="canDownload(job)"
                   class="icon-button icon-button--bare icon-button--tiny"
                   type="button"
                   :aria-label="copy('下载', 'Download')"
@@ -277,11 +358,32 @@ function canCancel(job) {
                     <path d="M4.5 14.5h11" />
                   </svg>
                 </button>
-                <button v-if="canCancel(job)" class="ghost-button danger-text" type="button" @click.stop="cancelJob(job.id)">
-                  {{ copy("取消", "Cancel") }}
+                <button
+                  v-if="canCancel(job)"
+                  class="icon-button icon-button--bare icon-button--tiny danger-text"
+                  type="button"
+                  :aria-label="copy('取消', 'Cancel')"
+                  :title="copy('取消', 'Cancel')"
+                  @click.stop="cancelJob(job.id)"
+                >
+                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <circle cx="10" cy="10" r="6.75" />
+                    <path d="m7.25 7.25 5.5 5.5" />
+                    <path d="m12.75 7.25-5.5 5.5" />
+                  </svg>
                 </button>
-                <button v-if="canRetry(job)" class="ghost-button" type="button" @click.stop="retryJob(job.id)">
-                  {{ copy("重试", "Retry") }}
+                <button
+                  v-if="canRetry(job)"
+                  class="icon-button icon-button--bare icon-button--tiny"
+                  type="button"
+                  :aria-label="copy('重试', 'Retry')"
+                  :title="copy('重试', 'Retry')"
+                  @click.stop="retryJob(job.id)"
+                >
+                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <path d="M15.2 10a5.2 5.2 0 1 1-1.05-4.55" />
+                    <path d="M14.15 5.45 15.95 7.25H14.2" />
+                  </svg>
                 </button>
               </div>
             </div>
@@ -306,6 +408,7 @@ function canCancel(job) {
             <div class="meta-card">
               <span>{{ copy("状态", "Status") }}</span>
               <strong>{{ formatJobStatus(state.selectedJob.status, copy) }}</strong>
+              <small>{{ copy("总耗时", "Total") }} {{ selectedJobElapsedLabel }}</small>
             </div>
             <div class="meta-card">
               <span>{{ copy("模型", "Model") }}</span>
@@ -322,10 +425,13 @@ function canCancel(job) {
           </div>
 
           <div class="timeline">
-            <article v-for="event in state.selectedJob.events" :key="event.id" class="timeline-item">
+            <article v-for="event in selectedJobTimeline" :key="event.id" class="timeline-item">
               <div class="timeline-item-head">
                 <strong>{{ event.message }}</strong>
-                <span class="subtle">{{ formatDate(event.created_at) }}</span>
+                <div class="timeline-item-meta">
+                  <span class="subtle">{{ formatDate(event.created_at) }}</span>
+                  <span class="duration-pill">{{ event.durationState }} {{ event.durationLabel }}</span>
+                </div>
               </div>
               <p class="subtle">{{ event.level }}</p>
             </article>

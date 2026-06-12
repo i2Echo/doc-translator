@@ -73,6 +73,7 @@ export const state = reactive({
 export const isAuthenticated = computed(() => Boolean(state.user && state.token));
 export const isAdmin = computed(() => state.user?.role === "admin");
 export const previewDirty = computed(() => hasPreviewChanges(state.previewData, state.previewDraft));
+export const previewLayoutOverflowCount = computed(() => countPreviewLayoutOverflows(state.previewDraft));
 
 export function copy(zh, en) {
   return state.uiLanguage === "zh-CN" ? zh : en;
@@ -196,6 +197,24 @@ function hasPreviewChanges(original, draft) {
   return original.pages.some((page, index) => page.translated_text !== draft.pages[index].translated_text);
 }
 
+function countPreviewLayoutOverflows(preview) {
+  if (!preview || preview.document_kind !== "pdf") {
+    return 0;
+  }
+
+  return preview.pages.reduce((total, page) => {
+    return (
+      total +
+      page.blocks.reduce((pageTotal, block) => {
+        if ((block.type || "text") === "table") {
+          return pageTotal + block.cells.filter((cell) => cell.layout_status === "overflow").length;
+        }
+        return pageTotal + (block.layout_status === "overflow" ? 1 : 0);
+      }, 0)
+    );
+  }, 0);
+}
+
 function previewEditablePayload() {
   if (!state.previewData || !state.previewDraft || state.previewData.document_kind !== "pdf") {
     return [];
@@ -209,27 +228,84 @@ function previewEditablePayload() {
       if ((originalBlock.type || "text") === "table") {
         originalBlock.cells.forEach((originalCell, cellIndex) => {
           const draftCell = draftBlock.cells[cellIndex];
-          if (originalCell.tgt_text !== draftCell.tgt_text) {
+          if (originalCell.tgt_text !== draftCell.tgt_text && draftCell.layout_status !== "overflow") {
             updates.push({
               cell_id: draftCell.cell_id,
               tgt_text: draftCell.tgt_text,
               font_size_final: draftCell.font_size_current,
+              layout_status: draftCell.layout_status || "ok",
             });
           }
         });
         return;
       }
 
-      if (originalBlock.tgt_text !== draftBlock.tgt_text) {
+      if (originalBlock.tgt_text !== draftBlock.tgt_text && draftBlock.layout_status !== "overflow") {
         updates.push({
           block_id: draftBlock.block_id,
           tgt_text: draftBlock.tgt_text,
           font_size_final: draftBlock.font_size_current,
+          layout_status: draftBlock.layout_status || "ok",
         });
       }
     });
   });
   return updates;
+}
+
+function collectQuarantinedPdfEdits(original, draft) {
+  if (!original || !draft || original.document_kind !== "pdf") {
+    return new Map();
+  }
+
+  const quarantined = new Map();
+  original.pages.forEach((originalPage, pageIndex) => {
+    const draftPage = draft.pages[pageIndex];
+    originalPage.blocks.forEach((originalBlock, blockIndex) => {
+      const draftBlock = draftPage.blocks[blockIndex];
+      if ((originalBlock.type || "text") === "table") {
+        originalBlock.cells.forEach((originalCell, cellIndex) => {
+          const draftCell = draftBlock.cells[cellIndex];
+          if (originalCell.tgt_text !== draftCell.tgt_text && draftCell.layout_status === "overflow") {
+            quarantined.set(draftCell.cell_id, {
+              font_size_current: draftCell.font_size_current,
+              layout_status: draftCell.layout_status,
+              tgt_text: draftCell.tgt_text,
+            });
+          }
+        });
+        return;
+      }
+
+      if (originalBlock.tgt_text !== draftBlock.tgt_text && draftBlock.layout_status === "overflow") {
+        quarantined.set(draftBlock.block_id, {
+          font_size_current: draftBlock.font_size_current,
+          layout_status: draftBlock.layout_status,
+          tgt_text: draftBlock.tgt_text,
+        });
+      }
+    });
+  });
+  return quarantined;
+}
+
+function restoreQuarantinedPdfEdits(draft, quarantined) {
+  if (!draft || draft.document_kind !== "pdf" || quarantined.size === 0) {
+    return draft;
+  }
+
+  draft.pages.forEach((page) => {
+    page.blocks.forEach((block) => {
+      if ((block.type || "text") === "table") {
+        block.cells.forEach((cell) => {
+          Object.assign(cell, quarantined.get(cell.cell_id) || {});
+        });
+        return;
+      }
+      Object.assign(block, quarantined.get(block.block_id) || {});
+    });
+  });
+  return draft;
 }
 
 async function authedRequest(path, options = {}, config = {}) {
@@ -305,6 +381,7 @@ export async function refreshJobsOnly() {
     return;
   }
   state.jobs = await authedRequest("/jobs");
+  await refreshSelectedJob();
 }
 
 export async function refreshAll() {
@@ -570,11 +647,22 @@ export async function savePreview() {
   state.pending.previewSave = true;
   state.messages.preview = "";
   try {
+    const pdfPayload = state.previewDraft.document_kind === "pdf" ? previewEditablePayload() : [];
+    const quarantined =
+      state.previewDraft.document_kind === "pdf" ? collectQuarantinedPdfEdits(state.previewData, state.previewDraft) : new Map();
+    if (state.previewDraft.document_kind === "pdf" && pdfPayload.length === 0) {
+      state.messages.preview =
+        previewLayoutOverflowCount.value > 0
+          ? copy("红框溢出块已隔离，没有可安全保存的修改。", "Overflow blocks were quarantined; there are no safe edits to save.")
+          : copy("没有可保存的修改。", "No edits to save.");
+      return;
+    }
+
     const payload =
       state.previewDraft.document_kind === "pdf"
         ? {
             status: "validated",
-            payload: previewEditablePayload(),
+            payload: pdfPayload,
           }
         : {
             pages: state.previewDraft.pages.map((page) => ({
@@ -589,11 +677,14 @@ export async function savePreview() {
       body: JSON.stringify(payload),
     });
     state.previewData = preview;
-    state.previewDraft = clonePreview(preview);
+    state.previewDraft = restoreQuarantinedPdfEdits(clonePreview(preview), quarantined);
     if (preview.document_kind === "pdf") {
       refreshTranslatedPreviewDocument(state.previewJob.id, preview.updated_at);
     }
-    state.messages.preview = copy("修改已保存。", "Edits saved.");
+    state.messages.preview =
+      quarantined.size > 0
+        ? copy("安全修改已保存，红框溢出块已保留在草稿中。", "Safe edits saved; overflow blocks remain quarantined in the draft.")
+        : copy("修改已保存。", "Edits saved.");
   } finally {
     state.pending.previewSave = false;
   }

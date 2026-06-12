@@ -139,6 +139,10 @@ class JobPreviewPdfTextBlockRead(BaseModel):
     font_size_current: float
     src_text: str
     tgt_text: str
+    alignment: Literal["CENTER"] | None = None
+    font_style: Literal["BOLD"] | None = None
+    rotation: int | None = None
+    layout_status: Literal["ok", "overflow"] | None = None
 
 
 class JobPreviewPdfTableCellRead(BaseModel):
@@ -153,6 +157,10 @@ class JobPreviewPdfTableCellRead(BaseModel):
     font_size_current: float
     src_text: str
     tgt_text: str
+    alignment: Literal["CENTER"] | None = None
+    font_style: Literal["BOLD"] | None = None
+    rotation: int | None = None
+    layout_status: Literal["ok", "overflow"] | None = None
 
 
 class JobPreviewPdfTableBlockRead(BaseModel):
@@ -197,6 +205,7 @@ class JobPreviewPdfBlockUpdate(BaseModel):
     cell_id: str | None = None
     tgt_text: str
     font_size_final: float = Field(ge=0.5)
+    layout_status: Literal["ok", "overflow"] | None = None
 
     @model_validator(mode="after")
     def validate_identifier(self) -> "JobPreviewPdfBlockUpdate":

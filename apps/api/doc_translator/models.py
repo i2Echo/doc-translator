@@ -26,6 +26,7 @@ class JobStatus(StrEnum):
     OCR_RUNNING = "ocr_running"
     TRANSLATING = "translating"
     REBUILDING = "rebuilding"
+    VALIDATING = "validating"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -134,4 +135,3 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     actor: Mapped[User | None] = relationship(back_populates="audit_logs")
-
