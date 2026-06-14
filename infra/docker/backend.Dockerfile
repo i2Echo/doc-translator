@@ -26,11 +26,9 @@ RUN apt-get update \
 
 COPY apps/api/requirements.txt /tmp/requirements.txt
 COPY infra/docker/babeldoc-requirements.txt /tmp/babeldoc-requirements.txt
-COPY infra/docker/patch_babeldoc.py /tmp/patch_babeldoc.py
 RUN python -m pip install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
     && python -m pip install --break-system-packages --no-cache-dir --only-binary=onnx,onnxruntime,opencv-python-headless,scikit-learn,scipy -r /tmp/babeldoc-requirements.txt \
-    && python -m pip install --break-system-packages --no-cache-dir --only-binary=onnx,onnxruntime,opencv-python-headless,scikit-learn,scipy BabelDOC==0.6.2 \
-    && python /tmp/patch_babeldoc.py
+    && python -m pip install --break-system-packages --no-cache-dir --only-binary=onnx,onnxruntime,opencv-python-headless,scikit-learn,scipy BabelDOC==0.6.2
 
 COPY alembic.ini /app/alembic.ini
 COPY apps/api /app/apps/api

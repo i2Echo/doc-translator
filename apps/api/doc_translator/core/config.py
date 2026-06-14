@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     ocr_language_hint: str = "auto"
 
     max_upload_mb: int = 100
-    max_concurrent_jobs: int = 2
+    max_concurrent_jobs: int = 10
 
     admin_email: str = "admin@example.com"
     admin_password: str = "change-this-password"
@@ -39,4 +39,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-

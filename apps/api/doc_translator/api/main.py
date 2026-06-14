@@ -56,6 +56,38 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Doc Translator API", version="0.1.0", lifespan=lifespan)
 
+_TRANSLATION_LANGUAGE_ALIASES = {
+    "auto": "auto",
+    "auto detect": "auto",
+    "zh": "chinese",
+    "zh-cn": "chinese",
+    "chinese": "chinese",
+    "en": "english",
+    "english": "english",
+    "ja": "japanese",
+    "japanese": "japanese",
+    "ko": "korean",
+    "korean": "korean",
+    "ms": "malay",
+    "malay": "malay",
+    "th": "thai",
+    "thai": "thai",
+    "vi": "vietnamese",
+    "vietnamese": "vietnamese",
+}
+
+
+def normalize_translation_language(language: str) -> str:
+    normalized = language.strip().casefold()
+    return _TRANSLATION_LANGUAGE_ALIASES.get(normalized, normalized)
+
+
+def has_same_translation_language(source_language: str, target_language: str) -> bool:
+    normalized_source_language = normalize_translation_language(source_language)
+    if not normalized_source_language or normalized_source_language == "auto":
+        return False
+    return normalized_source_language == normalize_translation_language(target_language)
+
 
 def load_job_or_404(session: Session, job_id: str, current_user: User) -> TranslationJob:
     job = (
@@ -297,6 +329,12 @@ def upload_job(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ) -> JobRead:
+    if has_same_translation_language(source_language, target_language):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Source and target language are the same. No translation is needed, or choose a different target language.",
+        )
+
     runtime = get_runtime_settings(session)
     file_meta = persist_upload(file, runtime)
 

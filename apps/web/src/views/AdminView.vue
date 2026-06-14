@@ -37,7 +37,7 @@ const settingsForm = reactive({
   ocr_enabled: true,
   ocr_language_hint: "chi_sim+eng",
   max_upload_mb: 100,
-  max_concurrent_jobs: 2,
+  max_concurrent_jobs: 10,
 });
 
 const userForm = reactive({

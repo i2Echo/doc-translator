@@ -20,7 +20,7 @@ You are an advanced software engineering agent. Implement the following 5-phase 
 * **Task 2.1:** Build a text flattener that extracts all text fragments into a single-layer Key-Value dictionary (`block_id: src_text`).
 * **Task 2.2:** Build a local prefix-tree matcher (`marisa-trie`) to scan keys against industry-specific dictionaries (PCB/Semiconductor).
 * **Task 2.3:** Dynamically inject matched word-pairs directly into the LLM System Prompt under a strict compliance instruction block.
-* **Task 2.4:** Implement a post-translation validation daemon (`Gatekeeper`) comparing input vs. output keys. If any block is missing or un-translated, intercept and trigger an isolated sub-batch repair loop.
+* **Task 2.4:** Superseded by the BabelDOC internal-hook IR path: classify high-confidence roles before translation instead of repairing blocks after PDF output.
 * **Milestone:** Verified translation JSON output demonstrating 100% term compliance and zero omitted nodes.
 
 ---

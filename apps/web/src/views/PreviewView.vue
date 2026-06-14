@@ -54,6 +54,11 @@ let layoutMeasureTimer = null;
 const isPdf = computed(() => state.previewData?.document_kind === "pdf");
 const isEditing = computed(() => state.previewMode === "edit");
 const title = computed(() => state.previewData?.output_name || state.previewJob?.output_file?.original_name || "");
+const referencePdfKind = computed(() => (isEditing.value ? "translated" : "source"));
+const referencePdfLabel = computed(() => (isEditing.value ? copy("译文", "Translated") : copy("原文", "Source")));
+const referencePdfName = computed(() =>
+  isEditing.value ? title.value : (state.previewJob?.input_file?.original_name || "")
+);
 const subtitle = computed(() => {
   if (!state.previewJob) {
     return "";
@@ -224,7 +229,41 @@ function scheduleLayoutMeasure(item = null) {
   }, 40);
 }
 
-function selectPdfItem(item, behavior = "smooth") {
+function scrollEditorItemIntoView(itemId, { behavior = "smooth", block = "nearest" } = {}) {
+  const scroller = editorScroller.value;
+  if (!scroller) {
+    return;
+  }
+
+  const row = scroller.querySelector(`[data-editor-id="${CSS.escape(itemId)}"]`);
+  if (!row) {
+    return;
+  }
+
+  const paddingTop = 14;
+  const viewportTop = scroller.scrollTop;
+  const viewportBottom = viewportTop + scroller.clientHeight;
+  const rowTop = row.offsetTop;
+  const rowBottom = rowTop + row.offsetHeight;
+
+  let nextTop = viewportTop;
+  if (block === "start") {
+    nextTop = Math.max(rowTop - paddingTop, 0);
+  } else if (rowTop < viewportTop + paddingTop) {
+    nextTop = Math.max(rowTop - paddingTop, 0);
+  } else if (rowBottom > viewportBottom - paddingTop) {
+    nextTop = Math.max(rowBottom - scroller.clientHeight + paddingTop, 0);
+  } else {
+    return;
+  }
+
+  scroller.scrollTo({
+    top: nextTop,
+    behavior,
+  });
+}
+
+function selectPdfItem(item, { behavior = "smooth", editorBlock = "nearest" } = {}) {
   if (!item) {
     return;
   }
@@ -233,8 +272,8 @@ function selectPdfItem(item, behavior = "smooth") {
     scrollToPage(item.pageNum, behavior);
   }
   nextTick(() => {
-    editorScroller.value?.querySelector(`[data-editor-id="${CSS.escape(item.id)}"]`)?.scrollIntoView({
-      block: "nearest",
+    scrollEditorItemIntoView(item.id, {
+      block: editorBlock,
       behavior,
     });
   });
@@ -310,11 +349,12 @@ function formatZoom(kind) {
 
 function adjustZoom(kind, direction) {
   const nextZoom = Math.min(1.8, Math.max(0.7, Math.round((pdfZoom[kind] + direction * 0.1) * 10) / 10));
-  if (nextZoom === pdfZoom[kind]) {
+  if (nextZoom === pdfZoom.source && nextZoom === pdfZoom.translated) {
     return;
   }
 
-  pdfZoom[kind] = nextZoom;
+  pdfZoom.source = nextZoom;
+  pdfZoom.translated = nextZoom;
   void queuePdfRender();
 }
 
@@ -335,6 +375,7 @@ function releaseCanvas(kind, canvas) {
   canvas.style.height = `${Math.round((canvas.parentElement?.clientWidth || 1) / aspectRatio)}px`;
   canvas.dataset.rendered = "false";
   canvas.dataset.renderedWidth = "";
+  canvas.dataset.renderedDocKey = "";
 }
 
 function pageNumbersAroundViewport(scroller, multiplier = 1.1) {
@@ -373,7 +414,12 @@ async function renderPageIntoCanvas(kind, doc, pageNumber, canvas) {
   const baseViewport = page.getViewport({ scale: 1 });
   const width = Math.max((canvas.parentElement?.clientWidth || 0) * (pdfZoom[kind] || 1), 260);
   const widthKey = String(Math.round(width));
-  if (canvas.dataset.rendered === "true" && canvas.dataset.renderedWidth === widthKey) {
+  const docKey = loadedPdfUrls[kind] || kind;
+  if (
+    canvas.dataset.rendered === "true" &&
+    canvas.dataset.renderedWidth === widthKey &&
+    canvas.dataset.renderedDocKey === docKey
+  ) {
     return;
   }
 
@@ -401,6 +447,7 @@ async function renderPageIntoCanvas(kind, doc, pageNumber, canvas) {
 
   canvas.dataset.rendered = "true";
   canvas.dataset.renderedWidth = widthKey;
+  canvas.dataset.renderedDocKey = docKey;
 }
 
 function trimRenderedPages(kind, scroller, keepPages) {
@@ -470,12 +517,13 @@ function syncScroll(source, target) {
 }
 
 async function renderCurrentPdfPages() {
-  if (!isPdf.value || !pdfDocs.source) {
+  const referenceDoc = pdfDocs[referencePdfKind.value];
+  if (!isPdf.value || !referenceDoc) {
     return;
   }
 
   await nextTick();
-  await renderPdfColumn("source", pdfDocs.source, sourceScroller.value);
+  await renderPdfColumn(referencePdfKind.value, referenceDoc, sourceScroller.value);
   if (!isEditing.value && pdfDocs.translated) {
     await renderPdfColumn("translated", pdfDocs.translated, translatedScroller.value);
   }
@@ -757,8 +805,8 @@ onUnmounted(async () => {
     <section v-else-if="state.previewData && isPdf" class="preview-body preview-body--pdf">
       <article class="preview-column preview-column--canvas">
         <div class="preview-column__head">
-          <strong>{{ copy("原文", "Source") }}</strong>
-          <span :title="state.previewJob?.input_file?.original_name">{{ state.previewJob?.input_file?.original_name }}</span>
+          <strong>{{ referencePdfLabel }}</strong>
+          <span :title="referencePdfName">{{ referencePdfName }}</span>
         </div>
 
         <div class="preview-zoom-control">
@@ -808,7 +856,7 @@ onUnmounted(async () => {
                   }"
                   type="button"
                   :style="pdfBlockStyle(page, item)"
-                  @click.stop="selectPdfItem(item)"
+                  @click.stop="selectPdfItem(item, { editorBlock: 'start' })"
                 ></button>
               </div>
               <div class="pdf-page-loader" aria-hidden="true">
@@ -925,7 +973,12 @@ onUnmounted(async () => {
               </div>
               <p class="editor-source">{{ item.source || copy("没有原文可参考。", "No source text available.") }}</p>
               <span class="control-shell control-shell--textarea">
-                <textarea v-model="item.model.tgt_text" rows="5" @input="handlePdfTextInput(item)" @focus="selectPdfItem(item, 'auto')"></textarea>
+                <textarea
+                  v-model="item.model.tgt_text"
+                  rows="5"
+                  @input="handlePdfTextInput(item)"
+                  @focus="selectPdfItem(item, { behavior: 'auto' })"
+                ></textarea>
               </span>
               <p v-if="item.model.layout_status === 'overflow'" class="pdf-layout-alert">
                 {{ copy("已降至最小字号，仍超出目标边界。", "Minimum font size reached and the text still exceeds the target bounds.") }}

@@ -1339,6 +1339,7 @@ svg {
 
 .pdf-editor-row.overflow {
   border-color: rgba(183, 64, 45, 0.58);
+  box-shadow: 0 0 0 2px rgba(183, 64, 45, 0.08);
 }
 
 .pdf-editor-meta {

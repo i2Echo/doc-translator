@@ -37,19 +37,29 @@ def persist_upload(file: UploadFile, runtime: RuntimeSettings) -> dict:
     directories = ensure_storage_directories(runtime.local_storage_path)
     stored_name = f"{uuid4()}{extension}"
     target_path = directories["uploads"] / stored_name
+    temp_path = target_path.with_name(f".{stored_name}.tmp")
 
     digest = hashlib.sha256()
     max_bytes = runtime.max_upload_mb * 1024 * 1024
     size_bytes = 0
 
-    with target_path.open("wb") as output_stream:
-        while chunk := file.file.read(1024 * 1024):
-            size_bytes += len(chunk)
-            if size_bytes > max_bytes:
-                target_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds size limit")
-            output_stream.write(chunk)
-            digest.update(chunk)
+    try:
+        with temp_path.open("wb") as output_stream:
+            while chunk := file.file.read(1024 * 1024):
+                size_bytes += len(chunk)
+                if size_bytes > max_bytes:
+                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds size limit")
+                output_stream.write(chunk)
+                digest.update(chunk)
+
+        if size_bytes == 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
+
+        temp_path.replace(target_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        target_path.unlink(missing_ok=True)
+        raise
 
     return {
         "original_name": file.filename or stored_name,
@@ -73,4 +83,3 @@ def file_checksum(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
-

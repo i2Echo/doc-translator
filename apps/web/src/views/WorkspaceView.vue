@@ -29,6 +29,19 @@ const activeJobs = computed(() => state.jobs.filter((job) => activeJobStatuses.h
 const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
 const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
 const supportedUploadExtensions = new Set([".pdf", ".docx"]);
+const uploadMessageIsError = computed(() => {
+  const message = state.messages.upload;
+  return Boolean(
+    message &&
+      (message.includes("Choose") ||
+        message.includes("请先") ||
+        message.includes("无需翻译") ||
+        message.includes("No translation is needed") ||
+        message.includes("选择其他语言") ||
+        message.includes("different target language") ||
+        message.includes("language are the same"))
+  );
+});
 
 const workspaceModel = computed(() => {
   return state.settings?.model_name || state.jobs[0]?.model_name_snapshot || copy("托管模型", "Managed model");
@@ -142,17 +155,35 @@ function removeUploadFile(index) {
   uploadForm.files.splice(index, 1);
 }
 
+function normalizeSelectedLanguage(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function hasSameTranslationLanguages(sourceLanguage, targetLanguage) {
+  const normalizedSourceLanguage = normalizeSelectedLanguage(sourceLanguage);
+  if (!normalizedSourceLanguage || normalizedSourceLanguage === "auto") {
+    return false;
+  }
+  return normalizedSourceLanguage === normalizeSelectedLanguage(targetLanguage);
+}
+
 async function submitUpload() {
   if (!uploadForm.files.length) {
     state.messages.upload = copy("请先选择 PDF 或 DOCX 文件。", "Choose a PDF or DOCX file first.");
     return;
   }
 
+  if (hasSameTranslationLanguages(uploadForm.sourceLanguage, uploadForm.targetLanguage)) {
+    state.messages.upload = copy(
+      "源语言与目标语言相同，无需翻译；请选择其他目标语言。",
+      "Source and target language are the same. No translation is needed, or choose a different target language."
+    );
+    return;
+  }
+
   try {
     await uploadJobs(uploadForm.files, uploadForm.sourceLanguage, uploadForm.targetLanguage);
     uploadForm.files = [];
-    uploadForm.sourceLanguage = "auto";
-    uploadForm.targetLanguage = "Chinese";
   } catch (error) {
     state.messages.upload = error.message;
   }
@@ -287,7 +318,7 @@ onBeforeUnmount(() => {
             {{ state.pending.upload ? copy("提交中…", "Queuing...") : copy("开始翻译", "Start translation") }}
           </button>
         </div>
-        <p v-if="state.messages.upload" class="message" :class="{ error: state.messages.upload.includes('Choose') || state.messages.upload.includes('请先') }">
+        <p v-if="state.messages.upload" class="message" :class="{ error: uploadMessageIsError }">
           {{ state.messages.upload }}
         </p>
       </form>

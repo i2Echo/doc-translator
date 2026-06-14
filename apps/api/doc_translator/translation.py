@@ -3,13 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import re
 import shutil
-import subprocess
 import tempfile
-import threading
-import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,17 +20,13 @@ from PIL import Image
 from sqlalchemy.orm import Session, selectinload
 
 from doc_translator.audit import record_audit
+from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path
+from doc_translator.babeldoc_runner import BabeldocLibraryResult, translate_pdf_with_babeldoc_library
 from doc_translator.db import SessionLocal
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
-from doc_translator.preview import load_or_create_preview, update_preview
-from doc_translator.render_guards.font_router import normalize_language_code
+from doc_translator.preview import load_or_create_preview
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
 from doc_translator.storage import build_output_target, file_checksum
-from doc_translator.translators.gatekeeper import (
-    flatten_preview_text,
-    should_preserve_source_text,
-    validate_translation_map,
-)
 from doc_translator.translators.prompt_builder import build_terminology_instruction
 from doc_translator.translators.trie_matcher import default_terminology_matcher
 
@@ -83,36 +75,6 @@ _BABELDOC_PROGRESS_EVENT_PREFIX = "__BABELDOC_PROGRESS__"
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BABELDOC_PROGRESS_FRACTION_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 _MODEL_ERROR_BODY_LIMIT = 600
-_PDF_SCHEMATIC_LABEL_HINT_RE = re.compile(
-    r"\b(?:"
-    r"ADC|DAC|MUX|PGA|I2C|SCL|SDA|ADDR|ALERT|RDY|AIN\d*|VDD|GND|"
-    r"OSC(?:ILLATOR)?|COMPARATOR|REFERENCE|VOLTAGE|INTERFACE|MULTIPLEXER|"
-    r"\d+\s*[- ]?\s*BIT|BIT|ONLY"
-    r")\b",
-    re.IGNORECASE,
-)
-_PDF_SCHEMATIC_LABEL_MAX_CHARS = 64
-_PDF_SCHEMATIC_LABEL_MAX_TOKENS = 6
-_PDF_SCHEMATIC_LABEL_MAX_FONT_SIZE = 10.5
-_PDF_SCHEMATIC_LABEL_MAX_WIDTH = 180.0
-_PDF_SCHEMATIC_LABEL_MAX_HEIGHT = 48.0
-_PDF_DATASHEET_IDENTIFIER_RE = re.compile(r"\b[A-Z]{2,}\d{3,}[A-Z0-9-]*\b")
-_PDF_DATASHEET_HEADER_MARKER_RE = re.compile(
-    r"\b(?:REVISED|REVISION|JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|"
-    r"SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER|TEXAS\s+INSTRUMENTS)\b|www\.ti\.com",
-    re.IGNORECASE,
-)
-_PDF_DATASHEET_HEADER_MAX_CHARS = 140
-_PDF_DATASHEET_HEADER_MAX_FONT_SIZE = 22.0
-_PDF_TOC_ENTRY_RE = re.compile(r"^([\d.]+)?\s*(.*?)([.\s…_-]{3,})(\d+)$")
-_PDF_TOC_ENTRY_SCAN_RE = re.compile(r"(?:^|\s+)([\d.]+)?\s*(.*?)([.\s…_-]{3,})(\d+)(?=\s+(?:[\d.]+\s*)?\S|$)")
-_PDF_TOC_TRAILING_PAGE_RE = re.compile(r"(?:[.\s…_-]{3,}|\s+)(\d+)$")
-
-
-@dataclass(frozen=True)
-class _PdfTocEntry:
-    title: str
-    page_number: str
 
 
 @dataclass(frozen=True)
@@ -706,109 +668,7 @@ class _BabeldocProgressTracker:
         self.last_stage_name = stage.name
 
 
-def _enqueue_babeldoc_output_lines(buffer: str, output_lines: queue.Queue[str]) -> str:
-    if not buffer:
-        return ""
-
-    ends_with_separator = buffer.endswith(("\r", "\n"))
-    segments = re.split(r"[\r\n]+", buffer)
-    complete_segments = segments if ends_with_separator else segments[:-1]
-    pending = "" if ends_with_separator else segments[-1]
-
-    for segment in complete_segments:
-        normalized = segment.strip()
-        if normalized:
-            output_lines.put(normalized)
-    return pending
-
-
-def _read_command_output(
-    stream,
-    captured_output: list[str],
-    output_lines: queue.Queue[str],
-) -> None:
-    pending = ""
-    read_chunk = getattr(stream, "read1", stream.read)
-    try:
-        while True:
-            chunk = read_chunk(4096)
-            if not chunk:
-                break
-            text = chunk.decode("utf-8", errors="replace")
-            captured_output.append(text)
-            pending = _enqueue_babeldoc_output_lines(pending + text, output_lines)
-    except (OSError, ValueError):
-        return
-
-    tail = pending.strip()
-    if tail:
-        output_lines.put(tail)
-
-
-def _drain_command_output(output_lines: queue.Queue[str], on_output_line: Callable[[str], None] | None) -> None:
-    while True:
-        try:
-            line = output_lines.get_nowait()
-        except queue.Empty:
-            return
-        if on_output_line is not None:
-            on_output_line(line)
-
-
-def _run_command_with_cancellation(
-    command: list[str],
-    *,
-    session: Session,
-    job: TranslationJob,
-    cwd: Path | None = None,
-    on_output_line: Callable[[str], None] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        command,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    if process.stdout is None:
-        raise RuntimeError("Failed to capture command output")
-
-    captured_output: list[str] = []
-    output_lines: queue.Queue[str] = queue.Queue()
-    output_reader = threading.Thread(
-        target=_read_command_output,
-        args=(process.stdout, captured_output, output_lines),
-        daemon=True,
-    )
-    output_reader.start()
-    try:
-        while process.poll() is None:
-            ensure_not_cancelled(session, job)
-            _drain_command_output(output_lines, on_output_line)
-            time.sleep(0.5)
-        output_reader.join(timeout=5)
-        _drain_command_output(output_lines, on_output_line)
-    except JobCancelledError:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
-        output_reader.join(timeout=5)
-        _drain_command_output(output_lines, on_output_line)
-        raise
-    finally:
-        process.stdout.close()
-
-    stdout = "".join(captured_output)
-    completed = subprocess.CompletedProcess(command, process.returncode, stdout, "")
-    if completed.returncode != 0:
-        error_text = (completed.stdout or "BabelDOC failed").strip()
-        raise RuntimeError(f"BabelDOC translation failed: {error_text[-4000:]}")
-    return completed
-
-
-def _translate_prepared_pdf_with_babeldoc_cli(
+def _translate_prepared_pdf_with_babeldoc_hooks(
     input_path: Path,
     output_dir: Path,
     working_dir: Path,
@@ -819,52 +679,27 @@ def _translate_prepared_pdf_with_babeldoc_cli(
     source_language: str | None,
     target_language: str,
     use_ocr_workaround: bool,
-) -> Path:
+) -> BabeldocLibraryResult:
     progress_tracker = _BabeldocProgressTracker(session, job)
-    command = [
-        "babeldoc",
-        "--files",
-        str(input_path),
-        "--output",
-        str(output_dir),
-        "--working-dir",
-        str(working_dir),
-        "--lang-out",
-        target_language,
-        "--openai",
-        "--openai-model",
-        runtime.model_name,
-        "--openai-base-url",
-        runtime.model_base_url,
-        "--openai-api-key",
-        runtime.model_api_key,
-        "--no-dual",
-        "--watermark-output-mode",
-        "no_watermark",
-        "--report-interval",
-        str(BABELDOC_PROGRESS_REPORT_INTERVAL_SECONDS),
-    ]
-    if source_language:
-        command.extend(["--lang-in", source_language])
-    if use_ocr_workaround:
-        command.extend(["--skip-scanned-detection", "--ocr-workaround"])
 
-    _run_command_with_cancellation(
-        command,
-        session=session,
-        job=job,
-        on_output_line=progress_tracker.handle_output_line,
+    def on_progress_event(event: dict[str, object]) -> None:
+        ensure_not_cancelled(session, job)
+        progress_tracker.handle_output_line(
+            _BABELDOC_PROGRESS_EVENT_PREFIX + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    return translate_pdf_with_babeldoc_library(
+        input_path,
+        output_dir,
+        working_dir,
+        runtime,
+        source_language=source_language,
+        target_language=target_language,
+        use_ocr_workaround=use_ocr_workaround,
+        qps=BABELDOC_QPS,
+        report_interval=BABELDOC_PROGRESS_REPORT_INTERVAL_SECONDS,
+        on_progress_event=on_progress_event,
     )
-    return _find_babeldoc_mono_output(output_dir, input_path.stem)
-
-
-def _find_babeldoc_mono_output(output_dir: Path, input_stem: str) -> Path:
-    matches = sorted(output_dir.glob(f"{input_stem}*.mono.pdf"))
-    if not matches:
-        matches = sorted(output_dir.glob("*.mono.pdf"))
-    if not matches:
-        raise RuntimeError("BabelDOC finished without producing a monolingual PDF output")
-    return max(matches, key=lambda candidate: candidate.stat().st_mtime)
 
 
 def _paragraph_targets(document: Document) -> list:
@@ -914,696 +749,68 @@ def translate_docx(
     return None
 
 
-def _translate_pdf_repair_text(
-    target_id: str,
-    source_text: str,
-    translator: OpenAICompatibleTranslator,
-    job: TranslationJob,
-) -> str:
-    if should_preserve_source_text(source_text):
-        return source_text
-
-    terminology_instruction = build_terminology_instruction(default_terminology_matcher().scan([source_text]))
-    translated_chunks: list[str] = []
-    for chunk in split_text(source_text):
+def _restore_input_file_from_duplicate(session: Session, input_file: JobFile, target_path: Path) -> Path | None:
+    candidates = (
+        session.query(JobFile)
+        .filter(JobFile.kind == JobFileKind.INPUT)
+        .filter(JobFile.checksum == input_file.checksum)
+        .filter(JobFile.id != input_file.id)
+        .filter(JobFile.deleted_at.is_(None))
+        .order_by(JobFile.created_at.desc())
+        .all()
+    )
+    for candidate in candidates:
+        candidate_path = Path(candidate.storage_path)
         try:
-            translated_chunks.append(
-                translator.translate_text(
-                    chunk,
-                    job.source_language,
-                    job.target_language,
-                    preserve_line_breaks=True,
-                    extra_system_instruction=terminology_instruction,
-                )
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Repair translation failed for PDF block '{target_id}': {exc}") from exc
-    return "".join(translated_chunks)
-
-
-def _parse_pdf_toc_entry(text: str) -> _PdfTocEntry | None:
-    normalized = unicodedata.normalize("NFKC", str(text or "")).replace("\r\n", "\n")
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    match = _PDF_TOC_ENTRY_RE.match(normalized)
-    if match is None:
-        return None
-
-    prefix = (match.group(1) or "").strip()
-    title = re.sub(r"\s+", " ", match.group(2) or "").strip()
-    page_number = (match.group(4) or "").strip()
-    if not title or not page_number:
-        return None
-    return _PdfTocEntry(title=f"{prefix} {title}".strip(), page_number=page_number)
-
-
-def _pdf_toc_entry_from_match(match: re.Match[str]) -> _PdfTocEntry | None:
-    prefix = (match.group(1) or "").strip()
-    title = re.sub(r"\s+", " ", match.group(2) or "").strip()
-    page_number = (match.group(4) or "").strip()
-    if not title or not page_number:
-        return None
-    return _PdfTocEntry(title=f"{prefix} {title}".strip(), page_number=page_number)
-
-
-def _scan_pdf_toc_entries_in_line(line: str) -> list[_PdfTocEntry]:
-    normalized = unicodedata.normalize("NFKC", str(line or "")).replace("\r\n", "\n")
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    matches = [_pdf_toc_entry_from_match(match) for match in _PDF_TOC_ENTRY_SCAN_RE.finditer(normalized)]
-    return [entry for entry in matches if entry is not None]
-
-
-def _parse_pdf_toc_entries(text: str) -> list[_PdfTocEntry]:
-    lines = [line for line in unicodedata.normalize("NFKC", str(text or "")).replace("\r\n", "\n").splitlines() if line.strip()]
-    if not lines:
-        return []
-    entries_by_line = [_scan_pdf_toc_entries_in_line(line) for line in lines]
-    if all(entries_by_line):
-        return [entry for entries in entries_by_line for entry in entries]
-
-    entries: list[_PdfTocEntry] = []
-    index = 0
-    while index < len(lines):
-        line_entries = _scan_pdf_toc_entries_in_line(lines[index])
-        if line_entries:
-            entries.extend(line_entries)
-            index += 1
+            if candidate_path.stat().st_size != input_file.size_bytes:
+                continue
+        except FileNotFoundError:
+            continue
+        if file_checksum(candidate_path) != input_file.checksum:
             continue
 
-        matched_wrapped = False
-        for end_index in range(index + 2, min(index + 4, len(lines)) + 1):
-            wrapped_entries = _scan_pdf_toc_entries_in_line(" ".join(lines[index:end_index]))
-            if len(wrapped_entries) == 1:
-                entries.extend(wrapped_entries)
-                index = end_index
-                matched_wrapped = True
-                break
-        if not matched_wrapped:
-            return []
-
-    return entries
-
-
-def _extract_pdf_toc_target_title(target_text: str) -> str:
-    target_entry = _parse_pdf_toc_entry(target_text)
-    if target_entry is not None:
-        return target_entry.title
-    normalized = unicodedata.normalize("NFKC", str(target_text or "")).replace("\r\n", "\n")
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return _PDF_TOC_TRAILING_PAGE_RE.sub("", normalized).strip(" .…_-")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        restore_path = target_path.with_name(f".{target_path.name}.restore")
+        try:
+            shutil.copyfile(candidate_path, restore_path)
+            if restore_path.stat().st_size != input_file.size_bytes or file_checksum(restore_path) != input_file.checksum:
+                restore_path.unlink(missing_ok=True)
+                continue
+            restore_path.replace(target_path)
+        finally:
+            restore_path.unlink(missing_ok=True)
+        return candidate_path
+    return None
 
 
-def _extract_pdf_toc_target_titles(target_text: str) -> list[str]:
-    target_entries = _parse_pdf_toc_entries(target_text)
-    if target_entries:
-        return [entry.title for entry in target_entries]
-
-    normalized = unicodedata.normalize("NFKC", str(target_text or "")).replace("\r\n", "\n")
-    lines = [line for line in normalized.splitlines() if line.strip()]
-    if len(lines) <= 1:
-        title = _extract_pdf_toc_target_title(normalized)
-        return [title] if title else []
-    return [title for line in lines for title in (_extract_pdf_toc_target_title(line),) if title]
-
-
-def _strip_pdf_toc_target_page_suffix(source_entry: _PdfTocEntry, target_title: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(target_title or "")).replace("\r\n", "\n")
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        return ""
-
-    source_index = _pdf_toc_title_index(source_entry.title)
-    page_number = re.escape(source_entry.page_number)
-    next_token_pattern = rf"(?:{re.escape(source_index)}\.?\b|\d+(?:\.\d+)*\b|[.…_-])" if source_index else r"(?:\d+(?:\.\d+)*\b|[.…_-])"
-    noisy_suffix_pattern = rf"(?<!\d)(?:[.…_-]+|\s{{2,}})\s*{page_number}(?=\s+{next_token_pattern}|$).*"
-    stripped = re.sub(noisy_suffix_pattern, "", normalized).strip(" .…_-")
-    if stripped != normalized:
-        return stripped
-
-    parsed_entry = _parse_pdf_toc_entry(normalized)
-    if parsed_entry is not None and parsed_entry.page_number == source_entry.page_number:
-        parsed_title = re.sub(noisy_suffix_pattern, "", parsed_entry.title).strip(" .…_-")
-        return parsed_title or parsed_entry.title
-
-    stripped = re.sub(rf"(?:[.…_-]+|\s{{2,}})\s*{page_number}\s*$", "", normalized).strip(" .…_-")
-    return stripped or normalized
-
-
-def _pdf_toc_title_index(text: str) -> str:
-    match = re.match(r"^\s*(\d+(?:\.\d+)*\.?)\b", str(text or ""))
-    return match.group(1).rstrip(".") if match is not None else ""
-
-
-def _pdf_toc_title_has_body(text: str, source_entry: _PdfTocEntry) -> bool:
-    body = str(text or "").strip()
-    source_index = _pdf_toc_title_index(source_entry.title)
-    if source_index:
-        body = re.sub(rf"^\s*{re.escape(source_index)}\.?\s*", "", body).strip()
-    return bool(re.search(r"[^\W\d_.]", body, flags=re.UNICODE) or re.search(r"[\u4e00-\u9fff]", body))
-
-
-def _translate_pdf_toc_title(
-    target_id: str,
-    source_title: str,
-    translator: OpenAICompatibleTranslator,
-    job: TranslationJob,
-) -> str:
-    if should_preserve_source_text(source_title):
-        return source_title
-
-    terminology_instruction = build_terminology_instruction(default_terminology_matcher().scan([source_title]))
-    toc_instruction = (
-        "This is a table-of-contents entry title. Translate only the title text. "
-        "Do not add dot leaders, page numbers, explanations, or surrounding punctuation."
-    )
-    extra_instruction = "\n\n".join(part for part in (terminology_instruction, toc_instruction) if part)
+def _ensure_input_file_available(session: Session, job: TranslationJob) -> Path:
+    input_file = job.input_file
+    input_path = Path(input_file.storage_path)
     try:
-        return translator.translate_text(
-            source_title,
-            job.source_language,
-            job.target_language,
-            preserve_line_breaks=False,
-            extra_system_instruction=extra_instruction,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"TOC title translation failed for PDF block '{target_id}': {exc}") from exc
+        actual_size = input_path.stat().st_size
+    except FileNotFoundError:
+        actual_size = None
 
+    if actual_size == input_file.size_bytes and actual_size > 0:
+        return input_path
 
-def _repair_pdf_preview_translation_blocks(
-    preview: dict,
-    failed_keys: tuple[str, ...],
-    translator: OpenAICompatibleTranslator,
-    job: TranslationJob,
-) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
-    source_map = flatten_preview_text(preview, source=True)
-    updates: list[dict[str, object]] = []
-    failures: list[dict[str, str]] = []
-    failed_key_set = set(failed_keys)
-    for page in preview.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for block in page.get("blocks", []):
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "table":
-                for cell in block.get("cells", []):
-                    if not isinstance(cell, dict):
-                        continue
-                    cell_id = str(cell.get("cell_id", ""))
-                    if cell_id not in failed_key_set:
-                        continue
-                    source_text = source_map.get(cell_id, "")
-                    try:
-                        repaired_text = _translate_pdf_repair_text(cell_id, source_text, translator, job)
-                    except Exception as exc:
-                        logger.warning("PDF repair translation failed", extra={"job_id": job.id, "target_id": cell_id, "error": str(exc)})
-                        failures.append({"target_id": cell_id, "error": str(exc)})
-                        continue
-                    updates.append(
-                        {
-                            "cell_id": cell_id,
-                            "tgt_text": repaired_text,
-                            "font_size_final": float(cell.get("font_size_current") or cell.get("font_size_original") or 8.0),
-                            "layout_status": cell.get("layout_status", "ok"),
-                        }
-                    )
-                continue
-
-            block_id = str(block.get("block_id", ""))
-            if block_id not in failed_key_set:
-                continue
-            source_text = source_map.get(block_id, "")
-            try:
-                repaired_text = _translate_pdf_repair_text(block_id, source_text, translator, job)
-            except Exception as exc:
-                logger.warning("PDF repair translation failed", extra={"job_id": job.id, "target_id": block_id, "error": str(exc)})
-                failures.append({"target_id": block_id, "error": str(exc)})
-                continue
-            updates.append(
-                {
-                    "block_id": block_id,
-                    "tgt_text": repaired_text,
-                    "font_size_final": float(block.get("font_size_current") or block.get("font_size_original") or 8.0),
-                    "layout_status": block.get("layout_status", "ok"),
-                }
-            )
-    return updates, failures
-
-
-def _build_pdf_preview_reflow_updates(preview: dict) -> list[dict[str, object]]:
-    updates: list[dict[str, object]] = []
-    for page in preview.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for block in page.get("blocks", []):
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "table":
-                for cell in block.get("cells", []):
-                    if not isinstance(cell, dict):
-                        continue
-                    updates.append(
-                        {
-                            "cell_id": str(cell.get("cell_id", "")),
-                            "tgt_text": str(cell.get("tgt_text", "")),
-                            "font_size_final": float(cell.get("font_size_current") or cell.get("font_size_original") or 8.0),
-                            "layout_status": cell.get("layout_status", "ok"),
-                        }
-                    )
-                continue
-            updates.append(
-                {
-                    "block_id": str(block.get("block_id", "")),
-                    "tgt_text": str(block.get("tgt_text", "")),
-                    "font_size_final": float(block.get("font_size_current") or block.get("font_size_original") or 8.0),
-                    "layout_status": block.get("layout_status", "ok"),
-                }
-            )
-    return updates
-
-
-def _build_pdf_toc_updates(
-    preview: dict,
-    translator: OpenAICompatibleTranslator,
-    job: TranslationJob,
-) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
-    updates: list[dict[str, object]] = []
-    failures: list[dict[str, str]] = []
-    for page in preview.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for block in page.get("blocks", []):
-            if not isinstance(block, dict) or block.get("type") == "table":
-                continue
-
-            source_text = str(block.get("src_text", ""))
-            source_entries = _parse_pdf_toc_entries(source_text)
-            if not source_entries:
-                continue
-
-            block_id = str(block.get("block_id", ""))
-            target_titles = _extract_pdf_toc_target_titles(str(block.get("tgt_text", "")))
-            repaired_titles: list[str] = []
-            for index, source_entry in enumerate(source_entries):
-                target_title = target_titles[index] if index < len(target_titles) else ""
-                target_title = _strip_pdf_toc_target_page_suffix(source_entry, target_title)
-                if not target_title or not _pdf_toc_title_has_body(target_title, source_entry) or (
-                    _canonical_pdf_label_text(target_title) == _canonical_pdf_label_text(source_entry.title)
-                    and not should_preserve_source_text(source_entry.title)
-                ):
-                    try:
-                        target_title = _translate_pdf_toc_title(block_id, source_entry.title, translator, job)
-                    except Exception as exc:
-                        logger.warning("PDF TOC repair translation failed", extra={"job_id": job.id, "target_id": block_id, "error": str(exc)})
-                        failures.append({"target_id": block_id, "error": str(exc)})
-                        target_title = source_entry.title
-                repaired_titles.append(target_title)
-
-            target_title_text = "\n".join(repaired_titles)
-
-            updates.append(
-                {
-                    "block_id": block_id,
-                    "tgt_text": target_title_text,
-                    "font_size_final": float(block.get("font_size_current") or block.get("font_size_original") or 8.0),
-                    "layout_status": "ok",
-                    "toc_source_text": source_text,
-                    "toc_title_text": target_title_text,
-                    "toc_page_number": "\n".join(entry.page_number for entry in source_entries),
-                }
-            )
-    return updates, failures
-
-
-def _repair_pdf_toc_entries(
-    job: TranslationJob,
-    session: Session,
-    preview: dict,
-    runtime: RuntimeSettings,
-) -> dict:
-    translator = OpenAICompatibleTranslator(runtime)
-    updates, failures = _build_pdf_toc_updates(preview, translator, job)
-    if not updates:
-        if failures:
-            add_job_event(
-                session,
-                job,
-                "PDF TOC repair skipped entries after model errors",
-                level="warning",
-                details={"failed_repairs": failures[:20], "failed_repair_count": len(failures)},
-            )
-            session.commit()
-        return preview
-
-    update_job_state(
-        session,
-        job,
-        status=JobStatus.VALIDATING,
-        progress=max(job.progress, 94),
-        message="Repairing PDF table of contents layout",
-        details={"toc_blocks": len(updates), "failed_repair_count": len(failures)},
-    )
-    repaired_preview = update_preview(job, {"status": "validated", "payload": updates})
-    details = {"toc_blocks": len(updates)}
-    if failures:
-        details["failed_repair_count"] = len(failures)
-    add_job_event(session, job, "Repaired PDF table of contents layout", details=details)
-    if failures:
+    restored_from = _restore_input_file_from_duplicate(session, input_file, input_path)
+    if restored_from is not None:
         add_job_event(
             session,
             job,
-            "PDF TOC repair skipped entries after model errors",
+            "Restored missing or incomplete input file from matching upload",
             level="warning",
-            details={"failed_repairs": failures[:20], "failed_repair_count": len(failures)},
-        )
-    session.commit()
-    return repaired_preview
-
-
-def _pdf_literal_token_count(text: str) -> int:
-    return len([token for token in re.split(r"\s+", str(text or "").strip()) if token])
-
-
-def _canonical_pdf_label_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(text or ""))
-    normalized = re.sub(r"[\u200b-\u200d\ufeff]", "", normalized)
-    normalized = re.sub(r"[\u2010-\u2015\u2212]", "-", normalized)
-    return re.sub(r"\s+", "", normalized).casefold()
-
-
-def _pdf_block_font_size(block: dict[str, object]) -> float:
-    return float(block.get("font_size_original") or block.get("font_size_current") or 0.0)
-
-
-def _pdf_block_rect(block: dict[str, object]) -> tuple[float, float, float, float] | None:
-    rect = block.get("rect")
-    if not isinstance(rect, list) or len(rect) != 4:
-        return None
-    return (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
-
-
-def _is_pdf_margin_block(page: dict[str, object], block: dict[str, object]) -> bool:
-    rect = _pdf_block_rect(block)
-    if rect is None:
-        return False
-    _, y0, _, y1 = rect
-    page_height = float(page.get("page_height") or 0.0)
-    return y0 <= 40.0 or (page_height > 0 and y1 >= page_height - 36.0)
-
-
-def _has_pdf_literal_exclusion_text(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", str(text or "")).casefold()
-    return any(
-        marker in normalized
-        for marker in (
-            "copyright",
-            "www.",
-            "product folder",
-            "tools &",
-            "support &",
-            "technical documents",
-            "sample &",
-            "important notice",
-            "production data",
-        )
-    )
-
-
-def _is_pdf_schematic_label(block: dict[str, object], source_text: str) -> bool:
-    normalized_text = re.sub(r"\s+", " ", str(source_text or "")).strip()
-    if not normalized_text:
-        return False
-
-    rect = _pdf_block_rect(block)
-    if rect is None:
-        return False
-    x0, y0, x1, y1 = rect
-    width = max(x1 - x0, 0.0)
-    height = max(y1 - y0, 0.0)
-
-    if len(normalized_text) > _PDF_SCHEMATIC_LABEL_MAX_CHARS:
-        return False
-    if _pdf_literal_token_count(normalized_text) > _PDF_SCHEMATIC_LABEL_MAX_TOKENS:
-        return False
-    if _pdf_block_font_size(block) > _PDF_SCHEMATIC_LABEL_MAX_FONT_SIZE:
-        return False
-    if width > _PDF_SCHEMATIC_LABEL_MAX_WIDTH or height > _PDF_SCHEMATIC_LABEL_MAX_HEIGHT:
-        return False
-
-    return bool(_PDF_SCHEMATIC_LABEL_HINT_RE.search(normalized_text))
-
-
-def _is_pdf_datasheet_header_identifier(page: dict[str, object], block: dict[str, object], source_text: str) -> bool:
-    normalized_text = re.sub(r"\s+", " ", str(source_text or "")).strip()
-    if not normalized_text or len(normalized_text) > _PDF_DATASHEET_HEADER_MAX_CHARS:
-        return False
-    if _pdf_block_font_size(block) > _PDF_DATASHEET_HEADER_MAX_FONT_SIZE:
-        return False
-
-    rect = _pdf_block_rect(block)
-    if rect is None:
-        return False
-    _, y0, _, y1 = rect
-    page_height = float(page.get("page_height") or 0.0)
-    in_header_band = y0 <= 140.0 or (page_height > 0 and y1 >= page_height - 48.0)
-    if not in_header_band:
-        return False
-
-    identifiers = _PDF_DATASHEET_IDENTIFIER_RE.findall(normalized_text)
-    if len(identifiers) >= 2:
-        return True
-    if identifiers and _PDF_DATASHEET_HEADER_MARKER_RE.search(normalized_text):
-        return True
-    return bool(_PDF_DATASHEET_HEADER_MARKER_RE.search(normalized_text) and _pdf_literal_token_count(normalized_text) <= 6)
-
-
-def _is_pdf_layout_sensitive_literal(page: dict[str, object], block: dict[str, object], source_text: str) -> bool:
-    return _is_pdf_schematic_label(block, source_text) or _is_pdf_datasheet_header_identifier(page, block, source_text)
-
-
-def _should_preserve_pdf_table_cell(cell: dict[str, object], source_text: str) -> bool:
-    if int(cell.get("row_index") or 0) <= 1:
-        return False
-    return should_preserve_source_text(source_text)
-
-
-def _should_preserve_pdf_block_literal(page: dict[str, object], block: dict[str, object], source_text: str) -> bool:
-    if _is_pdf_layout_sensitive_literal(page, block, source_text):
-        return True
-    if _is_pdf_margin_block(page, block) or _has_pdf_literal_exclusion_text(source_text):
-        return False
-    if should_preserve_source_text(source_text) and _pdf_block_font_size(block) <= 8.0:
-        return True
-    return _pdf_block_font_size(block) <= 7.5 and _pdf_literal_token_count(source_text) <= 4 and len(source_text) <= 48
-
-
-def _build_pdf_literal_preservation_updates(preview: dict) -> list[dict[str, object]]:
-    updates: list[dict[str, object]] = []
-    for page in preview.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for block in page.get("blocks", []):
-            if not isinstance(block, dict):
-                continue
-
-            if block.get("type") == "table":
-                for cell in block.get("cells", []):
-                    if not isinstance(cell, dict):
-                        continue
-                    source_text = str(cell.get("src_text", ""))
-                    target_text = str(cell.get("tgt_text", ""))
-                    if not source_text.strip() or source_text == target_text or not _should_preserve_pdf_table_cell(cell, source_text):
-                        continue
-                    updates.append(
-                        {
-                            "cell_id": str(cell.get("cell_id", "")),
-                            "tgt_text": source_text,
-                            "font_size_final": float(cell.get("font_size_original") or cell.get("font_size_current") or 8.0),
-                            "layout_status": "ok",
-                            "preserve_source_literal": True,
-                        }
-                    )
-                continue
-
-            source_text = str(block.get("src_text", ""))
-            target_text = str(block.get("tgt_text", ""))
-            layout_sensitive = _is_pdf_layout_sensitive_literal(page, block, source_text)
-            if (
-                not source_text.strip()
-                or (_canonical_pdf_label_text(source_text) == _canonical_pdf_label_text(target_text) and not layout_sensitive)
-                or not _should_preserve_pdf_block_literal(page, block, source_text)
-            ):
-                continue
-            updates.append(
-                {
-                    "block_id": str(block.get("block_id", "")),
-                    "tgt_text": source_text,
-                    "font_size_final": float(block.get("font_size_original") or block.get("font_size_current") or 8.0),
-                    "layout_status": "ok",
-                    "preserve_source_literal": True,
-                }
-            )
-    return updates
-
-
-def _preserve_pdf_literals(
-    job: TranslationJob,
-    session: Session,
-    preview: dict,
-) -> dict:
-    updates = _build_pdf_literal_preservation_updates(preview)
-    if not updates:
-        return preview
-
-    update_job_state(
-        session,
-        job,
-        status=JobStatus.VALIDATING,
-        progress=max(job.progress, 94),
-        message="Preserving PDF literal values",
-        details={"preserved_blocks": len(updates)},
-    )
-    preserved_preview = update_preview(job, {"status": "validated", "payload": updates})
-    add_job_event(
-        session,
-        job,
-        "Preserved PDF literal values",
-        details={"preserved_blocks": len(updates)},
-    )
-    session.commit()
-    return preserved_preview
-
-
-def _needs_pdf_reflow_pass(job: TranslationJob) -> bool:
-    return normalize_language_code(job.target_language) == "th"
-
-
-def _reflow_pdf_preview_with_render_guards(
-    job: TranslationJob,
-    session: Session,
-    preview: dict,
-) -> dict:
-    updates = _build_pdf_preview_reflow_updates(preview)
-    if not updates:
-        return preview
-
-    update_job_state(
-        session,
-        job,
-        status=JobStatus.VALIDATING,
-        progress=max(job.progress, 96),
-        message="Applying Thai layout guards",
-        details={"reflow_blocks": len(updates), "target_language": job.target_language},
-    )
-    reflowed_preview = update_preview(job, {"status": "validated", "payload": updates})
-    add_job_event(
-        session,
-        job,
-        "Applied Thai layout guards",
-        details={"reflow_blocks": len(updates)},
-    )
-    session.commit()
-    return reflowed_preview
-
-
-def gatekeep_pdf_preview_translation(
-    job: TranslationJob,
-    session: Session,
-    runtime: RuntimeSettings,
-) -> dict | None:
-    update_job_state(
-        session,
-        job,
-        status=JobStatus.VALIDATING,
-        progress=max(job.progress, 93),
-        message="Validating translated PDF blocks",
-    )
-    preview = load_or_create_preview(job, force=True)
-    preview = _preserve_pdf_literals(job, session, preview)
-    preview = _repair_pdf_toc_entries(job, session, preview, runtime)
-    source_map = flatten_preview_text(preview, source=True)
-    translated_map = flatten_preview_text(preview, source=False)
-    validation = validate_translation_map(source_map, translated_map)
-    if validation.ok:
-        add_job_event(
-            session,
-            job,
-            "Verified PDF translation blocks",
-            details={"checked_blocks": len(source_map), "missing_blocks": 0, "untranslated_blocks": 0},
+            details={"restored_from": str(restored_from), "expected_bytes": input_file.size_bytes, "actual_bytes": actual_size},
         )
         session.commit()
-        if _needs_pdf_reflow_pass(job):
-            return _reflow_pdf_preview_with_render_guards(job, session, preview)
-        return preview
+        return input_path
 
-    failed_keys = (*validation.missing_keys, *validation.untranslated_keys)
-    update_job_state(
-        session,
-        job,
-        status=JobStatus.VALIDATING,
-        progress=max(job.progress, 95),
-        message="Repairing omitted or untranslated PDF blocks",
-        details={
-            "checked_blocks": len(source_map),
-            "missing_blocks": len(validation.missing_keys),
-            "untranslated_blocks": len(validation.untranslated_keys),
-        },
+    actual_text = "missing" if actual_size is None else f"{actual_size} bytes"
+    raise RuntimeError(
+        f"Input file is unavailable or incomplete: expected {input_file.size_bytes} bytes at {input_path}, found {actual_text}. "
+        "Please re-upload the source document."
     )
-    translator = OpenAICompatibleTranslator(runtime)
-    repairs, repair_failures = _repair_pdf_preview_translation_blocks(preview, failed_keys, translator, job)
-    if repair_failures:
-        add_job_event(
-            session,
-            job,
-            "PDF repair translation skipped blocks after model errors",
-            level="warning",
-            details={"failed_repairs": repair_failures[:20], "failed_repair_count": len(repair_failures)},
-        )
-        session.commit()
-    if not repairs:
-        add_job_event(
-            session,
-            job,
-            "PDF translation validation finished without repair updates",
-            level="warning",
-            details={
-                "missing_blocks": len(validation.missing_keys),
-                "untranslated_blocks": len(validation.untranslated_keys),
-                "failed_repair_count": len(repair_failures),
-            },
-        )
-        session.commit()
-        return preview
-
-    repaired_preview = update_preview(job, {"status": "validated", "payload": repairs})
-    repaired_validation = validate_translation_map(
-        flatten_preview_text(repaired_preview, source=True),
-        flatten_preview_text(repaired_preview, source=False),
-    )
-    if not repaired_validation.ok:
-        add_job_event(
-            session,
-            job,
-            "PDF translation validation finished with residual untranslated blocks",
-            level="warning",
-            details={
-                "missing_blocks": len(repaired_validation.missing_keys),
-                "untranslated_blocks": len(repaired_validation.untranslated_keys),
-            },
-        )
-        session.commit()
-        if _needs_pdf_reflow_pass(job):
-            repaired_preview = _reflow_pdf_preview_with_render_guards(job, session, repaired_preview)
-        return repaired_preview
-    add_job_event(
-        session,
-        job,
-        "Repaired PDF translation blocks",
-        details={"repaired_blocks": len(repairs), "checked_blocks": len(source_map)},
-    )
-    session.commit()
-    if _needs_pdf_reflow_pass(job):
-        repaired_preview = _reflow_pdf_preview_with_render_guards(job, session, repaired_preview)
-    return repaired_preview
 
 
 def translate_pdf(
@@ -1618,14 +825,16 @@ def translate_pdf(
 
     with tempfile.TemporaryDirectory(prefix="babeldoc-") as temp_dir:
         temp_root = Path(temp_dir)
-        prepared_input_path = temp_root / Path(input_path).name
+        source_input_path = temp_root / f"source{Path(input_path).suffix.lower()}"
+        prepared_input_path = temp_root / f"prepared{Path(input_path).suffix.lower()}"
         output_dir = temp_root / "output"
         working_dir = temp_root / "working"
         output_dir.mkdir(parents=True, exist_ok=True)
         working_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(input_path, source_input_path)
 
-        page_count, used_ocr = _prepare_pdf_for_babeldoc(input_path, prepared_input_path, runtime)
-        babeldoc_input_path = prepared_input_path if used_ocr else Path(input_path)
+        page_count, used_ocr = _prepare_pdf_for_babeldoc(str(source_input_path), prepared_input_path, runtime)
+        babeldoc_input_path = prepared_input_path if used_ocr else source_input_path
         # OCR workaround paints over original content before re-typesetting it.
         # Use it for OCR-prepared PDFs and white-background native PDFs where
         # BabelDOC may otherwise leave the original text visible under the translation.
@@ -1643,11 +852,11 @@ def translate_pdf(
             details={
                 "ocr_workaround": use_ocr_workaround,
                 "ocr_prepared": used_ocr,
-                "pdf_mode": "babeldoc_cli",
+                "pdf_mode": "babeldoc_library_hooks",
                 "enhance_compatibility": False,
             },
         )
-        mono_output = _translate_prepared_pdf_with_babeldoc_cli(
+        babeldoc_result = _translate_prepared_pdf_with_babeldoc_hooks(
             babeldoc_input_path,
             output_dir,
             working_dir,
@@ -1660,7 +869,16 @@ def translate_pdf(
         )
 
         update_job_state(session, job, status=JobStatus.REBUILDING, progress=92, message="Saving translated PDF")
-        shutil.move(str(mono_output), output_path)
+        shutil.move(str(babeldoc_result.mono_output), output_path)
+        if babeldoc_result.hook_sidecar and babeldoc_result.hook_sidecar.exists():
+            sidecar_output_path = babeldoc_ir_sidecar_path(output_path)
+            shutil.copyfile(babeldoc_result.hook_sidecar, sidecar_output_path)
+            add_job_event(
+                session,
+                job,
+                "Recorded BabelDOC internal hook IR",
+                details={"sidecar": str(sidecar_output_path)},
+            )
 
     output_document = fitz.open(output_path)
     try:
@@ -1698,7 +916,7 @@ def run_translation_job(job_id: str) -> None:
         ensure_not_cancelled(session, job)
 
         input_file = job.input_file
-        input_path = input_file.storage_path
+        input_path = str(_ensure_input_file_available(session, job))
         extension = Path(input_file.original_name).suffix.lower()
         output_path = build_output_target(runtime, input_file.original_name, extension)
         page_count: int | None
@@ -1731,10 +949,7 @@ def run_translation_job(job_id: str) -> None:
         job.page_count = page_count
         preview_details: dict | None = None
         try:
-            if extension == ".pdf":
-                preview = gatekeep_pdf_preview_translation(job, session, runtime)
-            else:
-                preview = load_or_create_preview(job, force=True)
+            preview = load_or_create_preview(job, force=True)
             preview_details = {"preview_pages": len(preview["pages"])}
         except Exception as exc:
             if extension == ".pdf":
