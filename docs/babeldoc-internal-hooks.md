@@ -31,6 +31,7 @@ PDF 翻译入口从 CLI 子进程改为 `doc_translator.babeldoc_runner.translat
 ```
 
 sidecar 记录 schema、角色计数、命中的 paragraph、分组、hook 阶段事件和实际应用过的策略。
+其中 `axis_diagnostics` 专门记录疑似图表轴标签：`paragraph_candidates` 来自 paragraph/role 阶段，`character_groups` 来自 PDF 创建阶段的最终 `render_units` 替换阶段，并附带轴标签的标准化英文文本与最终译文，用来判断异常发生在 BabelDOC IR、字符分组，还是最终渲染。
 
 ## 高置信 Role
 
@@ -116,7 +117,7 @@ BabelDOC 有时会把视觉上的多行脚注、页眉或变更记录合成一�
 
 BabelDOC 默认会跳过 `vertical=True` paragraph；如果强行送进普通 paragraph 翻译，图表坐标轴常会被拆成单字符堆叠。当前 hook 对 BabelDOC vertical paragraph 和高窄多行块使用 `vertical_label/preserve`，优先避免破坏原图表。
 
-另一个问题发生在更晚的 render backend：某些 PDF 的旋转文字不是 paragraph，而是 `page.pdf_character`；它们会以窄高连续字形列出现，但 `vertical` 标记丢失。针对这类对象，hook 在 `PDFCreater.create_render_units_for_page` 前只按几何和字符序列恢复旋转标记：窄高、字符连续、非纯数字/符号、包含足够字母或单位。这里不使用固定轴标题词表。
+另一个问题发生在更晚的 render backend：某些 PDF 的旋转文字进入最终 `render_units` 后会变成窄高连续字形列。针对这类对象，hook 在 `PDFCreater.create_render_units_for_page` 里按几何和完整轴标题形态识别候选，先把 CamelCase 原文标准化并单独翻译，再用 BabelDOC 的 typesetting 生成译文字符，最后把这些字符作为一个旋转文本 render unit 输出，避免每个字母被单独摆放。这里不使用固定轴标题词表。
 
 后续安全推进路径：
 

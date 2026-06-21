@@ -26,10 +26,16 @@ _NUMBERED_MARKER_RE = re.compile(r"(?:\(\d{1,3}\)|\d{1,3}[.)])\s*")
 _BABELDOC_STYLE_PLACEHOLDER_RE = re.compile(r"</?b\d+>", re.IGNORECASE)
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 _ACRONYM_BOUNDARY_RE = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_TRAILING_UNIT_PARENS_RE = re.compile(r"[\(（]([^()（）]+)[\)）]\s*$")
 _TECHNICAL_NUMBER_UNIT_RE = re.compile(
     r"(?<![A-Za-z0-9_])[-+±]?\d+(?:\.\d+)?\s*(?:MΩ|kΩ|Ω|µA|uA|mA|µV|uV|mV|V|°C|℃|dB|kHz|MHz|Hz|SPS|mW|W|pF|nF|µF|uF|%)\b"
 )
 _TECHNICAL_UNIT_RE = re.compile(r"(?<![A-Za-z])(?:MΩ|kΩ|Ω|µA|uA|mA|µV|uV|mV|V|°C|℃|dB|kHz|MHz|Hz|SPS|mW|W|pF|nF|µF|uF|%)(?![A-Za-z])")
+_AXIS_LABEL_TEXT_RE = re.compile(
+    r"^[A-Za-z][A-Za-z\s/+&-]{1,70}\s*"
+    r"\((?:MΩ|kΩ|Ω|µA|uA|mA|µV|uV|mV|V|°C|℃|dB|kHz|MHz|Hz|SPS|mW|W|pF|nF|µF|uF|LSB|ppm|FSR|%)"
+    r"(?:\s+of\s+FSR)?\)$"
+)
 _TECHNICAL_IDENTIFIER_RE = re.compile(
     r"\b(?:VDD|VSS|VCC|VREF|VIN|VOUT|VIH|VIL|VOH|VOL|GND|IOL|IOH|ISINK|IL|IH|TA|TJ|TS|TSTG|FCM|DR|PGA|ADC|I2C|SCL|SDA|ADDR|TTL|TI|DIV|FS|LM\d+|ADS\d+)\b",
     re.IGNORECASE,
@@ -60,6 +66,15 @@ _TECHNICAL_WORD_REPLACEMENTS = (
     (re.compile(r"电阻\s*B"), "RB"),
 )
 _SPACE_COLLAPSE_RE = re.compile(r"\s+")
+_CJK_AXIS_LABEL_FONT_SIZE = 8.0
+_VERTICAL_AXIS_LABEL_TOP_PADDING_RATIO = 0.22
+_VERTICAL_AXIS_LABEL_BOTTOM_PADDING_RATIO = 0.12
+_VERTICAL_AXIS_LABEL_CJK_ADVANCE_RATIO = 1.08
+_VERTICAL_AXIS_LABEL_LATIN_ADVANCE_RATIO = 0.74
+_VERTICAL_AXIS_LABEL_PUNCT_ADVANCE_RATIO = 0.58
+_VERTICAL_AXIS_LABEL_SPACE_ADVANCE_RATIO = 0.42
+_VERTICAL_AXIS_LABEL_INTER_CHAR_GAP_RATIO = 0.08
+_VERTICAL_AXIS_LABEL_CROSS_PADDING = 0.35
 _TECHNICAL_UPPER_TOKENS = frozenset(
     {
         "ADC",
@@ -149,10 +164,14 @@ class BabeldocHookContext:
     groups: dict[str, list[str]] = field(default_factory=dict)
     phase_events: list[dict[str, Any]] = field(default_factory=list)
     applied_events: list[dict[str, Any]] = field(default_factory=list)
+    axis_diagnostics: dict[str, list[dict[str, Any]]] = field(
+        default_factory=lambda: {"paragraph_candidates": [], "character_groups": []}
+    )
     _translations: dict[str, _TranslationSnapshot] = field(default_factory=dict)
     _source_layouts: dict[str, _TranslationSnapshot] = field(default_factory=dict)
     _protected_tokens: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     _toc_prefix_width_by_id: dict[str, int] = field(default_factory=dict)
+    _axis_label_translation_cache: dict[str, str] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reconciled: bool = False
 
@@ -187,6 +206,7 @@ class BabeldocHookContext:
                 _mark(record, "preserved_token", "preserve", 0.97, ("short stable token",))
 
         self._capture_source_layouts(records)
+        self.axis_diagnostics["paragraph_candidates"] = _axis_paragraph_diagnostics(records)
         self._build_toc_alignment(records)
         self._classify_repeated_edge_text(records)
         self.note_phase(
@@ -459,42 +479,111 @@ class BabeldocHookContext:
                 }
             )
 
-    def restore_page_level_axis_rotation(self, page: Any) -> None:
-        groups = _page_level_axis_label_groups(getattr(page, "pdf_character", []) or [])
+    def replace_axis_label_render_units(
+        self,
+        page: Any,
+        render_units: list[Any],
+        translation_config: Any,
+    ) -> list[Any]:
+        from babeldoc.format.pdf.document_il import il_version_1
+        from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting
+
+        chars = [getattr(unit, "char", None) for unit in render_units if getattr(unit, "char", None) is not None]
+        groups = _page_level_axis_label_groups(chars)
         if not groups:
-            return
+            return render_units
 
-        restored = 0
-        samples = []
+        raw_page_number = getattr(page, "page_number", None)
+        page_number = raw_page_number + 1 if isinstance(raw_page_number, int) else raw_page_number
+        typesetter = Typesetting(translation_config)
+        fonts = _build_typesetting_fonts(page, typesetter)
+
+        source_char_ids: set[int] = set()
+        translated_char_ids: set[int] = set()
+        replacement_units = []
+        diagnostics = []
         for group in groups:
-            changed = 0
-            for char in group:
-                if bool(getattr(char, "vertical", False)):
-                    continue
-                char.vertical = True
-                changed += 1
-            if not changed:
+            source_text = _axis_label_translation_source(_char_group_text(group))
+            source_rect = _char_group_rect(group)
+            if source_text is None or source_rect is None:
                 continue
-            restored += changed
-            if len(samples) < 8:
-                samples.append(
-                    {
-                        "text": _char_group_text(group)[:80],
-                        "rect": _char_group_rect(group),
-                        "characters": len(group),
-                    }
-                )
-
-        if restored:
-            raw_page_number = getattr(page, "page_number", None)
-            self.applied_events.append(
+            source_font_size = _group_font_size(group)
+            translated_text = self._translate_axis_label_text(source_text, translation_config)
+            paragraph = _build_synthetic_axis_label_paragraph(il_version_1, group, translated_text, source_rect)
+            if paragraph is None:
+                continue
+            typesetter.render_paragraph(paragraph, page, fonts)
+            translated_chars = _paragraph_pdf_chars(paragraph)
+            if not translated_chars:
+                continue
+            unit = _AxisLabelRenderUnit.from_group(
+                translated_chars,
+                anchor_rect=source_rect,
+                sort_mode="x",
+                preferred_font_size=source_font_size,
+            )
+            if unit is None:
+                continue
+            source_char_ids.update(id(char) for char in group)
+            translated_char_ids.update(id(char) for char in translated_chars)
+            replacement_units.append(unit)
+            diagnostics.append(
                 {
-                    "action": "restore_page_axis_rotation",
-                    "page_number": raw_page_number + 1 if isinstance(raw_page_number, int) else raw_page_number,
-                    "characters": restored,
-                    "samples": samples,
+                    "page_number": page_number,
+                    "text": source_text,
+                    "translated_text": translated_text,
+                    "rect": source_rect,
+                    "characters": len(translated_chars),
+                    "replacement": "translated_axis_label_rotated_text",
                 }
             )
+
+        if not replacement_units:
+            return render_units
+
+        replaced_units = [
+            unit
+            for unit in render_units
+            if id(getattr(unit, "char", None)) not in source_char_ids
+            and id(getattr(unit, "char", None)) not in translated_char_ids
+        ]
+        replaced_units.extend(replacement_units)
+
+        self.axis_diagnostics["character_groups"].extend(diagnostics[:24])
+        samples = [
+            {
+                "text": entry["text"][:80],
+                "translated_text": entry["translated_text"][:80],
+                "rect": entry["rect"],
+                "characters": entry["characters"],
+            }
+            for entry in diagnostics[:8]
+        ]
+        self.applied_events.append(
+            {
+                "action": "replace_page_axis_label_render_units",
+                "page_number": page_number,
+                "groups": len(replacement_units),
+                "characters": sum(entry["characters"] for entry in diagnostics),
+                "samples": samples,
+            }
+        )
+        return replaced_units
+
+    def _translate_axis_label_text(self, source_text: str, translation_config: Any) -> str:
+        with self._lock:
+            cached = self._axis_label_translation_cache.get(source_text)
+        if cached is not None:
+            return cached
+        translated = translation_config.translator.translate(source_text, ignore_cache=False)
+        translated = _restore_common_technical_translations(source_text, translated)
+        translated = _restore_axis_label_unit(source_text, translated)
+        translated = _SPACE_COLLAPSE_RE.sub(" ", str(translated or "")).strip()
+        if not translated:
+            translated = source_text
+        with self._lock:
+            self._axis_label_translation_cache[source_text] = translated
+        return translated
 
     def reconcile_translation(self) -> None:
         if self._reconciled:
@@ -544,6 +633,7 @@ class BabeldocHookContext:
             "roles": roles,
             "groups": self.groups,
             "diagnostic_samples": self._diagnostic_samples(),
+            "axis_diagnostics": self.axis_diagnostics,
             "phase_events": self.phase_events,
             "applied_events": self.applied_events,
         }
@@ -567,6 +657,30 @@ class BabeldocHookContext:
             )
             if len(samples) >= 80:
                 break
+        if len(samples) < 80:
+            for record in self.records_by_id.values():
+                if record in samples:
+                    continue
+                if record.rect is None:
+                    continue
+                x1, y1, x2, y2 = record.rect
+                width = x2 - x1
+                height = y2 - y1
+                if width > 24 or height < max(width * 2.5, 18):
+                    continue
+                samples.append(
+                    {
+                        "paragraph_id": record.paragraph_id,
+                        "page_number": record.page_number,
+                        "role": record.role,
+                        "policy": record.policy,
+                        "text": record.text,
+                        "rect": record.rect,
+                        "diagnostic_reason": "high_narrow_paragraph",
+                    }
+                )
+                if len(samples) >= 80:
+                    break
         return samples
 
     def _capture_source_layouts(self, records: list[_ParagraphRecord]) -> None:
@@ -847,6 +961,401 @@ def _merge_paragraphs(left: Any, right: Any) -> None:
     left.optimal_scale = None
 
 
+class _AxisLabelRenderUnit:
+    def __init__(
+        self,
+        chars: list[Any],
+        render_order: int,
+        sub_render_order: int,
+        xobj_id: str | None,
+        anchor_rect: tuple[float, float, float, float] | None = None,
+        preferred_font_size: float | None = None,
+    ) -> None:
+        self.chars = chars
+        self.render_order = render_order
+        self.sub_render_order = sub_render_order
+        self.xobj_id = xobj_id
+        self.anchor_rect = anchor_rect
+        self.preferred_font_size = preferred_font_size
+
+    @classmethod
+    def from_group(
+        cls,
+        group: list[Any],
+        *,
+        anchor_rect: tuple[float, float, float, float] | None = None,
+        sort_mode: str = "y",
+        preferred_font_size: float | None = None,
+    ) -> "_AxisLabelRenderUnit | None":
+        if not _can_render_axis_label_as_group(group):
+            return None
+        chars = _sorted_axis_chars(group, sort_mode=sort_mode)
+        render_order = min(getattr(char, "render_order", 100) or 100 for char in chars)
+        sub_render_order = min(getattr(char, "sub_render_order", 0) or 0 for char in chars)
+        return cls(
+            chars,
+            render_order,
+            sub_render_order,
+            getattr(chars[0], "xobj_id", None),
+            anchor_rect=anchor_rect,
+            preferred_font_size=preferred_font_size,
+        )
+
+    def get_sort_key(self) -> tuple[int, int]:
+        return self.render_order, self.sub_render_order
+
+    def render(self, draw_op: Any, context: Any) -> None:
+        first = self.chars[0]
+        anchor_rect = self.anchor_rect or _char_group_rect(self.chars)
+        text_rect = _char_group_rect(self.chars)
+        current_font_size = _group_font_size(self.chars)
+        target_font_size = self.preferred_font_size or current_font_size or first.pdf_style.font_size
+        if _group_contains_cjk(self.chars):
+            target_font_size = _CJK_AXIS_LABEL_FONT_SIZE
+        final_scale = 1.0
+        if anchor_rect is None:
+            anchor_x = first.box.x2
+            anchor_y = first.box.y
+        else:
+            anchor_width = max(anchor_rect[2] - anchor_rect[0], 1.0)
+            anchor_height = max(anchor_rect[3] - anchor_rect[1], 1.0)
+            anchor_y = anchor_rect[1]
+            cross_padding = min(_VERTICAL_AXIS_LABEL_CROSS_PADDING, anchor_width * 0.18)
+            max_cross_font_size = max(anchor_width - (cross_padding * 2.0), 0.1)
+            target_font_size = min(target_font_size, max_cross_font_size)
+            anchor_x = anchor_rect[0] + cross_padding + target_font_size
+        draw_op.append(b"q ")
+        context.pdf_creator.render_graphic_state(draw_op, first.pdf_style.graphic_state)
+        if anchor_rect is not None and text_rect is not None:
+            anchor_height = max(anchor_rect[3] - anchor_rect[1], 1.0)
+            font_ratio = 1.0
+            if current_font_size is not None and current_font_size > 0:
+                font_ratio = target_font_size / current_font_size
+            final_scale = font_ratio
+            top_padding = target_font_size * _VERTICAL_AXIS_LABEL_TOP_PADDING_RATIO
+            bottom_padding = target_font_size * _VERTICAL_AXIS_LABEL_BOTTOM_PADDING_RATIO
+            usable_start = anchor_rect[1] + top_padding
+            usable_end = anchor_rect[3] - bottom_padding
+            positioned_chars: list[tuple[Any, float, float]] = []
+            baseline_offset = 0.0
+            for index, char in enumerate(self.chars):
+                font_size = max(char.pdf_style.font_size * final_scale, 0.1)
+                positioned_chars.append((char, font_size, baseline_offset))
+                advance = _vertical_axis_label_advance(char, font_size)
+                if index < len(self.chars) - 1:
+                    advance += font_size * _VERTICAL_AXIS_LABEL_INTER_CHAR_GAP_RATIO
+                baseline_offset += advance
+            rendered_height = baseline_offset if positioned_chars else 0.0
+            available_height = max(usable_end - usable_start, 1.0)
+            anchor_y = anchor_rect[1] + max(anchor_height - rendered_height, 0.0) / 2.0
+            if rendered_height <= available_height:
+                anchor_y = usable_start + max(available_height - rendered_height, 0.0) / 2.0
+            for char, font_size, char_offset in positioned_chars:
+                font_id = char.pdf_style.font_id
+                encoding_length = self._encoding_length(context, font_id)
+                if encoding_length is None:
+                    continue
+                baseline_y = anchor_y + char_offset
+                draw_op.append(f"BT 0 1 -1 0 {anchor_x:f} {baseline_y:f} Tm ".encode())
+                draw_op.append(f"/{font_id} {font_size:f} Tf ".encode())
+                draw_op.append(f"<{char.pdf_character_id:0{encoding_length * 2}x}>".upper().encode())
+                draw_op.append(b" Tj ET ")
+            draw_op.append(b"Q \n")
+            return
+
+        draw_op.append(b"BT ")
+        draw_op.append(f"0 1 -1 0 {anchor_x:f} {anchor_y:f} Tm ".encode())
+        previous_font = None
+        for char in self.chars:
+            font_id = char.pdf_style.font_id
+            font_size = target_font_size
+            encoding_length = self._encoding_length(context, font_id)
+            if encoding_length is None:
+                continue
+            if font_id != previous_font:
+                draw_op.append(f"/{font_id} {font_size:f} Tf ".encode())
+                previous_font = font_id
+            draw_op.append(f"<{char.pdf_character_id:0{encoding_length * 2}x}>".upper().encode())
+            draw_op.append(b" Tj ")
+        draw_op.append(b"ET Q \n")
+
+    def _encoding_length(self, context: Any, font_id: str | None) -> int | None:
+        if self.xobj_id in context.xobj_encoding_length_map:
+            encoding_length = context.xobj_encoding_length_map[self.xobj_id].get(font_id)
+        else:
+            encoding_length = context.page_encoding_length_map.get(font_id)
+        if encoding_length is None:
+            encoding_length = context.all_encoding_length_map.get(font_id)
+        return encoding_length
+
+
+def _can_render_axis_label_as_group(group: list[Any]) -> bool:
+    chars = _sorted_axis_chars(group)
+    if not chars:
+        return False
+    first = chars[0]
+    xobj_id = getattr(first, "xobj_id", None)
+    for char in chars:
+        style = getattr(char, "pdf_style", None)
+        if getattr(style, "font_id", None) is None or getattr(style, "font_size", None) is None:
+            return False
+        if getattr(char, "xobj_id", None) != xobj_id:
+            return False
+        if getattr(char, "pdf_character_id", None) is None:
+            return False
+    return True
+
+
+def _group_font_size(group: list[Any]) -> float | None:
+    sizes = []
+    for char in group:
+        style = getattr(char, "pdf_style", None)
+        size = getattr(style, "font_size", None)
+        if isinstance(size, (int, float)) and math.isfinite(size) and size > 0:
+            sizes.append(float(size))
+    if not sizes:
+        return None
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
+def _group_contains_cjk(group: list[Any]) -> bool:
+    for char in group:
+        text = str(getattr(char, "char_unicode", "") or "")
+        if any("\u4e00" <= symbol <= "\u9fff" for symbol in text):
+            return True
+    return False
+
+
+def _vertical_axis_label_advance(char: Any, font_size: float) -> float:
+    text = str(getattr(char, "char_unicode", "") or "")
+    if not text:
+        return font_size * _VERTICAL_AXIS_LABEL_PUNCT_ADVANCE_RATIO
+    if text.isspace():
+        return font_size * _VERTICAL_AXIS_LABEL_SPACE_ADVANCE_RATIO
+    if any("\u4e00" <= symbol <= "\u9fff" for symbol in text):
+        return font_size * _VERTICAL_AXIS_LABEL_CJK_ADVANCE_RATIO
+    if text.isascii() and any(symbol.isalnum() for symbol in text):
+        return font_size * _VERTICAL_AXIS_LABEL_LATIN_ADVANCE_RATIO
+    return font_size * _VERTICAL_AXIS_LABEL_PUNCT_ADVANCE_RATIO
+
+
+def _sorted_axis_chars(group: list[Any], *, sort_mode: str = "y") -> list[Any]:
+    items = []
+    for char in group:
+        rect = _box_rect(getattr(char, "box", None))
+        if rect is None:
+            continue
+        items.append((rect, char))
+    if sort_mode == "x":
+        ordered = sorted(items, key=lambda item: (item[0][0], item[0][1]))
+    else:
+        ordered = sorted(items, key=lambda item: (item[0][1], item[0][0]))
+    return [char for _rect, char in ordered]
+
+
+def _axis_label_translation_source(text: str) -> str | None:
+    for normalized in _axis_label_text_variants(text):
+        unit_match = re.fullmatch(r"(?P<body>[A-Za-z][A-Za-z]+(?:[A-Za-z]+)?)\((?P<unit>[^()]+)\)", normalized)
+        if unit_match is not None:
+            expanded_body = _ACRONYM_BOUNDARY_RE.sub(" ", _CAMEL_BOUNDARY_RE.sub(" ", unit_match.group("body")))
+            expanded_body = _SPACE_COLLAPSE_RE.sub(" ", expanded_body).strip()
+            expanded = f"{expanded_body} ({unit_match.group('unit')})"
+            if _AXIS_LABEL_TEXT_RE.fullmatch(expanded):
+                return expanded
+        plain = _normalize_plain_axis_label_text(normalized)
+        if plain is not None:
+            return plain
+    return None
+
+
+def _axis_label_text_variants(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not normalized:
+        return ()
+    reversed_text = normalized[::-1].strip()
+    if reversed_text and reversed_text != normalized:
+        return (normalized, reversed_text)
+    return (normalized,)
+
+
+def _normalize_plain_axis_label_text(text: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not normalized:
+        return None
+    normalized = re.sub(r"(?<=[A-Za-z])[^\w\s'-]+(?=[A-Za-z])", " ", normalized)
+    normalized = re.sub(r"(?<=[A-Za-z])(of|and|vs|per|from|to|in)(?=[A-Z])", r" \1 ", normalized)
+    normalized = _ACRONYM_BOUNDARY_RE.sub(" ", _CAMEL_BOUNDARY_RE.sub(" ", normalized))
+    normalized = _SPACE_COLLAPSE_RE.sub(" ", normalized)
+    if not 8 <= len(normalized) <= 48:
+        return None
+    words = normalized.split(" ")
+    if not 2 <= len(words) <= 4:
+        return None
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z'-]*", word) for word in words):
+        return None
+    if any(len(word) == 1 for word in words):
+        return None
+    if not any(len(word) >= 5 for word in words):
+        return None
+    letters = sum(1 for char in normalized if char.isalpha())
+    if letters < 8:
+        return None
+    return normalized
+
+
+def _restore_axis_label_unit(source_text: str, translated_text: str) -> str:
+    source_match = _TRAILING_UNIT_PARENS_RE.search(str(source_text or "").strip())
+    if source_match is None:
+        return translated_text
+    source_unit = source_match.group(1).strip()
+    translated = str(translated_text or "").strip()
+    if not translated:
+        return f"({source_unit})"
+    translated_match = _TRAILING_UNIT_PARENS_RE.search(translated)
+    if translated_match is not None:
+        prefix = translated[: translated_match.start()].rstrip()
+        return f"{prefix} ({source_unit})".strip()
+    return f"{translated} ({source_unit})".strip()
+
+
+def _build_synthetic_axis_label_paragraph(
+    il_version_1: Any,
+    group: list[Any],
+    source_text: str,
+    source_rect: tuple[float, float, float, float],
+) -> Any:
+    if not group:
+        return None
+    first = group[0]
+    style = copy.deepcopy(getattr(first, "pdf_style", None))
+    if style is None or getattr(style, "font_id", None) is None or getattr(style, "font_size", None) is None:
+        return None
+    x1, y1, x2, y2 = source_rect
+    label_height = max(x2 - x1, style.font_size * 1.8, 12.0)
+    label_width = max(y2 - y1, style.font_size * max(len(source_text) * 0.8, 8.0))
+    box = il_version_1.Box(
+        x=x1,
+        y=y1,
+        x2=x1 + label_width,
+        y2=y1 + label_height,
+    )
+    render_order = min(getattr(char, "render_order", 100) or 100 for char in group)
+    return il_version_1.PdfParagraph(
+        first_line_indent=False,
+        box=box,
+        vertical=False,
+        pdf_style=style,
+        unicode=source_text,
+        pdf_paragraph_composition=[
+            il_version_1.PdfParagraphComposition(
+                pdf_same_style_unicode_characters=il_version_1.PdfSameStyleUnicodeCharacters(
+                    unicode=source_text,
+                    pdf_style=style,
+                ),
+            ),
+        ],
+        xobj_id=getattr(first, "xobj_id", None),
+        debug_id=f"synthetic-axis-{hashlib.sha1(source_text.encode('utf-8')).hexdigest()[:10]}",
+        layout_label="axis_label",
+        render_order=render_order,
+    )
+
+
+def _build_typesetting_fonts(page: Any, typesetter: Any) -> dict[str | int, Any]:
+    fonts: dict[str | int, Any] = {f.font_id: f for f in getattr(page, "pdf_font", []) or [] if getattr(f, "font_id", None)}
+    page_fonts = fonts.copy()
+    for font_id, font in typesetter.font_mapper.fontid2font.items():
+        fonts[font_id] = font
+    for xobj in getattr(page, "pdf_xobject", []) or []:
+        xobj_id = getattr(xobj, "xobj_id", None)
+        if xobj_id is None:
+            continue
+        fonts[xobj_id] = page_fonts.copy()
+        for font in getattr(xobj, "pdf_font", []) or []:
+            if getattr(font, "font_id", None):
+                fonts[xobj_id][font.font_id] = font
+    return fonts
+
+
+def _paragraph_pdf_chars(paragraph: Any) -> list[Any]:
+    chars = []
+    for composition in getattr(paragraph, "pdf_paragraph_composition", []) or []:
+        char = getattr(composition, "pdf_character", None)
+        if char is not None:
+            chars.append(char)
+        formula = getattr(composition, "pdf_formula", None)
+        if formula is not None:
+            chars.extend(getattr(formula, "pdf_character", []) or [])
+    return chars
+
+
+def _axis_paragraph_diagnostics(records: list[_ParagraphRecord]) -> list[dict[str, Any]]:
+    diagnostics = []
+    for record in records:
+        reasons = _axis_paragraph_reasons(record)
+        if not reasons:
+            continue
+        width = None
+        height = None
+        if record.rect is not None:
+            x1, y1, x2, y2 = record.rect
+            width = round(x2 - x1, 3)
+            height = round(y2 - y1, 3)
+        diagnostics.append(
+            {
+                "paragraph_id": record.paragraph_id,
+                "page_number": record.page_number,
+                "paragraph_index": record.paragraph_index,
+                "role": record.role,
+                "policy": record.policy,
+                "vertical": record.vertical,
+                "layout_label": record.layout_label,
+                "text": record.text,
+                "rect": record.rect,
+                "width": width,
+                "height": height,
+                "line_count": len([line for line in record.text.splitlines() if line.strip()]),
+                "reasons": reasons,
+            }
+        )
+        if len(diagnostics) >= 160:
+            break
+    return diagnostics
+
+
+def _axis_paragraph_reasons(record: _ParagraphRecord) -> list[str]:
+    reasons = []
+    if record.vertical:
+        reasons.append("babeldoc_vertical_flag")
+    if _looks_like_axis_label_fragment(record.text):
+        reasons.append("axis_label_fragment_text")
+    if _looks_like_vertical_axis_text(record.text):
+        reasons.append("vertical_axis_text")
+    if _looks_like_horizontal_axis_label(record.text):
+        reasons.append("horizontal_axis_label_text")
+    if record.rect is not None:
+        x1, y1, x2, y2 = record.rect
+        width = x2 - x1
+        height = y2 - y1
+        if height > max(width * 2.2, 20):
+            reasons.append("high_narrow_rect")
+        elif height > width * 1.3 and _looks_like_vertical_axis_text(record.text):
+            reasons.append("tall_multiline_axis_text")
+    return reasons
+
+
+def _looks_like_horizontal_axis_label(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not 3 <= len(normalized) <= 80:
+        return False
+    if "\n" in normalized:
+        return False
+    if not any(char.isalpha() for char in normalized):
+        return False
+    return _looks_like_axis_measurement_label(normalized)
+
+
 def _page_level_axis_label_groups(chars: list[Any]) -> list[list[Any]]:
     items: list[tuple[Any, tuple[float, float, float, float], str]] = []
     for char in chars:
@@ -912,14 +1421,55 @@ def _is_page_level_axis_label_segment(segment: list[tuple[Any, tuple[float, floa
     letters = sum(1 for char in visible_chars if char.isalpha())
     if letters < 4:
         return False
-    if _has_measurement_unit(stripped):
-        return True
-    return letters / max(len(visible_chars), 1) >= 0.45 and height / max(width, 1) >= 4
+    if _looks_like_tabular_vertical_column(segment):
+        return False
+    return _looks_like_axis_label_segment_text(stripped)
 
 
-def _has_measurement_unit(text: str) -> bool:
-    normalized = unicodedata.normalize("NFKC", text)
-    return bool(re.search(r"(?:mA|µA|uA|mV|µV|uV|dB|LSB|%)", normalized))
+def _looks_like_axis_measurement_label(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    normalized = _SPACE_COLLAPSE_RE.sub(" ", normalized)
+    return bool(_AXIS_LABEL_TEXT_RE.fullmatch(normalized))
+
+
+def _looks_like_tabular_vertical_column(segment: list[tuple[Any, tuple[float, float, float, float], str]]) -> bool:
+    row_sizes = []
+    current_y: float | None = None
+    current_count = 0
+    for _item, rect, _text in sorted(segment, key=lambda value: value[1][1]):
+        y1 = rect[1]
+        if current_y is None or abs(y1 - current_y) > 1.2:
+            if current_count:
+                row_sizes.append(current_count)
+            current_y = y1
+            current_count = 1
+            continue
+        current_count += 1
+    if current_count:
+        row_sizes.append(current_count)
+    duplicated_rows = [size for size in row_sizes if size > 1]
+    if not duplicated_rows:
+        return False
+    duplicated_chars = sum(duplicated_rows)
+    return duplicated_chars >= max(4, len(segment) // 3)
+
+
+def _looks_like_axis_label_segment_text(text: str) -> bool:
+    for normalized in _axis_label_text_variants(text):
+        compact = _SPACE_COLLAPSE_RE.sub("", normalized)
+        if _looks_like_axis_measurement_label(normalized):
+            return True
+        if _normalize_plain_axis_label_text(normalized) is not None:
+            return True
+        if not 4 <= len(compact) <= 80:
+            continue
+        if not any(char.isalpha() or "\u4e00" <= char <= "\u9fff" for char in compact):
+            continue
+        if re.search(r"(?:µA|uA|mA|µV|uV|mV|dB|LSB|%)", compact):
+            digits = sum(char.isdigit() for char in compact)
+            if digits <= max(3, len(compact) // 3):
+                return True
+    return False
 
 
 def _char_group_text(group: list[Any]) -> str:

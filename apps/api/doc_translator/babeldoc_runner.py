@@ -272,8 +272,8 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
 
     class HookedPDFCreater(originals["PDFCreater"]):
         def create_render_units_for_page(self, page: Any, translation_config: Any) -> Any:
-            hook_context.restore_page_level_axis_rotation(page)
-            return super().create_render_units_for_page(page, translation_config)
+            render_units = super().create_render_units_for_page(page, translation_config)
+            return hook_context.replace_axis_label_render_units(page, render_units, translation_config)
 
     globals_copy = dict(high_level.async_translate.__globals__)
     globals_copy.update(
