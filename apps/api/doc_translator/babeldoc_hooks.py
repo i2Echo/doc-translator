@@ -507,6 +507,7 @@ class BabeldocHookContext:
             source_rect = _char_group_rect(group)
             if source_text is None or source_rect is None:
                 continue
+            source_text = _restore_micro_unit_from_glyph_fonts(source_text, group)
             source_font_size = _group_font_size(group)
             translated_text = self._translate_axis_label_text(source_text, translation_config)
             paragraph = _build_synthetic_axis_label_paragraph(il_version_1, group, translated_text, source_rect)
@@ -530,6 +531,15 @@ class BabeldocHookContext:
             diagnostics.append(
                 {
                     "page_number": page_number,
+                    "raw_text": _char_group_text(group),
+                    "raw_chars": [
+                        {
+                            "unicode": str(getattr(char, "char_unicode", "") or ""),
+                            "pdf_character_id": getattr(char, "pdf_character_id", None),
+                            "font_id": getattr(getattr(char, "pdf_style", None), "font_id", None),
+                        }
+                        for char in _sorted_axis_chars(group)
+                    ],
                     "text": source_text,
                     "translated_text": translated_text,
                     "rect": source_rect,
@@ -1217,6 +1227,32 @@ def _restore_axis_label_unit(source_text: str, translated_text: str) -> str:
         prefix = translated[: translated_match.start()].rstrip()
         return f"{prefix} ({source_unit})".strip()
     return f"{translated} ({source_unit})".strip()
+
+
+def _restore_micro_unit_from_glyph_fonts(source_text: str, group: list[Any]) -> str:
+    match = re.fullmatch(r"(?P<body>.+?)\s*\((?P<unit>m[A-Z])\)\s*", str(source_text or "").strip())
+    if match is None:
+        return source_text
+    chars = _sorted_axis_chars(group)
+    if len(chars) < 4:
+        return source_text
+    open_paren, prefix_char, suffix_char, close_paren = chars[-4:]
+    raw_unit = "".join(str(getattr(char, "char_unicode", "") or "") for char in (open_paren, prefix_char, suffix_char, close_paren))
+    if raw_unit not in {f"({match.group('unit')})", f"（{match.group('unit')}）"}:
+        return source_text
+    prefix_font = getattr(getattr(prefix_char, "pdf_style", None), "font_id", None)
+    suffix_font = getattr(getattr(suffix_char, "pdf_style", None), "font_id", None)
+    open_font = getattr(getattr(open_paren, "pdf_style", None), "font_id", None)
+    close_font = getattr(getattr(close_paren, "pdf_style", None), "font_id", None)
+    if prefix_font in {None, suffix_font}:
+        return source_text
+    if prefix_font in {open_font, close_font}:
+        return source_text
+    corrected_unit = f"u{match.group('unit')[1:]}"
+    body = _SPACE_COLLAPSE_RE.sub(" ", match.group("body")).strip()
+    return f"{body} ({corrected_unit})"
+
+
 
 
 def _build_synthetic_axis_label_paragraph(
