@@ -1735,6 +1735,8 @@ def _is_compact_technical_label_record(record: _ParagraphRecord) -> bool:
     compact = _SPACE_COLLAPSE_RE.sub("", text)
     if len(compact) < 3 or len(compact) > 48:
         return False
+    if _looks_like_translatable_fallback_line_text(text):
+        return False
     x1, y1, x2, y2 = record.rect
     width = x2 - x1
     height = y2 - y1
@@ -1746,7 +1748,7 @@ def _is_compact_technical_label_record(record: _ParagraphRecord) -> bool:
         return True
     if re.search(r"[=()/±°^/_-]|[A-Z]\d|\d[A-Z]", text):
         return True
-    if record.xobj_id not in {None, 0} and any(char.isupper() for char in compact):
+    if record.xobj_id not in {None, 0} and any(char.isupper() for char in compact) and not re.search(r"[a-z]", text):
         word_count = len(text.split())
         if word_count <= 4:
             return True
@@ -4011,6 +4013,13 @@ def _looks_like_translated_prose_segment(text: str) -> bool:
     return " " in normalized and letter_count >= 2
 
 
+def _looks_like_translatable_fallback_line_text(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not normalized or not _SPACE_COLLAPSE_RE.search(normalized):
+        return False
+    return bool(re.search(r"[a-z]", normalized))
+
+
 def _looks_like_vertical_axis_text(text: str) -> bool:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) < 3:
@@ -4841,6 +4850,9 @@ def _detect_fallback_line_underscore_bands(records: list[_ParagraphRecord]) -> s
             for candidate in band_records:
                 if candidate.paragraph_id == record.paragraph_id or candidate.rect is None:
                     continue
+                candidate_text = unicodedata.normalize("NFKC", candidate.text).strip()
+                if _looks_like_translatable_fallback_line_text(candidate_text):
+                    continue
                 if _rects_share_fallback_line_band(base_rect, candidate.rect):
                     protected.add(candidate.paragraph_id)
     return protected
@@ -4852,6 +4864,8 @@ def _is_fallback_line_underscore_band_paragraph(paragraph_or_record: Any) -> boo
         return False
     text = unicodedata.normalize("NFKC", str(getattr(paragraph_or_record, "unicode", None) or getattr(paragraph_or_record, "text", "") or "")).strip()
     if not text:
+        return False
+    if _looks_like_translatable_fallback_line_text(text):
         return False
     if text == "_":
         return True
