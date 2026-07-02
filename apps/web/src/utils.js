@@ -40,6 +40,14 @@ export function formatDate(value) {
   }).format(new Date(value));
 }
 
+export function isJobExpired(job) {
+  return job?.status === "completed" && Boolean(job?.output_file?.deleted_at);
+}
+
+export function jobStatusKey(job) {
+  return isJobExpired(job) ? "expired" : String(job?.status || "").toLowerCase();
+}
+
 export function formatJobStatus(status, copy) {
   const label = String(status || "").toLowerCase();
   const map = {
@@ -52,6 +60,7 @@ export function formatJobStatus(status, copy) {
     rebuilding: copy("生成中", "Building"),
     validating: copy("校验中", "Validating"),
     completed: copy("已完成", "Completed"),
+    expired: copy("已过期", "Expired"),
     failed: copy("失败", "Failed"),
     cancelled: copy("已取消", "Cancelled"),
   };

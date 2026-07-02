@@ -7,13 +7,24 @@ import {
   copy,
   defaultUploadState,
   downloadJob,
+  downloadJobDebugArtifact,
   refreshAll,
   retryJob,
   selectJob,
   state,
   uploadJobs,
 } from "../store";
-import { fileKindLabel, formatBytes, formatDate, formatJobStatus, languageName, sourceLanguageOptions, targetLanguageOptions } from "../utils";
+import {
+  fileKindLabel,
+  formatBytes,
+  formatDate,
+  formatJobStatus,
+  isJobExpired,
+  jobStatusKey,
+  languageName,
+  sourceLanguageOptions,
+  targetLanguageOptions,
+} from "../utils";
 
 const router = useRouter();
 const uploadForm = reactive({
@@ -194,11 +205,11 @@ function openPreview(jobId) {
 }
 
 function canPreview(job) {
-  return job.status === "completed" && job.output_file;
+  return job.status === "completed" && job.output_file && !isJobExpired(job);
 }
 
 function canDownload(job) {
-  return job.status === "completed" && job.output_file;
+  return job.status === "completed" && job.output_file && !isJobExpired(job);
 }
 
 function canRetry(job) {
@@ -207,6 +218,10 @@ function canRetry(job) {
 
 function canCancel(job) {
   return activeJobStatuses.has(job.status);
+}
+
+function canDownloadDebugArtifacts(job) {
+  return job.status === "completed" && job.output_file && !isJobExpired(job);
 }
 
 onMounted(() => {
@@ -352,7 +367,7 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="job-card-side">
-              <span class="status-pill" :data-status="job.status">{{ formatJobStatus(job.status, copy) }}</span>
+              <span class="status-pill" :data-status="jobStatusKey(job)">{{ formatJobStatus(jobStatusKey(job), copy) }}</span>
 
               <div v-if="(job.progress || 0) < 100" class="progress-row job-progress-inline">
                 <div class="progress-track">
@@ -438,7 +453,7 @@ onBeforeUnmount(() => {
           <div class="compact-grid two-up">
             <div class="meta-card">
               <span>{{ copy("状态", "Status") }}</span>
-              <strong>{{ formatJobStatus(state.selectedJob.status, copy) }}</strong>
+              <strong>{{ formatJobStatus(jobStatusKey(state.selectedJob), copy) }}</strong>
               <small>{{ copy("总耗时", "Total") }} {{ selectedJobElapsedLabel }}</small>
             </div>
             <div class="meta-card">
@@ -453,6 +468,15 @@ onBeforeUnmount(() => {
               <span>{{ copy("输出文件", "Output file") }}</span>
               <strong :title="state.selectedJob.output_file?.original_name || ''">{{ state.selectedJob.output_file?.original_name || "—" }}</strong>
             </div>
+          </div>
+
+          <div v-if="canDownloadDebugArtifacts(state.selectedJob)" class="button-row">
+            <button class="ghost-button" type="button" @click="downloadJobDebugArtifact(state.selectedJob.id, 'structure-before')">
+              {{ copy("下载切分前 JSON", "Download pre-split JSON") }}
+            </button>
+            <button class="ghost-button" type="button" @click="downloadJobDebugArtifact(state.selectedJob.id, 'structure-after')">
+              {{ copy("下载切分后 JSON", "Download post-split JSON") }}
+            </button>
           </div>
 
           <div class="timeline">

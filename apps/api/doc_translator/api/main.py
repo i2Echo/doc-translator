@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from doc_translator.audit import record_audit
 from doc_translator.auth import authenticate_user, create_access_token, get_current_user, require_admin
+from doc_translator.babeldoc_hooks import babeldoc_structure_snapshot_path
 from doc_translator.bootstrap import bootstrap_defaults
 from doc_translator.core.config import get_settings
 from doc_translator.core.logging import configure_logging
@@ -132,6 +134,22 @@ def load_job_document(job: TranslationJob, document_kind: str) -> JobFile:
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Translated file has expired")
         return job.output_file
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+
+def load_job_debug_artifact_path(job: TranslationJob, artifact_kind: str):
+    if job.status != JobStatus.COMPLETED or job.output_file is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Debug artifacts are available after translation completes")
+    if job.output_file.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Debug artifacts are no longer available because the translated file expired")
+    if artifact_kind == "structure-before":
+        path = babeldoc_structure_snapshot_path(Path(job.output_file.storage_path), "before_translation")
+    elif artifact_kind == "structure-after":
+        path = babeldoc_structure_snapshot_path(Path(job.output_file.storage_path), "after_translation")
+    else:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Debug artifact not found")
+    if not path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Debug artifact not found")
+    return path
 
 
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
@@ -488,6 +506,22 @@ def read_job_document(
         media_type=job_file.content_type,
         filename=job_file.original_name,
         headers={"Content-Disposition": f'inline; filename="{job_file.original_name}"'},
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}/debug-artifacts/{artifact_kind}")
+def read_job_debug_artifact(
+    job_id: str,
+    artifact_kind: str,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    job = load_job_or_404(session, job_id, current_user)
+    artifact_path = load_job_debug_artifact_path(job, artifact_kind)
+    return FileResponse(
+        path=artifact_path,
+        media_type="application/json",
+        filename=artifact_path.name,
     )
 
 

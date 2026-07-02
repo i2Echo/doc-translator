@@ -20,7 +20,7 @@ from PIL import Image
 from sqlalchemy.orm import Session, selectinload
 
 from doc_translator.audit import record_audit
-from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path
+from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path, babeldoc_structure_snapshot_path
 from doc_translator.babeldoc_runner import BabeldocLibraryResult, translate_pdf_with_babeldoc_library
 from doc_translator.db import SessionLocal
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
@@ -878,6 +878,16 @@ def translate_pdf(
                 job,
                 "Recorded BabelDOC internal hook IR",
                 details={"sidecar": str(sidecar_output_path)},
+            )
+        if babeldoc_result.structure_before and babeldoc_result.structure_before.exists():
+            shutil.copyfile(
+                babeldoc_result.structure_before,
+                babeldoc_structure_snapshot_path(output_path, "before_translation"),
+            )
+        if babeldoc_result.structure_after and babeldoc_result.structure_after.exists():
+            shutil.copyfile(
+                babeldoc_result.structure_after,
+                babeldoc_structure_snapshot_path(output_path, "after_translation"),
             )
 
     output_document = fitz.open(output_path)

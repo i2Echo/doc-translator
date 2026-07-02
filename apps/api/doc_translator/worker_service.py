@@ -17,6 +17,7 @@ from doc_translator.core.config import get_settings
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health
 from doc_translator.models import JobEvent, JobFile, JobStatus, TranslationJob
+from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path, babeldoc_structure_snapshot_path
 from doc_translator.preview import preview_sidecar_path
 from doc_translator.queueing import TRANSLATION_QUEUE_KEY, get_redis_client
 from doc_translator.settings_service import get_runtime_settings
@@ -216,6 +217,9 @@ class WorkerRuntime:
                     Path(job_file.storage_path).unlink(missing_ok=True)
                     if job_file.kind.value == "output":
                         preview_sidecar_path(job_file.storage_path).unlink(missing_ok=True)
+                        babeldoc_ir_sidecar_path(Path(job_file.storage_path)).unlink(missing_ok=True)
+                        babeldoc_structure_snapshot_path(Path(job_file.storage_path), "before_translation").unlink(missing_ok=True)
+                        babeldoc_structure_snapshot_path(Path(job_file.storage_path), "after_translation").unlink(missing_ok=True)
                 finally:
                     job_file.deleted_at = datetime.now(timezone.utc)
                     record_audit(

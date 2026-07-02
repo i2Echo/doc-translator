@@ -1,5 +1,6 @@
 import { computed, reactive } from "vue";
 import { apiPath, apiRequest, contentDispositionFilename, triggerDownload } from "./api";
+import { isJobExpired } from "./utils";
 
 const TOKEN_STORAGE_KEY = "doc-translator.token";
 const UI_LANGUAGE_STORAGE_KEY = "doc-translator.ui-language";
@@ -539,6 +540,13 @@ export async function downloadJob(jobId) {
   triggerDownload(blob, filename);
 }
 
+export async function downloadJobDebugArtifact(jobId, artifactKind) {
+  const response = await authedRequest(`/jobs/${jobId}/debug-artifacts/${artifactKind}`, {}, { raw: true });
+  const blob = await response.blob();
+  const filename = contentDispositionFilename(response.headers.get("content-disposition"), `${artifactKind}-${jobId}.json`);
+  triggerDownload(blob, filename);
+}
+
 export async function saveSettings(payload) {
   state.pending.settings = true;
   state.messages.settings = "";
@@ -616,6 +624,9 @@ export async function loadPreview(jobId) {
   try {
     clearPreviewState();
     const job = await authedRequest(`/jobs/${jobId}`);
+    if (isJobExpired(job)) {
+      throw new Error(copy("译文文件已过期，无法查看预览。", "The translated file expired and can no longer be previewed."));
+    }
     if (!job.output_file || job.status !== "completed") {
       throw new Error(copy("翻译完成后才可预览。", "Preview is available after translation completes."));
     }

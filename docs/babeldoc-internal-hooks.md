@@ -100,18 +100,6 @@ BabelDOC 有时会把视觉上的多行脚注、页眉或变更记录合成一�
 3. typesetting 前把该 paragraph 拆成多个 paragraph，每个编号项独立排版。
 4. 不对普通正文、多行标题或未知结构强拆。
 
-## 同行碎片合并
-
-另一类重叠不是换行丢失，而是同一视觉行被 BabelDOC 上游切成多个 paragraph。例如一个普通句子可能被拆成 `All specific`、`ations ... note`、`d.` 三段；翻译后每段各自 typeset，就会出现源文残片和译文挤在同一行、甚至互相覆盖。
-
-当前 hook 在翻译前做通用合并：
-
-1. 只看相邻 paragraph，且两者必须位于同一 baseline、垂直重叠充分、水平间隙很小。
-2. 排除 TOC、竖排标签、重复页眉页脚和页面边缘对象。
-3. 文本必须像 prose 或断词边界，纯数字、页码和符号不合并。
-4. 合并后 union 原 box、拼接 composition，并重新建立 role。
-
-这一步不依赖具体 PDF 的词汇，只修复结构切分错误；普通段落仍保留 BabelDOC 的 rich text 翻译路径。
 
 ## 图表竖向文字
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 class BabeldocLibraryResult:
     mono_output: Path
     hook_sidecar: Path | None
+    structure_before: Path | None
+    structure_after: Path | None
 
 
 def translate_pdf_with_babeldoc_library(
@@ -126,9 +129,21 @@ def translate_pdf_with_babeldoc_library(
         except OSError:
             logger.exception("Failed to write BabelDOC hook sidecar")
             hook_sidecar = None
+        try:
+            structure_before = hook_context.write_structure_snapshot("before_translation")
+            structure_after = hook_context.write_structure_snapshot("after_translation")
+        except OSError:
+            logger.exception("Failed to write BabelDOC structure snapshots")
+            structure_before = None
+            structure_after = None
 
     mono_output = _mono_output_from_result(translate_result, output_dir, input_path.stem)
-    return BabeldocLibraryResult(mono_output=mono_output, hook_sidecar=hook_sidecar)
+    return BabeldocLibraryResult(
+        mono_output=mono_output,
+        hook_sidecar=hook_sidecar,
+        structure_before=structure_before,
+        structure_after=structure_after,
+    )
 
 
 async def _run_babeldoc_translation(
@@ -174,8 +189,16 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
     class HookedStylesAndFormulas(originals["StylesAndFormulas"]):
         def process(self, document: Any) -> Any:
             result = super().process(document)
+            hook_context.normalize_font_traits(document)
+            if hook_context.normalize_fragmented_paragraphs_before_translation(document):
+                hook_context.note_phase("normalize_fragmented_paragraphs_before_translation")
             hook_context.classify_document(document)
             if hook_context.merge_same_line_fragments_before_translation(document):
+                hook_context.classify_document(document)
+            if hook_context.remove_subsumed_same_line_duplicates_before_translation(document):
+                hook_context.classify_document(document)
+                hook_context.note_phase("remove_subsumed_same_line_duplicates_before_translation")
+            if hook_context.collapse_overlapping_same_baseline_fragments_before_translation(document):
                 hook_context.classify_document(document)
             return result
 
@@ -188,11 +211,10 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
                 tracker,
                 page_font_map,
                 xobj_font_map,
-                force_plain_text=hook_context.should_force_plain_text(paragraph),
             )
             if text is None:
                 return None, None
-            return hook_context.translation_text_override(paragraph, text), translate_input
+            return hook_context.translation_text_override(paragraph, text, translate_input), translate_input
 
         def _pre_translate_paragraph(
             self,
@@ -237,8 +259,10 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
                     paragraph.vertical = True
 
         def post_translate_paragraph(self, paragraph: Any, tracker: Any, translate_input: Any, translated_text: str) -> Any:
+            source_composition = copy.deepcopy(getattr(paragraph, "pdf_paragraph_composition", []) or [])
             translated_text = hook_context.translated_text_override(paragraph, translate_input, translated_text)
             result = super().post_translate_paragraph(paragraph, tracker, translate_input, translated_text)
+            hook_context.restore_definition_line_styles_after_translation(paragraph, translated_text, source_composition)
             hook_context.record_translation(paragraph)
             return result
 
@@ -267,6 +291,8 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
             hook_context.reconcile_translation()
             hook_context.split_numbered_lists_before_typesetting(document)
             hook_context.restore_source_layouts_before_typesetting(document)
+            hook_context.normalize_body_font_sizes_before_typesetting(document)
+            hook_context.capture_after_translation_snapshot(document)
             hook_context.note_phase("typesetting")
             return super().typesetting_document(document)
 

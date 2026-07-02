@@ -994,6 +994,11 @@ svg {
   background: rgba(35, 158, 101, 0.12);
 }
 
+.status-pill[data-status="expired"] {
+  color: #6f5a2f;
+  background: rgba(184, 151, 86, 0.18);
+}
+
 .status-pill[data-status="failed"],
 .status-pill[data-status="cancelled"] {
   color: var(--danger);
