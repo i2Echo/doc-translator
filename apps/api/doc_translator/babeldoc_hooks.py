@@ -24,7 +24,6 @@ _TRAILING_TOC_LOCATOR_RE = re.compile(r"(?:[.\u00b7\u2026]|\s)*\d{1,4}\s*$")
 _NUMBERED_LINE_START_RE = re.compile(r"^\s*(?:\(\d{1,3}\)|\d{1,3}[.)])\s+")
 _NUMBERED_MARKER_RE = re.compile(r"(?:\(\d{1,3}\)|\d{1,3}[.)])\s*")
 _BABELDOC_STYLE_PLACEHOLDER_RE = re.compile(r"</?b\d+>", re.IGNORECASE)
-_MARKETING_STATUS_LINE_RE = re.compile(r"^\s*(ACTIVE|LIFEBUY|NRND|PREVIEW|OBSOLETE)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _BABELDOC_INLINE_PLACEHOLDER_TOKEN = r"(?:\{[^{}\s]+\}|</?b\d+>)"
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{[^{}\s]+\}")
 _PROTECTED_TOKEN_PLACEHOLDER_RE = re.compile(r"\bDTX[A-F0-9]{10}Q\b", re.IGNORECASE)
@@ -72,7 +71,7 @@ _AXIS_LABEL_TEXT_RE = re.compile(
     r"(?:\s+of\s+FSR)?\)$"
 )
 _TECHNICAL_IDENTIFIER_RE = re.compile(
-    r"\b(?:VDD|VSS|VCC|VREF|VIN|VOUT|VIH|VIL|VOH|VOL|GND|IOL|IOH|ISINK|IL|IH|TA|TJ|TS|TSTG|FCM|DR|PGA|ADC|I2C|UART|SCL|SDA|ADDR|TTL|TI|DIV|FS|LSB|PPM|LM\d+|ADS\d+|MSP430F\d+)\b",
+    r"\b(?:VDD|VSS|VCC|VREF|VIN|VOUT|VIH|VIL|VOH|VOL|GND|IOL|IOH|ISINK|IL|IH|TA|TJ|TS|TSTG|FCM|DR|PGA|ADC|I2C|UART|SCL|SDA|ADDR|TTL|DIV|FS|LSB|PPM)\b",
     re.IGNORECASE,
 )
 _TECHNICAL_COMPOUND_IDENTIFIER_RE = re.compile(
@@ -131,13 +130,6 @@ _TECHNICAL_UPPER_TOKENS = frozenset(
         "VSS",
     }
 )
-_MARKETING_STATUS_TRANSLATIONS = {
-    "ACTIVE": "活跃",
-    "LIFEBUY": "终身购买",
-    "NRND": "不推荐新设计",
-    "PREVIEW": "预览",
-    "OBSOLETE": "过时",
-}
 _SANS_FONT_NAME_HINTS = (
     "arial",
     "helvetica",
@@ -240,7 +232,6 @@ class BabeldocHookContext:
     _protected_tokens: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     _toc_prefix_width_by_id: dict[str, int] = field(default_factory=dict)
     _axis_label_translation_cache: dict[str, str] = field(default_factory=dict)
-    _marketing_status_labels: dict[str, str] = field(default_factory=dict)
     _before_structure_snapshot: dict[str, Any] | None = None
     _after_structure_snapshot: dict[str, Any] | None = None
     _fallback_line_protected_bands: set[str] = field(default_factory=set)
@@ -339,11 +330,6 @@ class BabeldocHookContext:
             text = record.text
         elif record.text:
             text = _normalize_translation_input_text(paragraph, record.text, text, translate_input, self.applied_events, record)
-        marketing_status = _split_marketing_status_line(record.text or text)
-        if marketing_status is not None:
-            label, body = marketing_status
-            self._marketing_status_labels[record.paragraph_id] = label
-            text = body
         if record.role != "toc_entry":
             protected_text = self._protect_technical_tokens(record, text)
             return protected_text
@@ -375,9 +361,6 @@ class BabeldocHookContext:
             translated_text = self._restore_neighbor_protected_placeholders(record, translated_text)
             if _has_inline_numbered_markers(record.text):
                 translated_text = _strip_babeldoc_style_placeholders(translated_text)
-            marketing_label = self._marketing_status_labels.get(record.paragraph_id)
-            if marketing_label is not None:
-                translated_text = f"{marketing_label}：{translated_text.strip()}"
         restored_text = _restore_source_line_breaks(source_text, translated_text)
         if restored_text != translated_text and record is not None:
             self.applied_events.append(
@@ -1270,8 +1253,6 @@ class BabeldocHookContext:
             if source_rect is None:
                 continue
             if source_text is None:
-                source_text = self._infer_axis_label_source_from_context(page_number, group, source_rect)
-            if source_text is None:
                 continue
             if self._should_skip_page_level_axis_group(page_number, group, source_text):
                 continue
@@ -1347,32 +1328,6 @@ class BabeldocHookContext:
             }
         )
         return replaced_units
-
-    def _infer_axis_label_source_from_context(
-        self,
-        page_number: int | None,
-        group: list[Any],
-        source_rect: tuple[float, float, float, float],
-    ) -> str | None:
-        if page_number is None:
-            return None
-        raw_text = _compact_vertical_fragment_text(_char_group_text(group))
-        if not raw_text:
-            return None
-        if "%" not in raw_text:
-            return None
-        page_records = [
-            record
-            for record in self.records_by_id.values()
-            if record.page_number == page_number and record.rect is not None
-        ]
-        title_text = _nearest_chart_title_text(page_records, source_rect)
-        if title_text is None:
-            return None
-        title_upper = unicodedata.normalize("NFKC", title_text).upper()
-        if "GAIN ERROR" in title_upper:
-            return "Gain Error (%)"
-        return None
 
     def _translate_axis_label_text(self, source_text: str, translation_config: Any) -> str:
         with self._lock:
@@ -2386,40 +2341,6 @@ def _axis_label_translation_source(text: str) -> str | None:
     return None
 
 
-def _nearest_chart_title_text(
-    records: list[_ParagraphRecord],
-    source_rect: tuple[float, float, float, float],
-) -> str | None:
-    source_center_x = _rect_center_x(source_rect)
-    source_top = source_rect[3]
-    best_text: str | None = None
-    best_score: tuple[float, float, float] | None = None
-    for record in records:
-        rect = record.rect
-        if rect is None:
-            continue
-        text = unicodedata.normalize("NFKC", str(record.text or "")).strip()
-        if not text or not any(char.isalpha() for char in text):
-            continue
-        if record.vertical:
-            continue
-        gap = rect[1] - source_top
-        if gap < 12.0 or gap > 120.0:
-            continue
-        width = rect[2] - rect[0]
-        height = rect[3] - rect[1]
-        if width < 40.0 or height > 18.0:
-            continue
-        if rect[0] < source_rect[0] + 20.0:
-            continue
-        center_dx = abs(_rect_center_x(rect) - (source_center_x + 110.0))
-        score = (gap, center_dx, abs(width - 120.0))
-        if best_score is None or score < best_score:
-            best_score = score
-            best_text = text
-    return best_text
-
-
 def _is_strong_axis_label_source_text(text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
     if not normalized:
@@ -3409,18 +3330,6 @@ def _restore_source_line_breaks(source_text: str, translated_text: str) -> str:
 def _has_inline_numbered_markers(source_text: str) -> bool:
     markers = list(_NUMBERED_MARKER_RE.finditer(source_text))
     return len(markers) >= 2 and markers[0].start() <= 2
-
-
-def _split_marketing_status_line(text: str) -> tuple[str, str] | None:
-    match = _MARKETING_STATUS_LINE_RE.match(str(text or ""))
-    if match is None:
-        return None
-    key = match.group(1).upper()
-    label = _MARKETING_STATUS_TRANSLATIONS.get(key)
-    body = match.group(2).strip()
-    if label is None or not body:
-        return None
-    return label, body
 
 
 def _restore_numbered_marker_breaks(translated_text: str) -> str:
