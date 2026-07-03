@@ -14,7 +14,7 @@ from doc_translator.audit import record_audit
 from doc_translator.auth import authenticate_user, create_access_token, get_current_user, require_admin
 from doc_translator.babeldoc_hooks import babeldoc_structure_snapshot_path
 from doc_translator.bootstrap import bootstrap_defaults
-from doc_translator.core.config import get_settings
+from doc_translator.core.config import assert_secure_for_production, get_settings
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health, get_db
 from doc_translator.models import AuditLog, JobFile, JobFileKind, JobStatus, TranslationJob, User
@@ -38,7 +38,7 @@ from doc_translator.schemas import (
     UserRead,
     UserUpdate,
 )
-from doc_translator.settings_service import RuntimeSettings, get_runtime_settings, get_settings_response, update_settings
+from doc_translator.settings_service import RuntimeSettings, get_runtime_settings, get_settings_response, update_settings, validate_model_endpoint
 from doc_translator.storage import persist_upload
 from doc_translator.translation import test_model_connection
 
@@ -51,6 +51,7 @@ def get_request_ip(request: Request) -> str | None:
 async def lifespan(_: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    assert_secure_for_production(settings)
     with SessionLocal() as session:
         bootstrap_defaults(session)
     yield
@@ -325,6 +326,9 @@ def test_model(
     session: Session = Depends(get_db),
 ) -> ModelTestResult:
     runtime = build_runtime_override(get_runtime_settings(session), payload)
+    # SSRF defense-in-depth: re-check the resolved endpoint (covers the case
+    # where an admin tests against the already-stored URL).
+    validate_model_endpoint(runtime.model_base_url)
     latency_ms, preview = test_model_connection(runtime)
     record_audit(
         session,
@@ -489,7 +493,11 @@ def download_job(
         details={"output_file_id": job.output_file.id},
     )
     session.commit()
-    return FileResponse(path=job.output_file.storage_path, filename=job.output_file.original_name)
+    return FileResponse(
+        path=job.output_file.storage_path,
+        filename=job.output_file.original_name,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.get("/api/v1/jobs/{job_id}/documents/{document_kind}")
@@ -501,11 +509,16 @@ def read_job_document(
 ):
     job = load_job_or_404(session, job_id, current_user)
     job_file = load_job_document(job, document_kind)
+    # FileResponse(filename=...) RFC-encodes the filename (preventing header
+    # injection via a crafted original_name) and defaults to an attachment
+    # disposition. nosniff stops the browser from sniffing a spoofed content
+    # type; together with the extension-derived content_type this closes the
+    # C2 stored-XSS vector (upload .pdf with a spoofed text/html content type).
     return FileResponse(
         path=job_file.storage_path,
         media_type=job_file.content_type,
         filename=job_file.original_name,
-        headers={"Content-Disposition": f'inline; filename="{job_file.original_name}"'},
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 

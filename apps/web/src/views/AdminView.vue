@@ -63,7 +63,12 @@ watch(
     if (!value) {
       return;
     }
-    Object.assign(settingsForm, value);
+    // Copy every field except model_api_key: the stored value is masked
+    // (****<last4>) and must not be echoed back on save, or it would overwrite
+    // the real key. The key field stays blank until the admin types a new one.
+    const { model_api_key, ...rest } = value;
+    Object.assign(settingsForm, rest);
+    settingsForm.model_api_key = "";
   },
   { immediate: true }
 );
@@ -78,13 +83,24 @@ function navigate(page) {
 
 async function submitSettings() {
   try {
-    await saveSettings({
-      ...settingsForm,
+    // Partial update: omit model_api_key when blank so the backend keeps the
+    // existing key. Only send it when the admin entered a new value.
+    const payload = {
+      storage_mode: settingsForm.storage_mode,
+      local_storage_path: settingsForm.local_storage_path,
       file_retention_days: Number(settingsForm.file_retention_days),
+      model_base_url: settingsForm.model_base_url,
+      model_name: settingsForm.model_name,
       model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
+      ocr_enabled: settingsForm.ocr_enabled,
+      ocr_language_hint: settingsForm.ocr_language_hint,
       max_upload_mb: Number(settingsForm.max_upload_mb),
       max_concurrent_jobs: Number(settingsForm.max_concurrent_jobs),
-    });
+    };
+    if (settingsForm.model_api_key && settingsForm.model_api_key.trim()) {
+      payload.model_api_key = settingsForm.model_api_key.trim();
+    }
+    await saveSettings(payload);
   } catch (error) {
     state.messages.settings = error.message;
   }
@@ -92,12 +108,17 @@ async function submitSettings() {
 
 async function runModelTest() {
   try {
-    await testModel({
+    const testPayload = {
       model_base_url: settingsForm.model_base_url,
-      model_api_key: settingsForm.model_api_key,
       model_name: settingsForm.model_name,
       model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
-    });
+    };
+    // If the admin typed a new key, test with it; otherwise the backend tests
+    // against the already-stored key (model_api_key omitted -> no override).
+    if (settingsForm.model_api_key && settingsForm.model_api_key.trim()) {
+      testPayload.model_api_key = settingsForm.model_api_key.trim();
+    }
+    await testModel(testPayload);
   } catch (error) {
     state.messages.settings = error.message;
   }
@@ -205,7 +226,11 @@ function changeAuditPage(page) {
             <label class="field">
               <span>Model API key</span>
               <span class="control-shell">
-                <input v-model="settingsForm.model_api_key" type="password" required />
+                <input
+                  v-model="settingsForm.model_api_key"
+                  type="password"
+                  :placeholder="state.settings?.model_api_key ? copy('已设置（当前：', 'Set (current: ') + state.settings.model_api_key + ')' : copy('未设置', 'Not set')"
+                />
               </span>
             </label>
             <label class="field">

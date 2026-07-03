@@ -48,7 +48,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "${API_BIND_HOST:-0.0.0.0}:8000:8000"
+      - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
     volumes:
       - files_data:/data/files
       - babeldoc_cache:/root/.cache/babeldoc

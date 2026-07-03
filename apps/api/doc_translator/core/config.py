@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     app_secret_key: str = "change-me"
     access_token_expire_minutes: int = 720
 
+    # Known insecure defaults that must not be used in production.
+    _INSECURE_DEFAULT_SECRET = "change-me"
+    _INSECURE_DEFAULT_ADMIN_PASSWORD = "change-this-password"
+    _MIN_SECRET_LENGTH = 32
+
     postgres_url: str = "postgresql+psycopg://doc_translator:doc_translator@postgres:5432/doc_translator"
     redis_url: str = "redis://redis:6379/0"
 
@@ -39,3 +44,29 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+class InsecureConfigurationError(RuntimeError):
+    """Raised when production starts with known-insecure default secrets."""
+
+
+def assert_secure_for_production(settings: Settings) -> None:
+    """Refuse to boot in production with insecure default secrets.
+
+    Guards against the most common misdeployment: copying ``.env.example``
+    and forgetting to rotate the JWT secret or the bootstrap admin password.
+    """
+
+    if settings.app_env != "production":
+        return
+
+    problems: list[str] = []
+    if settings.app_secret_key == settings._INSECURE_DEFAULT_SECRET or len(settings.app_secret_key) < settings._MIN_SECRET_LENGTH:
+        problems.append(
+            f"app_secret_key must be set to a unique value of at least {settings._MIN_SECRET_LENGTH} characters "
+            f"(still the default or too short)."
+        )
+    if settings.admin_password == settings._INSECURE_DEFAULT_ADMIN_PASSWORD:
+        problems.append("admin_password must be changed from its default before running in production.")
+    if problems:
+        raise InsecureConfigurationError("; ".join(problems))

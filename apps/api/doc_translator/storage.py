@@ -65,7 +65,7 @@ def persist_upload(file: UploadFile, runtime: RuntimeSettings) -> dict:
         "original_name": file.filename or stored_name,
         "stored_name": stored_name,
         "storage_path": str(target_path),
-        "content_type": file.content_type or SUPPORTED_EXTENSIONS[extension],
+        "content_type": SUPPORTED_EXTENSIONS[extension],
         "size_bytes": size_bytes,
         "checksum": digest.hexdigest(),
     }

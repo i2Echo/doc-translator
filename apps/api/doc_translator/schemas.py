@@ -57,6 +57,9 @@ class SettingsRead(BaseModel):
     local_storage_path: str
     file_retention_days: int
     model_base_url: str
+    # Masked: never returns the raw key to the client. Empty string means no
+    # key is configured; otherwise only the last 4 characters are exposed so
+    # the admin can confirm *which* key is set without being able to use it.
     model_api_key: str
     model_name: str
     model_timeout_seconds: int
@@ -68,17 +71,29 @@ class SettingsRead(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    storage_mode: str = "local"
-    local_storage_path: str
-    file_retention_days: int = Field(ge=1, le=3650)
-    model_base_url: str
-    model_api_key: str
-    model_name: str
-    model_timeout_seconds: int = Field(ge=1, le=3600)
-    ocr_enabled: bool
-    ocr_language_hint: str
-    max_upload_mb: int = Field(ge=1, le=2048)
-    max_concurrent_jobs: int = Field(ge=1, le=16)
+    # Partial update: every field is Optional. ``None`` (field omitted) means
+    # "leave unchanged"; an explicit value replaces the stored one. This lets
+    # the admin save other settings without round-tripping the raw API key.
+    storage_mode: str | None = Field(default=None)
+    local_storage_path: str | None = None
+    file_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    model_base_url: str | None = None
+    model_api_key: str | None = None
+    model_name: str | None = None
+    model_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+    ocr_enabled: bool | None = None
+    ocr_language_hint: str | None = None
+    max_upload_mb: int | None = Field(default=None, ge=1, le=2048)
+    max_concurrent_jobs: int | None = Field(default=None, ge=1, le=16)
+
+    @model_validator(mode="after")
+    def validate_model_endpoint_field(self) -> "SettingsUpdate":
+        if self.model_base_url is not None:
+            # Imported here to avoid a circular import (settings_service imports schemas).
+            from doc_translator.settings_service import validate_model_endpoint
+
+            validate_model_endpoint(self.model_base_url)
+        return self
 
 
 class SettingsTestRequest(BaseModel):
@@ -86,6 +101,14 @@ class SettingsTestRequest(BaseModel):
     model_api_key: str | None = None
     model_name: str | None = None
     model_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+
+    @model_validator(mode="after")
+    def validate_test_model_endpoint_field(self) -> "SettingsTestRequest":
+        if self.model_base_url is not None:
+            from doc_translator.settings_service import validate_model_endpoint
+
+            validate_model_endpoint(self.model_base_url)
+        return self
 
 
 class FileRead(ORMModel):

@@ -1,5 +1,7 @@
+import ipaddress
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +14,42 @@ PRIVACY_NOTICE = (
     "Files remain in customer-controlled storage. If the configured model endpoint is external, "
     "document text is sent there for translation by design."
 )
+
+
+class InvalidModelEndpointError(ValueError):
+    """Raised when a configured model endpoint is not allowed (SSRF guard)."""
+
+
+def validate_model_endpoint(base_url: str) -> str:
+    """Validate an admin-configured model endpoint to prevent SSRF.
+
+    Rejects non-http(s) schemes and loopback / link-local / private / metadata
+    IP hosts. An empty URL is allowed (validated before the admin sets one).
+    """
+
+    url = (base_url or "").strip()
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise InvalidModelEndpointError(f"Model endpoint must use http or https (got {parsed.scheme!r}).")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise InvalidModelEndpointError("Model endpoint is missing a host.")
+    # Reject the cloud-metadata IP and obvious internal targets by name first.
+    if host in {"metadata.google.internal"}:
+        raise InvalidModelEndpointError("Model endpoint must not point to a metadata service.")
+    try:
+        # host may be a hostname or an IP literal; only screen IP literals here.
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_unspecified or addr.is_reserved:
+            raise InvalidModelEndpointError(
+                "Model endpoint must not point to a loopback, link-local, private, reserved, or unspecified address."
+            )
+    return url
 
 
 @dataclass(frozen=True)
@@ -76,6 +114,15 @@ def get_runtime_settings(session: Session) -> RuntimeSettings:
     return RuntimeSettings(**values)
 
 
+def mask_api_key(raw_key: str) -> str:
+    """Return a non-sensitive view of the model API key for API responses."""
+    if not raw_key:
+        return ""
+    if len(raw_key) <= 4:
+        return "****"
+    return f"****{raw_key[-4:]}"
+
+
 def get_settings_response(session: Session) -> SettingsRead:
     runtime = get_runtime_settings(session)
     return SettingsRead(
@@ -83,7 +130,7 @@ def get_settings_response(session: Session) -> SettingsRead:
         local_storage_path=runtime.local_storage_path,
         file_retention_days=runtime.file_retention_days,
         model_base_url=runtime.model_base_url,
-        model_api_key=runtime.model_api_key,
+        model_api_key=mask_api_key(runtime.model_api_key),
         model_name=runtime.model_name,
         model_timeout_seconds=runtime.model_timeout_seconds,
         ocr_enabled=runtime.ocr_enabled,
@@ -96,13 +143,21 @@ def get_settings_response(session: Session) -> SettingsRead:
 
 def update_settings(session: Session, payload: SettingsUpdate, actor_id: str | None) -> list[str]:
     changed_keys: list[str] = []
-    current = get_settings_response(session)
-    payload_data = payload.model_dump()
+    runtime = get_runtime_settings(session)
+    # model_dump(exclude_unset=True) yields only fields the client actually
+    # sent; omitted fields stay None and are left untouched.
+    payload_data = payload.model_dump(exclude_unset=True)
 
     for key, value in payload_data.items():
-        existing = getattr(current, key)
-        if value == "" and key == "model_api_key":
-            value = existing
+        if key not in SETTING_DEFINITIONS:
+            continue
+        # None on a partial update means "leave unchanged".
+        if value is None:
+            continue
+        # SSRF guard on the model endpoint (also enforced at the schema layer).
+        if key == "model_base_url":
+            validate_model_endpoint(str(value))
+        existing = getattr(runtime, key)
         if existing != value:
             setting = session.get(SystemSetting, key)
             if setting is None:
