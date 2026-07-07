@@ -1087,6 +1087,10 @@ class BabeldocHookContext:
         right_rect = _box_rect(getattr(right, "box", None))
         if left_rect is None or right_rect is None:
             return False, "missing_rect"
+        if _looks_like_multiline_prose_block(left, left_rect, left_text) and _looks_like_multiline_prose_block(
+            right, right_rect, right_text
+        ):
+            return False, "multi_line_blocks"
         baseline_ok, reason = _same_baseline_close_gap(left_rect, right_rect)
         if not baseline_ok:
             return False, reason
@@ -1812,6 +1816,20 @@ def _same_baseline_close_gap(
     if not (-1.0 <= gap <= gap_limit):
         return False, f"gap_out_of_range:{round(gap, 3)}>{round(gap_limit, 3)}"
     return True, "ok"
+
+
+def _looks_like_multiline_prose_block(
+    paragraph: Any,
+    rect: tuple[float, float, float, float],
+    text: str,
+) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if len(normalized) < 40 or not _looks_like_prose_fragment(normalized):
+        return False
+    style = getattr(paragraph, "pdf_style", None)
+    font_size = float(getattr(style, "font_size", 0) or 0) or 10.0
+    height = max(rect[3] - rect[1], 1.0)
+    return height / font_size >= 2.6
 
 
 def _paragraph_visual_sort_key(paragraph: Any, original_index: int) -> tuple[float, float, float, int]:
@@ -4099,7 +4117,7 @@ def _is_inline_punctuation_fragment(text: str) -> bool:
 
 
 def _supports_visual_line_split(paragraph: Any) -> bool:
-    return getattr(paragraph, "layout_label", None) in {"fallback_line", "plain text", "table_footnote", "abandon"}
+    return getattr(paragraph, "layout_label", None) == "fallback_line"
 
 
 def _split_paragraph_by_visual_lines(paragraph: Any) -> list[Any]:
@@ -4147,9 +4165,10 @@ def _split_paragraph_by_visual_lines(paragraph: Any) -> list[Any]:
 
 def _should_split_visual_line_groups(paragraph: Any, grouped_lines: list[dict[str, Any]]) -> bool:
     layout_label = getattr(paragraph, "layout_label", None)
-    if layout_label == "fallback_line":
-        return True
-    if layout_label not in {"plain text", "table_footnote", "abandon"}:
+    if layout_label != "fallback_line":
+        return False
+    source_text = unicodedata.normalize("NFKC", str(getattr(paragraph, "unicode", "") or "")).strip()
+    if not _looks_like_splitworthy_multiline_fallback_text(source_text):
         return False
     paragraph_rect = _box_rect(getattr(paragraph, "box", None))
     if paragraph_rect is None:
@@ -4170,8 +4189,6 @@ def _should_split_visual_line_groups(paragraph: Any, grouped_lines: list[dict[st
         return False
     if paragraph_height < max(18.0, min(line_heights) * 1.8):
         return False
-    if layout_label == "abandon":
-        return len(line_rects) >= 3 or paragraph_height >= max(26.0, min(line_heights) * 2.4)
     wide_line_count = sum(1 for rect in line_rects if (rect[2] - rect[0]) / paragraph_width >= 0.58)
     if wide_line_count < 2:
         return False
