@@ -120,6 +120,12 @@ _LAYOUT_TABLE_CONFIDENCE = 0.72
 _LAYOUT_FIGURE_CONFIDENCE = 0.66
 _LAYOUT_TWO_COLUMN_BODY_CONFIDENCE = 0.74
 _LAYOUT_SINGLE_COLUMN_BODY_CONFIDENCE = 0.64
+_BODY_SCALE_NORMALIZATION_MIN_GROUP_SIZE = 3
+_BODY_SCALE_NORMALIZATION_MIN_SCALE = 0.62
+_BODY_SCALE_NORMALIZATION_MIN_DELTA = 0.08
+_BODY_SCALE_NORMALIZATION_MAX_TARGET = 0.88
+_BODY_SCALE_NORMALIZATION_MIN_TEXT_WIDTH = 14
+_BODY_SCALE_NORMALIZATION_ANCHOR_TEXT_WIDTH = 32
 _TECHNICAL_UPPER_TOKENS = frozenset(
     {
         "ADC",
@@ -448,6 +454,9 @@ class BabeldocHookContext:
             if record.paragraph_id in schematic_label_ids:
                 _mark(record, "preserved_token", "preserve", 0.96, ("schematic figure fallback label",))
                 continue
+            if _is_edge_metadata_preserve_candidate(record):
+                _mark(record, "preserved_token", "preserve", 0.95, ("edge metadata header/footer",))
+                continue
             if _is_preserve_candidate(record):
                 _mark(record, "preserved_token", "preserve", 0.97, ("short stable token",))
 
@@ -721,9 +730,12 @@ class BabeldocHookContext:
         if not page_records:
             return False
         source_rect = _char_group_rect(group)
+        if source_rect is not None and _is_page_edge_rect(source_rect, page_records):
+            return True
 
         matched_non_axis_records: set[str] = set()
         matched_axis_records: set[str] = set()
+        matched_edge_records: set[str] = set()
         matched_chars = 0
         for char in group:
             char_rect = _box_rect(getattr(char, "box", None))
@@ -745,6 +757,9 @@ class BabeldocHookContext:
             if best_record is None or best_overlap < 0.55:
                 continue
             matched_chars += 1
+            if _is_edge_band(best_record):
+                matched_edge_records.add(best_record.paragraph_id)
+                continue
             if (
                 best_record.role == "vertical_label"
                 or _looks_like_axis_label_fragment(best_record.text)
@@ -756,6 +771,8 @@ class BabeldocHookContext:
 
         if matched_axis_records:
             return False
+        if matched_edge_records:
+            return True
         if source_rect is not None and _looks_like_record_aligned_table_column(source_rect, page_records):
             return True
         if _looks_like_repeated_short_record_column(source_rect, page_records):
@@ -2234,6 +2251,8 @@ class BabeldocHookContext:
             )
 
     def normalize_body_font_sizes_before_typesetting(self, document: Any) -> None:
+        if not self.hook_policy.is_apply("normalize_body_font_sizes"):
+            return
         normalized_runs = 0
         samples: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
@@ -2241,13 +2260,14 @@ class BabeldocHookContext:
                 record = self._record_for_paragraph(paragraph)
                 if record is None or record.role != "body" or record.policy != "pass_through":
                     continue
-                if (
-                    not self._needs_scoped_postprocess(paragraph)
-                    and id(paragraph) not in self._definition_style_restored_paragraph_ids
-                ):
+                region = self._record_layout_region(record)
+                is_scoped = (
+                    self._needs_scoped_postprocess(paragraph)
+                    or id(paragraph) in self._definition_style_restored_paragraph_ids
+                )
+                if not is_scoped and (region is None or region.region != "body_column"):
                     continue
-                base_style = getattr(paragraph, "pdf_style", None)
-                base_size = float(getattr(base_style, "font_size", 0) or 0)
+                base_size = _body_paragraph_reference_font_size(paragraph)
                 if base_size <= 0:
                     continue
                 paragraph_changes = []
@@ -2285,6 +2305,79 @@ class BabeldocHookContext:
                 rule_key="normalize_body_font_sizes",
                 decision="applied",
                 runs=normalized_runs,
+                samples=samples,
+            )
+
+    def normalize_body_scales_before_render(self, page: Any) -> None:
+        if not self.hook_policy.is_apply("normalize_body_font_sizes"):
+            return
+        groups: dict[tuple[int, float], list[tuple[Any, _ParagraphRecord, float | None, int]]] = {}
+        lanes: list[dict[str, Any]] = []
+        for paragraph in getattr(page, "pdf_paragraph", []) or []:
+            record = self._record_for_paragraph(paragraph)
+            if record is None or record.role != "body" or record.policy != "pass_through":
+                continue
+            region = self._record_layout_region(record)
+            if region is None or region.region != "body_column":
+                continue
+            raw_scale = getattr(paragraph, "optimal_scale", None)
+            scale = float(raw_scale) if raw_scale is not None and float(raw_scale) > 0 else None
+            base_size = _body_paragraph_reference_font_size(paragraph)
+            if base_size < 7.0 or base_size > 12.0:
+                continue
+            text = _paragraph_plain_text(paragraph)
+            text_width = _display_width(text)
+            if text_width < _BODY_SCALE_NORMALIZATION_MIN_TEXT_WIDTH or not _looks_like_translated_prose_segment(text):
+                continue
+            lane_id = _body_scale_lane_id(paragraph, lanes)
+            groups.setdefault((lane_id, round(base_size * 2.0) / 2.0), []).append((paragraph, record, scale, text_width))
+
+        normalized = 0
+        samples: list[dict[str, Any]] = []
+        for (lane_id, base_size), entries in groups.items():
+            anchor_entries = [
+                (paragraph, record, scale)
+                for paragraph, record, scale, text_width in entries
+                if scale is not None and text_width >= _BODY_SCALE_NORMALIZATION_ANCHOR_TEXT_WIDTH
+            ]
+            if len(anchor_entries) < _BODY_SCALE_NORMALIZATION_MIN_GROUP_SIZE:
+                continue
+            scales = sorted(scale for _paragraph, _record, scale in anchor_entries if scale is not None)
+            target_scale = min(_BODY_SCALE_NORMALIZATION_MAX_TARGET, _quantile(scales, 0.35))
+            target_size = base_size * target_scale
+            for paragraph, record, scale, _text_width in entries:
+                if scale is not None and scale <= _BODY_SCALE_NORMALIZATION_MIN_SCALE:
+                    continue
+                current_scale = scale if scale is not None else 1.0
+                changed_styles = _apply_body_target_font_size(paragraph, target_size)
+                force_retypeset = _force_body_retypeset_with_target_font_size(paragraph, target_size)
+                if (
+                    not changed_styles
+                    and not force_retypeset
+                    and abs(current_scale - target_scale) < _BODY_SCALE_NORMALIZATION_MIN_DELTA
+                ):
+                    continue
+                paragraph.optimal_scale = 1.0
+                normalized += 1
+                if len(samples) < 8:
+                    samples.append(
+                        {
+                            "paragraph_id": record.paragraph_id,
+                            "page_number": record.page_number,
+                            "lane_id": lane_id,
+                            "base_size": round(base_size, 3),
+                            "from": round(current_scale, 3),
+                            "to": round(target_scale, 3),
+                            "target_size": round(target_size, 3),
+                            "text": _paragraph_plain_text(paragraph)[:100],
+                        }
+                    )
+        if normalized:
+            self._record_action(
+                "normalize_body_scales_before_render",
+                rule_key="normalize_body_font_sizes",
+                decision="applied",
+                paragraphs=normalized,
                 samples=samples,
             )
 
@@ -3138,6 +3231,27 @@ def _is_preserve_candidate(record: _ParagraphRecord) -> bool:
     if not has_spacing and _TECHNICAL_TOKEN_RE.fullmatch(text):
         return True
     if not has_spacing and _SHORT_UPPER_TOKEN_RE.fullmatch(collapsed) and collapsed in _TECHNICAL_UPPER_TOKENS:
+        return True
+    return False
+
+
+def _is_edge_metadata_preserve_candidate(record: _ParagraphRecord) -> bool:
+    if not _is_edge_band(record):
+        return False
+    text = unicodedata.normalize("NFKC", record.text).strip()
+    if not text or len(text) > 96:
+        return False
+    if re.search(r"\b(?:SBAS|SBAA|SLOS|SLAS|SLVS|SNAS|SLLS|SLUS|SLES)[A-Z0-9]{3,}\b", text, re.IGNORECASE):
+        return True
+    if re.search(
+        r"\b(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)\s+\d{4}\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\b(?:REVISED|REV\.?|COPYRIGHT|www\.)\b|©", text, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\d{1,4}", text):
         return True
     return False
 
@@ -4870,6 +4984,25 @@ def _looks_like_record_aligned_table_column(
     return matched_axis == 0 and matched_non_axis >= 4
 
 
+def _is_page_edge_rect(
+    rect: tuple[float, float, float, float],
+    records: list[_ParagraphRecord],
+) -> bool:
+    page_rect = next((record.page_rect for record in records if record.page_rect is not None), None)
+    if page_rect is None:
+        return False
+    x1, y1, x2, y2 = rect
+    px1, py1, px2, py2 = page_rect
+    width = max(px2 - px1, 1.0)
+    height = max(py2 - py1, 1.0)
+    return (
+        y1 <= py1 + height * 0.1
+        or y2 >= py2 - height * 0.1
+        or x1 <= px1 + width * 0.06
+        or x2 >= px2 - width * 0.06
+    )
+
+
 def _rect_crosses_record_column(
     column_rect: tuple[float, float, float, float],
     record_rect: tuple[float, float, float, float],
@@ -5821,6 +5954,186 @@ def _should_normalize_translated_run_font_size(text: str, current_size: float, b
     if not normalized or _is_size_sensitive_inline_marker(normalized):
         return False
     return _looks_like_translated_prose_segment(normalized)
+
+
+def _body_paragraph_reference_font_size(paragraph: Any) -> float:
+    runs = []
+    for item in getattr(paragraph, "pdf_paragraph_composition", []) or []:
+        same_style_unicode = getattr(item, "pdf_same_style_unicode_characters", None)
+        if same_style_unicode is None:
+            continue
+        text = _strip_babeldoc_style_placeholders(str(getattr(same_style_unicode, "unicode", "") or "")).strip()
+        if not text or _is_size_sensitive_inline_marker(text):
+            continue
+        style = getattr(same_style_unicode, "pdf_style", None)
+        size = float(getattr(style, "font_size", 0) or 0)
+        if size <= 0:
+            continue
+        runs.append((size, max(_display_width(text), 1)))
+    if runs:
+        return _weighted_median_size(runs)
+
+    base_style = getattr(paragraph, "pdf_style", None)
+    return float(getattr(base_style, "font_size", 0) or 0)
+
+
+def _body_scale_lane_id(paragraph: Any, lanes: list[dict[str, Any]]) -> int:
+    for lane_id, lane in enumerate(lanes):
+        if _same_body_scale_lane(lane["rect"], paragraph):
+            rect = _box_rect(getattr(paragraph, "box", None))
+            if rect is not None:
+                lane["rect"] = _rect_union([lane["rect"], rect]) or lane["rect"]
+            return lane_id
+    lane_id = len(lanes)
+    rect = _box_rect(getattr(paragraph, "box", None))
+    lanes.append({"rect": rect})
+    return lane_id
+
+
+def _same_body_scale_lane(left_rect: tuple[float, float, float, float] | None, right: Any) -> bool:
+    right_rect = _box_rect(getattr(right, "box", None))
+    if left_rect is None or right_rect is None:
+        return False
+    min_width = max(min(left_rect[2] - left_rect[0], right_rect[2] - right_rect[0]), 1.0)
+    if abs(left_rect[0] - right_rect[0]) <= max(10.0, min_width * 0.12):
+        return True
+    if abs(left_rect[2] - right_rect[2]) <= max(12.0, min_width * 0.12):
+        return True
+    left_center = (left_rect[0] + left_rect[2]) / 2.0
+    right_center = (right_rect[0] + right_rect[2]) / 2.0
+    width_delta = abs((left_rect[2] - left_rect[0]) - (right_rect[2] - right_rect[0]))
+    return width_delta <= max(18.0, min_width * 0.25) and abs(left_center - right_center) <= max(18.0, min_width * 0.16)
+
+
+def _apply_body_target_font_size(paragraph: Any, target_size: float) -> int:
+    changed = 0
+    for item in getattr(paragraph, "pdf_paragraph_composition", []) or []:
+        same_style_unicode = getattr(item, "pdf_same_style_unicode_characters", None)
+        if same_style_unicode is not None:
+            text = _strip_babeldoc_style_placeholders(str(getattr(same_style_unicode, "unicode", "") or "")).strip()
+            if not text or _is_size_sensitive_inline_marker(text):
+                continue
+            style = getattr(same_style_unicode, "pdf_style", None)
+            current_size = float(getattr(style, "font_size", 0) or 0)
+            if current_size <= 0 or math.isclose(current_size, target_size, rel_tol=0.02, abs_tol=0.12):
+                continue
+            style.font_size = target_size
+            changed += 1
+            continue
+
+        char = getattr(item, "pdf_character", None)
+        style = getattr(char, "pdf_style", None)
+        text = str(getattr(char, "char_unicode", "") or "").strip()
+        if style is None or not text or _is_size_sensitive_inline_marker(text):
+            continue
+        current_size = float(getattr(style, "font_size", 0) or 0)
+        if current_size <= 0 or math.isclose(current_size, target_size, rel_tol=0.02, abs_tol=0.12):
+            continue
+        style.font_size = target_size
+        changed += 1
+    return changed
+
+
+def _force_body_retypeset_with_target_font_size(paragraph: Any, target_size: float) -> bool:
+    text = _paragraph_plain_text(paragraph)
+    if not text or "\n" in str(getattr(paragraph, "unicode", "") or ""):
+        return False
+    if _PLACEHOLDER_TOKEN_RE.search(text) or _BABELDOC_STYLE_PLACEHOLDER_RE.search(text):
+        return False
+    if not _looks_like_translated_prose_segment(text):
+        return False
+
+    composition = list(getattr(paragraph, "pdf_paragraph_composition", []) or [])
+    if not composition:
+        return False
+
+    style = _body_retypeset_style(paragraph)
+    if style is None or getattr(style, "font_id", None) is None:
+        return False
+
+    for item in composition:
+        if getattr(item, "pdf_formula", None) is not None or getattr(item, "pdf_line", None) is not None:
+            return False
+        if (
+            getattr(item, "pdf_character", None) is None
+            and getattr(item, "pdf_same_style_characters", None) is None
+            and getattr(item, "pdf_same_style_unicode_characters", None) is None
+        ):
+            return False
+
+    from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraphComposition
+    from babeldoc.format.pdf.document_il.il_version_1 import PdfSameStyleUnicodeCharacters
+
+    style = copy.deepcopy(style)
+    style.font_size = target_size
+    comp = PdfParagraphComposition()
+    comp.pdf_same_style_unicode_characters = PdfSameStyleUnicodeCharacters(
+        pdf_style=style,
+        unicode=text,
+    )
+    paragraph.pdf_paragraph_composition = [comp]
+    paragraph.unicode = text
+    return True
+
+
+def _body_retypeset_style(paragraph: Any) -> Any | None:
+    style_weights: list[tuple[int, Any]] = []
+    for item in getattr(paragraph, "pdf_paragraph_composition", []) or []:
+        same_style_unicode = getattr(item, "pdf_same_style_unicode_characters", None)
+        if same_style_unicode is not None:
+            text = str(getattr(same_style_unicode, "unicode", "") or "")
+            style = getattr(same_style_unicode, "pdf_style", None)
+            if text and style is not None:
+                style_weights.append((_display_width(text), style))
+            continue
+
+        same_style = getattr(item, "pdf_same_style_characters", None)
+        if same_style is not None:
+            chars = list(getattr(same_style, "pdf_character", []) or [])
+            style = getattr(same_style, "pdf_style", None)
+            if chars and style is not None:
+                style_weights.append((len(chars), style))
+            continue
+
+        char = getattr(item, "pdf_character", None)
+        style = getattr(char, "pdf_style", None)
+        text = str(getattr(char, "char_unicode", "") or "")
+        if text and style is not None:
+            style_weights.append((1, style))
+
+    if style_weights:
+        return max(style_weights, key=lambda item: item[0])[1]
+    return getattr(paragraph, "pdf_style", None)
+
+
+def _weighted_median_size(runs: list[tuple[float, int]]) -> float:
+    total = sum(weight for _size, weight in runs)
+    midpoint = total / 2.0
+    cumulative = 0
+    for size, weight in sorted(runs, key=lambda item: item[0]):
+        cumulative += weight
+        if cumulative >= midpoint:
+            return size
+    return runs[-1][0]
+
+
+def _paragraph_plain_text(paragraph: Any) -> str:
+    text = str(getattr(paragraph, "unicode", "") or "")
+    text = _BABELDOC_STYLE_PLACEHOLDER_RE.sub("", text)
+    text = re.sub(r"<style\b[^>]*>|</style>", "", text)
+    return _SPACE_COLLAPSE_RE.sub(" ", text).strip()
+
+
+def _quantile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    position = (len(values) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return values[lower]
+    fraction = position - lower
+    return values[lower] + ((values[upper] - values[lower]) * fraction)
 
 
 def _is_size_sensitive_inline_marker(text: str) -> bool:

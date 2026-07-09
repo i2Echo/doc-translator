@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import statistics
+import sys
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from typing import Any, Callable
@@ -14,6 +17,38 @@ from doc_translator.settings_service import RuntimeSettings
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _HardLineBreakTypesettingUnit:
+    font_size: float | None = None
+    debug_info: bool = False
+
+    char: Any = None
+    formular: Any = None
+    unicode: str = "\n"
+    width: float = 0.0
+    height: float = 0.0
+    is_space: bool = False
+    is_cjk_char: bool = False
+    mixed_character_blacklist: bool = False
+    is_hung_punctuation: bool = False
+    is_cannot_appear_in_line_end_punctuation: bool = False
+    can_break_line: bool = True
+    can_passthrough: bool = False
+
+    def try_get_unicode(self) -> str:
+        return "\n"
+
+    def relocate(self, _x: float, _y: float, _scale: float) -> "_HardLineBreakTypesettingUnit":
+        return self
+
+    def render(self) -> tuple[list[Any], list[Any], list[Any]]:
+        return [], [], []
+
+
+def _is_hard_line_break_unit(unit: Any) -> bool:
+    return isinstance(unit, _HardLineBreakTypesettingUnit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +213,7 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
         "ILTranslator": high_level.ILTranslator,
         "ILTranslatorLLMOnly": high_level.ILTranslatorLLMOnly,
         "Typesetting": high_level.Typesetting,
+        "typesetting_module": sys.modules[high_level.Typesetting.__module__],
         "PDFCreater": high_level.PDFCreater,
     }
 
@@ -319,6 +355,244 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
             return result
 
     class HookedTypesetting(originals["Typesetting"]):
+        def create_typesetting_units(self, paragraph: Any, fonts: dict[str, Any]) -> list[Any]:
+            if "\n" not in str(getattr(paragraph, "unicode", "") or ""):
+                return super().create_typesetting_units(paragraph, fonts)
+            if not getattr(paragraph, "pdf_paragraph_composition", None):
+                return []
+            result = []
+
+            @cache
+            def get_font(font_id: str, xobj_id: int | None) -> Any:
+                if xobj_id in fonts:
+                    return fonts[xobj_id][font_id]
+                return fonts[font_id]
+
+            for composition in paragraph.pdf_paragraph_composition:
+                if composition is None:
+                    continue
+                if composition.pdf_line:
+                    result.extend(
+                        [
+                            originals["typesetting_module"].TypesettingUnit(char=char)
+                            for char in composition.pdf_line.pdf_character
+                        ],
+                    )
+                elif composition.pdf_character:
+                    result.append(
+                        originals["typesetting_module"].TypesettingUnit(
+                            char=composition.pdf_character,
+                            debug_info=paragraph.debug_info,
+                        ),
+                    )
+                elif composition.pdf_same_style_characters:
+                    result.extend(
+                        [
+                            originals["typesetting_module"].TypesettingUnit(char=char)
+                            for char in composition.pdf_same_style_characters.pdf_character
+                        ],
+                    )
+                elif composition.pdf_same_style_unicode_characters:
+                    same_style_unicode = composition.pdf_same_style_unicode_characters
+                    style = same_style_unicode.pdf_style
+                    if style is None:
+                        logger.warning("Style is None while preserving hard line breaks.")
+                        continue
+                    font_id = style.font_id
+                    if font_id is None:
+                        logger.warning("Font ID is None while preserving hard line breaks.")
+                        continue
+                    font = get_font(font_id, paragraph.xobj_id)
+                    for char_unicode in str(same_style_unicode.unicode or ""):
+                        if char_unicode == "\n":
+                            result.append(
+                                _HardLineBreakTypesettingUnit(
+                                    font_size=style.font_size,
+                                    debug_info=same_style_unicode.debug_info or False,
+                                )
+                            )
+                            continue
+                        result.append(
+                            originals["typesetting_module"].TypesettingUnit(
+                                unicode=char_unicode,
+                                font=self.font_mapper.map(font, char_unicode),
+                                original_font=font,
+                                font_size=style.font_size,
+                                style=style,
+                                xobj_id=paragraph.xobj_id,
+                                debug_info=same_style_unicode.debug_info or False,
+                            )
+                        )
+                elif composition.pdf_formula:
+                    result.extend([originals["typesetting_module"].TypesettingUnit(formular=composition.pdf_formula)])
+                else:
+                    logger.error(
+                        "Unknown composition type while preserving hard line breaks. "
+                        "Composition: %s. Paragraph: %s.",
+                        composition,
+                        paragraph,
+                    )
+                    continue
+            return list(
+                filter(
+                    lambda unit: _is_hard_line_break_unit(unit) or unit.unicode is None or unit.font is not None,
+                    result,
+                ),
+            )
+
+        def _get_width_before_next_break_point(self, typesetting_units: list[Any], scale: float) -> float:
+            if not typesetting_units or _is_hard_line_break_unit(typesetting_units[0]):
+                return 0
+            total_width = 0.0
+            for unit in typesetting_units:
+                if _is_hard_line_break_unit(unit) or unit.can_break_line:
+                    return total_width * scale
+                total_width += unit.width
+            return total_width * scale
+
+        def _layout_typesetting_units(
+            self,
+            typesetting_units: list[Any],
+            box: Any,
+            scale: float,
+            line_skip: float,
+            paragraph: Any,
+            use_english_line_break: bool = True,
+        ) -> tuple[list[Any], bool]:
+            if not any(_is_hard_line_break_unit(unit) for unit in typesetting_units):
+                return super()._layout_typesetting_units(typesetting_units, box, scale, line_skip, paragraph, use_english_line_break)
+
+            font_sizes = []
+            for unit in typesetting_units:
+                if _is_hard_line_break_unit(unit):
+                    continue
+                if unit.font_size:
+                    font_sizes.append(unit.font_size)
+                if unit.char and unit.char.pdf_style and unit.char.pdf_style.font_size:
+                    font_sizes.append(unit.char.pdf_style.font_size)
+            font_sizes.sort()
+            font_size = statistics.mode(font_sizes)
+
+            space_width = self.font_mapper.base_font.char_lengths("你", font_size * scale)[0] * 0.5
+            unit_heights = [unit.height for unit in typesetting_units if not _is_hard_line_break_unit(unit)]
+            if not unit_heights:
+                avg_height = 0
+            elif len(unit_heights) == 1:
+                avg_height = unit_heights[0] * scale
+            else:
+                try:
+                    avg_height = statistics.mode(unit_heights) * scale
+                except statistics.StatisticsError:
+                    avg_height = sum(unit_heights) / len(unit_heights) * scale
+
+            current_x = box.x
+            current_y = box.y2 - avg_height
+            box = copy.deepcopy(box)
+            line_height = 0.0
+            current_line_heights = []
+            typeset_units = []
+            all_units_fit = True
+            last_unit = None
+            if paragraph.first_line_indent:
+                current_x += space_width * 4
+
+            def break_line() -> bool:
+                nonlocal current_x, current_y, line_height, current_line_heights, all_units_fit, last_unit
+                current_x = box.x
+                if not current_line_heights:
+                    line_step = avg_height * line_skip if avg_height else 0
+                else:
+                    max_height = max(current_line_heights)
+                    mode_height = statistics.mode(current_line_heights)
+                    line_step = max(mode_height * line_skip, max_height * 1.05)
+                current_y -= line_step
+                line_height = 0.0
+                current_line_heights = []
+                last_unit = None
+                if current_y < box.y:
+                    all_units_fit = False
+                return line_step > 0
+
+            for i, unit in enumerate(typesetting_units):
+                if _is_hard_line_break_unit(unit):
+                    if not break_line():
+                        return [], False
+                    continue
+
+                unit_width = unit.width * scale
+                unit_height = unit.height * scale
+
+                if current_x == box.x and unit.is_space:
+                    continue
+
+                if (
+                    last_unit
+                    and last_unit.is_cjk_char ^ unit.is_cjk_char
+                    and (
+                        last_unit.box
+                        and last_unit.box.y
+                        and current_y - 0.1
+                        <= last_unit.box.y2
+                        <= current_y + line_height + 0.1
+                    )
+                    and not last_unit.mixed_character_blacklist
+                    and not unit.mixed_character_blacklist
+                    and current_x > box.x
+                    and unit.try_get_unicode() != " "
+                    and last_unit.try_get_unicode() != " "
+                    and last_unit.try_get_unicode() not in ["。", "！", "？", "；", "：", "，"]
+                ):
+                    current_x += space_width * 0.5
+                if use_english_line_break:
+                    width_before_next_break_point = self._get_width_before_next_break_point(typesetting_units[i:], scale)
+                else:
+                    width_before_next_break_point = 0
+
+                if not unit.is_hung_punctuation and (
+                    (current_x + unit_width > box.x2)
+                    or (
+                        use_english_line_break
+                        and current_x + unit_width + width_before_next_break_point > box.x2
+                    )
+                    or (
+                        unit.is_cannot_appear_in_line_end_punctuation
+                        and current_x + unit_width * 2 > box.x2
+                    )
+                ):
+                    current_x = box.x
+                    if not current_line_heights:
+                        return [], False
+                    max_height = max(current_line_heights)
+                    mode_height = statistics.mode(current_line_heights)
+                    current_y -= max(mode_height * line_skip, max_height * 1.05)
+                    line_height = 0.0
+                    current_line_heights = []
+                    last_unit = None
+                    if current_y < box.y:
+                        all_units_fit = False
+                    if unit.is_space:
+                        line_height = max(line_height, unit_height)
+                        continue
+
+                relocated_unit = unit.relocate(current_x, current_y, scale)
+                typeset_units.append(relocated_unit)
+
+                if not unit.is_space:
+                    current_line_heights.append(unit_height)
+
+                prev_x = current_x
+                current_x = relocated_unit.box.x2
+                if prev_x > current_x:
+                    logger.warning("Coordinates wrapped around. TypesettingUnit: %s.", unit.box)
+
+                last_unit = relocated_unit
+
+            return typeset_units, all_units_fit
+
+        def render_page(self, page: Any) -> None:
+            hook_context.normalize_body_scales_before_render(page)
+            return super().render_page(page)
+
         def typesetting_document(self, document: Any) -> Any:
             hook_context.reconcile_translation()
             hook_context.split_numbered_lists_before_typesetting(document)
