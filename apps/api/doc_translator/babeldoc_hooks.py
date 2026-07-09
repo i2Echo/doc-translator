@@ -105,7 +105,6 @@ _VERTICAL_AXIS_LABEL_CJK_ADVANCE_RATIO = 1.08
 _VERTICAL_AXIS_LABEL_LATIN_ADVANCE_RATIO = 0.74
 _VERTICAL_AXIS_LABEL_PUNCT_ADVANCE_RATIO = 0.58
 _VERTICAL_AXIS_LABEL_SPACE_ADVANCE_RATIO = 0.42
-_VERTICAL_AXIS_LABEL_INTER_CHAR_GAP_RATIO = 0.08
 _VERTICAL_AXIS_LABEL_CROSS_PADDING = 0.35
 _LAYOUT_MIN_COLUMN_CANDIDATES = 3
 _LAYOUT_MIN_TWO_COLUMN_CANDIDATES = 6
@@ -4010,13 +4009,10 @@ class _AxisLabelRenderUnit:
             usable_end = anchor_rect[3] - bottom_padding
             positioned_chars: list[tuple[Any, float, float]] = []
             baseline_offset = 0.0
-            for index, char in enumerate(self.chars):
+            for char in self.chars:
                 font_size = max(char.pdf_style.font_size * final_scale, 0.1)
                 positioned_chars.append((char, font_size, baseline_offset))
-                advance = _vertical_axis_label_advance(char, font_size)
-                if index < len(self.chars) - 1:
-                    advance += font_size * _VERTICAL_AXIS_LABEL_INTER_CHAR_GAP_RATIO
-                baseline_offset += advance
+                baseline_offset += _vertical_axis_label_advance(char, font_size)
             rendered_height = baseline_offset if positioned_chars else 0.0
             available_height = max(usable_end - usable_start, 1.0)
             anchor_y = anchor_rect[1] + max(anchor_height - rendered_height, 0.0) / 2.0
@@ -4298,7 +4294,7 @@ def _restore_micro_unit_from_glyph_fonts(source_text: str, group: list[Any]) -> 
         return source_text
     if prefix_font in {open_font, close_font}:
         return source_text
-    corrected_unit = f"u{match.group('unit')[1:]}"
+    corrected_unit = f"μ{match.group('unit')[1:]}"
     body = _SPACE_COLLAPSE_RE.sub(" ", match.group("body")).strip()
     return f"{body} ({corrected_unit})"
 
