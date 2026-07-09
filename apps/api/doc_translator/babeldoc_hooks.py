@@ -2391,11 +2391,12 @@ class BabeldocHookContext:
 
         chars = [getattr(unit, "char", None) for unit in render_units if getattr(unit, "char", None) is not None]
         groups = _page_level_axis_label_groups(chars)
-        if not groups:
-            return render_units
-
         raw_page_number = getattr(page, "page_number", None)
         page_number = raw_page_number + 1 if isinstance(raw_page_number, int) else raw_page_number
+        tick_groups = _page_level_axis_tick_groups(chars, self.records_by_id.values(), page_number)
+        if not groups and not tick_groups:
+            return render_units
+
         typesetter = Typesetting(translation_config)
         fonts = _build_typesetting_fonts(page, typesetter)
 
@@ -2453,6 +2454,23 @@ class BabeldocHookContext:
                 }
             )
 
+        tick_diagnostics = []
+        for group in tick_groups:
+            unit = _AxisLabelRenderUnit.from_group(group, sort_mode="y")
+            if unit is None:
+                continue
+            source_char_ids.update(id(char) for char in group)
+            replacement_units.append(unit)
+            tick_diagnostics.append(
+                {
+                    "page_number": page_number,
+                    "text": _char_group_text(group),
+                    "rect": _char_group_rect(group),
+                    "characters": len(group),
+                    "replacement": "grouped_axis_tick_rotated_text",
+                }
+            )
+
         if not replacement_units:
             return render_units
 
@@ -2465,6 +2483,7 @@ class BabeldocHookContext:
         replaced_units.extend(replacement_units)
 
         self.axis_diagnostics["character_groups"].extend(diagnostics[:24])
+        self.axis_diagnostics["character_groups"].extend(tick_diagnostics[:24])
         samples = [
             {
                 "text": entry["text"][:80],
@@ -2474,13 +2493,24 @@ class BabeldocHookContext:
             }
             for entry in diagnostics[:8]
         ]
+        samples.extend(
+            {
+                "text": entry["text"][:80],
+                "translated_text": entry["text"][:80],
+                "rect": entry["rect"],
+                "characters": entry["characters"],
+            }
+            for entry in tick_diagnostics[:8]
+        )
         self._record_action(
             "replace_page_axis_label_render_units",
             rule_key="render_axis_label",
             decision="applied",
             page_number=page_number,
             groups=len(replacement_units),
-            characters=sum(entry["characters"] for entry in diagnostics),
+            characters=sum(entry["characters"] for entry in diagnostics) + sum(
+                entry["characters"] for entry in tick_diagnostics
+            ),
             samples=samples,
         )
         return replaced_units
@@ -4895,6 +4925,131 @@ def _looks_like_axis_label_segment_text(text: str) -> bool:
             if digits <= max(3, len(compact) // 3):
                 return True
     return False
+
+
+def _page_level_axis_tick_groups(
+    chars: list[Any],
+    records: Any,
+    page_number: int | None,
+) -> list[list[Any]]:
+    if page_number is None:
+        return []
+    page_records = [
+        record
+        for record in records
+        if record.page_number == page_number and record.rect is not None and record.xobj_id is not None
+    ]
+    if not page_records:
+        return []
+    groups: list[list[Any]] = []
+    grouped_keys: set[tuple[int | str | None, int, ...]] = set()
+    for label_record in page_records:
+        if not _looks_like_horizontal_axis_label(label_record.text):
+            continue
+        label_rect = label_record.rect
+        if label_rect is None:
+            continue
+        candidates = _axis_tick_candidate_chars(chars, label_record)
+        columns = _axis_tick_columns(candidates)
+        valid_columns = [column for column in columns if _is_axis_tick_column(column, label_rect)]
+        if len(valid_columns) < 4:
+            continue
+        for column in valid_columns:
+            key = (label_record.xobj_id, *sorted(id(char) for char in column))
+            if key in grouped_keys:
+                continue
+            grouped_keys.add(key)
+            groups.append(column)
+    return groups
+
+
+def _axis_tick_candidate_chars(chars: list[Any], label_record: _ParagraphRecord) -> list[Any]:
+    label_rect = label_record.rect
+    if label_rect is None:
+        return []
+    x1, _y1, x2, y2 = label_rect
+    horizontal_padding = max(x2 - x1, 80.0)
+    candidates = []
+    for char in chars:
+        if getattr(char, "xobj_id", None) != label_record.xobj_id:
+            continue
+        text = unicodedata.normalize("NFKC", str(getattr(char, "char_unicode", "") or "")).strip()
+        if not _is_axis_tick_char_text(text):
+            continue
+        rect = _box_rect(getattr(char, "box", None))
+        if rect is None:
+            continue
+        if rect[1] < y2 - 1.0 or rect[3] > y2 + 36.0:
+            continue
+        if rect[0] < x1 - horizontal_padding or rect[2] > x2 + horizontal_padding:
+            continue
+        if not _is_compact_axis_tick_char(char, rect):
+            continue
+        candidates.append(char)
+    return candidates
+
+
+def _is_axis_tick_char_text(text: str) -> bool:
+    if len(text) != 1:
+        return False
+    return text.isdigit() or text in {".", "+", "-", "−"}
+
+
+def _is_compact_axis_tick_char(char: Any, rect: tuple[float, float, float, float]) -> bool:
+    width = rect[2] - rect[0]
+    height = rect[3] - rect[1]
+    if width <= 0 or height <= 0 or width > 10.0 or height > 8.0:
+        return False
+    font_size = float(getattr(getattr(char, "pdf_style", None), "font_size", 0) or 0)
+    return 0 < font_size <= 5.5
+
+
+def _axis_tick_columns(chars: list[Any]) -> list[list[Any]]:
+    columns: list[list[tuple[float, Any]]] = []
+    for char in sorted(chars, key=lambda item: (_char_center_x(item), _char_center_y(item))):
+        center_x = _char_center_x(char)
+        matched: list[tuple[float, Any]] | None = None
+        for column in columns:
+            column_x = sum(item[0] for item in column) / len(column)
+            if abs(center_x - column_x) <= 3.0:
+                matched = column
+                break
+        if matched is None:
+            columns.append([(center_x, char)])
+        else:
+            matched.append((center_x, char))
+    return [[char for _center_x, char in column] for column in columns]
+
+
+def _is_axis_tick_column(group: list[Any], label_rect: tuple[float, float, float, float]) -> bool:
+    if not 4 <= len(group) <= 7:
+        return False
+    rect = _char_group_rect(group)
+    if rect is None:
+        return False
+    width = rect[2] - rect[0]
+    height = rect[3] - rect[1]
+    if height < 10.0 or height < width * 1.8:
+        return False
+    if rect[1] < label_rect[3] - 1.0 or rect[3] > label_rect[3] + 36.0:
+        return False
+    text = unicodedata.normalize("NFKC", _char_group_text(group)).replace("−", "-")
+    text = _SPACE_COLLAPSE_RE.sub("", text)
+    return bool(re.fullmatch(r"[+-]?(?:\d\.\d{2,4}|\d{4,5})", text))
+
+
+def _char_center_x(char: Any) -> float:
+    rect = _box_rect(getattr(char, "box", None))
+    if rect is None:
+        return math.inf
+    return (rect[0] + rect[2]) / 2
+
+
+def _char_center_y(char: Any) -> float:
+    rect = _box_rect(getattr(char, "box", None))
+    if rect is None:
+        return math.inf
+    return (rect[1] + rect[3]) / 2
 
 
 def _char_group_text(group: list[Any]) -> str:
