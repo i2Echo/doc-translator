@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from doc_translator.hook_policy import HookPolicy
+
 
 _NUMERIC_OR_SYMBOL_RE = re.compile(r"^[^A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+$")
 _PAGE_NUMBER_RE = re.compile(r"^(?:page\s*)?\d{1,4}(?:\s*/\s*\d{1,4})?$", re.IGNORECASE)
@@ -71,7 +73,7 @@ _AXIS_LABEL_TEXT_RE = re.compile(
     r"(?:\s+of\s+FSR)?\)$"
 )
 _TECHNICAL_IDENTIFIER_RE = re.compile(
-    r"\b(?:VDD|VSS|VCC|VREF|VIN|VOUT|VIH|VIL|VOH|VOL|GND|IOL|IOH|ISINK|IL|IH|TA|TJ|TS|TSTG|FCM|DR|PGA|ADC|I2C|UART|SCL|SDA|ADDR|TTL|DIV|FS|LSB|PPM)\b",
+    r"\b(?:VDD|VSS|VCC|VREF|VIN|VOUT|VIH|VIL|VOH|VOL|GND|IOL|IOH|ISINK|IL|IH|TA|TJ|TS|TSTG|FCM|DR|PGA|ADC|I2C|UART|SCL|SDA|ADDR|ALERT|RDY|GPIO|TTL|DIV|FS|LSB|PPM)\b",
     re.IGNORECASE,
 )
 _TECHNICAL_COMPOUND_IDENTIFIER_RE = re.compile(
@@ -105,6 +107,19 @@ _VERTICAL_AXIS_LABEL_PUNCT_ADVANCE_RATIO = 0.58
 _VERTICAL_AXIS_LABEL_SPACE_ADVANCE_RATIO = 0.42
 _VERTICAL_AXIS_LABEL_INTER_CHAR_GAP_RATIO = 0.08
 _VERTICAL_AXIS_LABEL_CROSS_PADDING = 0.35
+_LAYOUT_MIN_COLUMN_CANDIDATES = 3
+_LAYOUT_MIN_TWO_COLUMN_CANDIDATES = 6
+_LAYOUT_TWO_COLUMN_MIN_GAP_POINTS = 36.0
+_LAYOUT_TWO_COLUMN_MIN_GAP_PAGE_RATIO = 0.16
+_LAYOUT_MIN_RECORDS_PER_COLUMN = 3
+_LAYOUT_COLUMN_TOLERANCE_POINTS = 6.0
+_LAYOUT_COLUMN_TOLERANCE_RATIO = 0.08
+_LAYOUT_EDGE_CONFIDENCE = 0.9
+_LAYOUT_VERTICAL_LABEL_CONFIDENCE = 0.82
+_LAYOUT_TABLE_CONFIDENCE = 0.72
+_LAYOUT_FIGURE_CONFIDENCE = 0.66
+_LAYOUT_TWO_COLUMN_BODY_CONFIDENCE = 0.74
+_LAYOUT_SINGLE_COLUMN_BODY_CONFIDENCE = 0.64
 _TECHNICAL_UPPER_TOKENS = frozenset(
     {
         "ADC",
@@ -214,6 +229,49 @@ class _TranslationSnapshot:
     composition: list[Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _LayoutRegion:
+    paragraph_id: str
+    page_number: int
+    region: str
+    column_id: str | None
+    confidence: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PageLayoutSummary:
+    page_number: int
+    columns: tuple[tuple[str, float, float], ...]
+    counts: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _OverlapCollapseCluster:
+    ordered_group: tuple[tuple[int, Any], ...]
+    base_index: int
+    base: Any
+    absorbed_indices: tuple[int, ...]
+    merged_text: str
+    merged_rect: tuple[float, float, float, float]
+
+
+def _structure_plan_role_counts(plan: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in plan:
+        roles = []
+        for key in ("role", "left_role", "right_role"):
+            role = item.get(key)
+            if role:
+                roles.append(str(role))
+        multiplier = 1
+        if item.get("kind") == "reconcile" and isinstance(item.get("follower_ids"), list):
+            multiplier = max(len(item["follower_ids"]), 1)
+        for role in roles or ["unknown"]:
+            counts[role] = counts.get(role, 0) + multiplier
+    return counts
+
+
 @dataclass(slots=True)
 class BabeldocHookContext:
     working_dir: Path | None = None
@@ -222,8 +280,11 @@ class BabeldocHookContext:
     records_by_object_id: dict[int, _ParagraphRecord] = field(default_factory=dict)
     paragraphs_by_id: dict[str, Any] = field(default_factory=dict)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    layout_regions_by_id: dict[str, _LayoutRegion] = field(default_factory=dict)
+    page_layout_summaries: dict[int, _PageLayoutSummary] = field(default_factory=dict)
     phase_events: list[dict[str, Any]] = field(default_factory=list)
     applied_events: list[dict[str, Any]] = field(default_factory=list)
+    hook_policy: HookPolicy = field(default_factory=HookPolicy.from_env)
     axis_diagnostics: dict[str, list[dict[str, Any]]] = field(
         default_factory=lambda: {"paragraph_candidates": [], "character_groups": []}
     )
@@ -237,6 +298,8 @@ class BabeldocHookContext:
     _fallback_line_protected_bands: set[str] = field(default_factory=set)
     _postprocess_focus_paragraph_ids: set[int] = field(default_factory=set)
     _definition_style_restored_paragraph_ids: set[int] = field(default_factory=set)
+    _symbol_font_ids_by_paragraph_object_id: dict[int, frozenset[str]] = field(default_factory=dict)
+    _detached_i2c_visual_record_ids: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reconciled: bool = False
 
@@ -261,11 +324,115 @@ class BabeldocHookContext:
     def _needs_scoped_postprocess(self, paragraph: Any) -> bool:
         return id(paragraph) in self._postprocess_focus_paragraph_ids
 
+    def _record_action(
+        self,
+        action: str,
+        *,
+        rule_key: str,
+        decision: str,
+        reason: str | None = None,
+        role: str | None = None,
+        region: str | None = None,
+        samples: list[dict[str, Any]] | None = None,
+        **counts: Any,
+    ) -> None:
+        """Append a unified sidecar action event.
+
+        Every structure/style/render/text action goes through this helper so the
+        sidecar carries a consistent ``decision``/``rule_kind``/``rule_key``
+        triple on every entry (convergence plan M1a/M2).  ``decision`` is one of
+        ``applied`` / ``observed`` / ``rejected`` / ``skipped``.  Extra per-rule
+        counters (``pairs``, ``paragraphs``, ``runs`` ...) are forwarded via
+        ``counts`` and merged into the payload.
+        """
+
+        payload: dict[str, Any] = {
+            "action": action,
+            "rule_key": rule_key,
+            "rule_kind": self.hook_policy.kind(rule_key),
+            "decision": decision,
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        if role is not None:
+            payload["role"] = role
+        if region is not None:
+            payload["region"] = region
+        if samples is not None:
+            payload["samples"] = samples
+        for key, value in counts.items():
+            payload[key] = value
+        self.applied_events.append(payload)
+
+    def _emit_observed_plan(
+        self,
+        action: str,
+        *,
+        rule_key: str,
+        plan: list[dict[str, Any]],
+        sample_limit: int = 8,
+    ) -> None:
+        """Record an ``observe``-mode plan batch without mutating the document.
+
+        Each plan item carries a ``kind`` (``merge`` / ``split`` / ``remove`` /
+        ``collapse`` / ``reconcile`` / ``reject``) plus a human-readable
+        ``reason`` and the paragraph role(s) involved, so the sidecar explains
+        what the rule *would* have done under ``apply``.
+        """
+
+        if not plan:
+            return
+        samples = [
+            {k: v for k, v in item.items() if k != "paragraph"}
+            for item in plan[:sample_limit]
+        ]
+        by_kind: dict[str, int] = {}
+        for item in plan:
+            by_kind[item.get("kind", "unknown")] = by_kind.get(item.get("kind", "unknown"), 0) + 1
+        self._record_action(
+            action,
+            rule_key=rule_key,
+            decision="observed",
+            samples=samples,
+            plan_total=len(plan),
+            plan_by_kind=by_kind,
+            role_counts=_structure_plan_role_counts(plan),
+        )
+
+    def _emit_rejected_plan(
+        self,
+        action: str,
+        *,
+        rule_key: str,
+        plan: list[dict[str, Any]],
+        sample_limit: int = 8,
+    ) -> None:
+        rejected = [item for item in plan if item.get("guard_decision") == "rejected"]
+        if not rejected:
+            return
+        samples = [
+            {k: v for k, v in item.items() if k != "paragraph"}
+            for item in rejected[:sample_limit]
+        ]
+        self._record_action(
+            action,
+            rule_key=rule_key,
+            decision="rejected",
+            reason="layout_guard",
+            samples=samples,
+            plan_total=len(rejected),
+            role_counts=_structure_plan_role_counts(rejected),
+        )
+
+    def _allowed_plan_items(self, plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [item for item in plan if item.get("guard_decision") != "rejected"]
+
     def classify_document(self, document: Any) -> None:
         records = self._collect_records(document)
         self.records_by_id = {record.paragraph_id: record for record in records}
         self.records_by_object_id = {record.object_id: record for record in records}
         self._fallback_line_protected_bands = _detect_fallback_line_underscore_bands(records)
+        schematic_label_ids = _detect_schematic_figure_label_ids(records)
         vertical_fragment_ids = _detect_vertical_label_fragment_ids(records)
 
         for record in records:
@@ -278,6 +445,9 @@ class BabeldocHookContext:
             if record.paragraph_id in self._fallback_line_protected_bands:
                 _mark(record, "preserved_token", "preserve", 0.98, ("fallback line underscore technical band",))
                 continue
+            if record.paragraph_id in schematic_label_ids:
+                _mark(record, "preserved_token", "preserve", 0.96, ("schematic figure fallback label",))
+                continue
             if _is_preserve_candidate(record):
                 _mark(record, "preserved_token", "preserve", 0.97, ("short stable token",))
 
@@ -285,12 +455,14 @@ class BabeldocHookContext:
         self.axis_diagnostics["paragraph_candidates"] = _axis_paragraph_diagnostics(records)
         self._build_toc_alignment(records)
         self._classify_repeated_edge_text(records)
+        self._build_page_layout_summaries(records)
         self.note_phase(
             "classify_document",
             {
                 "paragraphs": len(records),
                 "roles": self._role_counts(),
                 "groups": len(self.groups),
+                "layout_regions": self._layout_region_counts(),
             },
         )
         self._before_structure_snapshot = self._build_structure_snapshot(document, stage="before_translation")
@@ -299,26 +471,26 @@ class BabeldocHookContext:
         record = self._record_for_paragraph(paragraph)
         text = str(getattr(paragraph, "unicode", "") or "")
         if record is not None and record.policy == "preserve":
-            self.applied_events.append(
-                {
-                    "action": "skip_translation",
-                    "paragraph_id": record.paragraph_id,
-                    "role": record.role,
-                    "policy": record.policy,
-                }
+            self._record_action(
+                "skip_translation",
+                rule_key="skip_translation",
+                decision="applied",
+                role=record.role,
+                paragraph_id=record.paragraph_id,
+                policy=record.policy,
             )
             return True
         if not _should_preserve_dynamic_text(text):
             return False
         if record is not None:
             _mark(record, "dynamic_preserve", "preserve", 0.84, ("short numeric/unit axis fragment",))
-        self.applied_events.append(
-            {
-                "action": "skip_translation",
-                "paragraph_id": record.paragraph_id if record is not None else None,
-                "role": record.role if record is not None else "dynamic_preserve",
-                "policy": "preserve",
-            }
+        self._record_action(
+            "skip_translation",
+            rule_key="skip_translation",
+            decision="applied",
+            role=record.role if record is not None else "dynamic_preserve",
+            paragraph_id=record.paragraph_id if record is not None else None,
+            policy="preserve",
         )
         return True
 
@@ -330,19 +502,21 @@ class BabeldocHookContext:
             text = record.text
         elif record.text:
             text = _normalize_translation_input_text(paragraph, record.text, text, translate_input, self.applied_events, record)
+        if record.paragraph_id in self._detached_i2c_visual_record_ids:
+            text = _detached_i2c_semantic_text(text)
         if record.role != "toc_entry":
             protected_text = self._protect_technical_tokens(record, text)
             return protected_text
         toc_parts = _split_toc_entry(text) or _split_toc_entry(record.text)
         if toc_parts is None:
             return text
-        self.applied_events.append(
-            {
-                "action": "translate_toc_title_only",
-                "paragraph_id": record.paragraph_id,
-                "role": record.role,
-                "policy": record.policy,
-            }
+        self._record_action(
+            "translate_toc_title_only",
+            rule_key="translate_toc_title_only",
+            decision="applied",
+            role=record.role,
+            paragraph_id=record.paragraph_id,
+            policy=record.policy,
         )
         return _normalize_toc_title(toc_parts[0])
 
@@ -359,17 +533,19 @@ class BabeldocHookContext:
         if record is not None:
             translated_text = self._restore_protected_tokens(record, translated_text)
             translated_text = self._restore_neighbor_protected_placeholders(record, translated_text)
+            if record.paragraph_id in self._detached_i2c_visual_record_ids:
+                translated_text = _detached_i2c_visual_text(translated_text)
             if _has_inline_numbered_markers(record.text):
                 translated_text = _strip_babeldoc_style_placeholders(translated_text)
         restored_text = _restore_source_line_breaks(source_text, translated_text)
         if restored_text != translated_text and record is not None:
-            self.applied_events.append(
-                {
-                    "action": "restore_source_line_breaks",
-                    "paragraph_id": record.paragraph_id,
-                    "role": record.role,
-                    "policy": record.policy,
-                }
+            self._record_action(
+                "restore_source_line_breaks",
+                rule_key="restore_source_line_breaks",
+                decision="applied",
+                role=record.role,
+                paragraph_id=record.paragraph_id,
+                policy=record.policy,
             )
         return restored_text
 
@@ -378,13 +554,13 @@ class BabeldocHookContext:
         if not protected:
             return text
         self._protected_tokens[record.paragraph_id] = protected
-        self.applied_events.append(
-            {
-                "action": "protect_technical_tokens",
-                "paragraph_id": record.paragraph_id,
-                "role": record.role,
-                "count": len(protected),
-            }
+        self._record_action(
+            "protect_technical_tokens",
+            rule_key="protect_technical_tokens",
+            decision="applied",
+            role=record.role,
+            paragraph_id=record.paragraph_id,
+            count=len(protected),
         )
         return protected_text
 
@@ -398,12 +574,12 @@ class BabeldocHookContext:
                 for font in getattr(xobj, "pdf_font", []) or []:
                     updated += _normalize_pdf_font_traits(font, samples)
         if updated:
-            self.applied_events.append(
-                {
-                    "action": "normalize_pdf_font_traits",
-                    "fonts": updated,
-                    "samples": samples[:8],
-                }
+            self._record_action(
+                "normalize_pdf_font_traits",
+                rule_key="normalize_pdf_font_traits",
+                decision="applied",
+                samples=samples[:8],
+                fonts=updated,
             )
 
     def _restore_protected_tokens(self, record: _ParagraphRecord, translated_text: str) -> str:
@@ -453,13 +629,13 @@ class BabeldocHookContext:
             restored_pairs.append((placeholder, replacement))
 
         if restored_pairs:
-            self.applied_events.append(
-                {
-                    "action": "restore_neighbor_protected_placeholders",
-                    "paragraph_id": record.paragraph_id,
-                    "page_number": record.page_number,
-                    "restored": restored_pairs,
-                }
+            self._record_action(
+                "restore_neighbor_protected_placeholders",
+                rule_key="restore_neighbor_protected_placeholders",
+                decision="applied",
+                paragraph_id=record.paragraph_id,
+                page_number=record.page_number,
+                restored=restored_pairs,
             )
         return resolved
 
@@ -494,14 +670,14 @@ class BabeldocHookContext:
         if not restored:
             return False
         self._definition_style_restored_paragraph_ids.add(id(paragraph))
-        self.applied_events.append(
-            {
-                "action": "restore_definition_line_styles_after_translation",
-                "paragraph_id": record.paragraph_id,
-                "role": record.role,
-                "layout_label": record.layout_label,
-                "text": str(getattr(paragraph, "unicode", "") or "")[:180],
-            }
+        self._record_action(
+            "restore_definition_line_styles_after_translation",
+            rule_key="restore_definition_line_styles_after_translation",
+            decision="applied",
+            role=record.role,
+            paragraph_id=record.paragraph_id,
+            layout_label=record.layout_label,
+            text=str(getattr(paragraph, "unicode", "") or "")[:180],
         )
         return True
 
@@ -520,11 +696,11 @@ class BabeldocHookContext:
                 paragraph.optimal_scale = 1.0
                 restored += 1
         if restored:
-            self.applied_events.append(
-                {
-                    "action": "restore_vertical_passthrough_layout",
-                    "count": restored,
-                }
+            self._record_action(
+                "restore_vertical_passthrough_layout",
+                rule_key="restore_vertical_passthrough_layout",
+                decision="applied",
+                count=restored,
             )
 
     def _should_skip_page_level_axis_group(
@@ -593,8 +769,36 @@ class BabeldocHookContext:
         return matched_chars >= 4 and len(matched_non_axis_records) >= 2
 
     def collapse_overlapping_same_baseline_fragments_before_translation(self, document: Any) -> bool:
-        collapsed = 0
-        samples = []
+        rule_key = "collapse_overlap"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_collapse_overlap(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "collapse_overlapping_same_baseline_fragments_before_translation",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return False
+        self._emit_rejected_plan(
+            "collapse_overlapping_same_baseline_fragments_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_collapse_overlap(document, self._allowed_plan_items(plan))
+
+    def _plan_collapse_overlap(self, document: Any) -> list[dict[str, Any]]:
+        """Read-only: list overlapping-baseline clusters that would be collapsed.
+
+        The absorb decision reuses the same rect/text helpers as the legacy
+        apply path, so observe and apply agree on what gets merged.  Paragraphs
+        are linked by ``paragraph_id`` (stable across plan/apply) rather than by
+        list index, which would shift once removals start.
+        """
+
+        plan: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
             paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
             if len(paragraphs) < 3:
@@ -604,58 +808,72 @@ class BabeldocHookContext:
                 continue
             removed_indices: set[int] = set()
             for group in groups:
-                live_group = [(index, paragraphs[index]) for index in group if index not in removed_indices]
-                if not _looks_like_overlapping_fragment_cluster(live_group):
+                cluster = _build_overlap_collapse_cluster(paragraphs, group, removed_indices)
+                if cluster is None:
                     continue
-                ordered_group = sorted(
-                    live_group,
-                    key=lambda item: (_box_rect(getattr(item[1], "box", None)) or (math.inf, math.inf, math.inf, math.inf))[0],
-                )
-                base_index, base = _overlapping_fragment_anchor(ordered_group)
-                before_texts = [str(getattr(paragraph, "unicode", "") or "")[:80] for _index, paragraph in ordered_group]
-                merged_text = ""
-                merged_rect = None
-                merged_composition = []
-                absorbed_indices: list[int] = []
-                for candidate_index, candidate in ordered_group:
-                    candidate_rect = _box_rect(getattr(candidate, "box", None))
-                    if candidate_rect is None:
+                base_record = self._record_for_paragraph(cluster.base)
+                absorbed_records = [
+                    self._record_for_paragraph(paragraphs[index])
+                    for index in cluster.absorbed_indices
+                    if index != cluster.base_index
+                ]
+                item = {
+                    "kind": "collapse",
+                    "base_id": base_record.paragraph_id if base_record else None,
+                    "role": base_record.role if base_record else "body",
+                    "absorbed_ids": [r.paragraph_id for r in absorbed_records if r is not None],
+                    "reason": "overlapping_same_baseline_cluster",
+                    "before": [str(getattr(paragraph, "unicode", "") or "")[:80] for _index, paragraph in cluster.ordered_group],
+                    "after": cluster.merged_text[:160],
+                    "rect": cluster.merged_rect,
+                }
+                item.update(self._guard_collapse_records(base_record, absorbed_records))
+                plan.append(item)
+                for candidate_index in cluster.absorbed_indices:
+                    if candidate_index == cluster.base_index:
                         continue
-                    if merged_rect is None:
-                        merged_text = str(getattr(candidate, "unicode", "") or "")
-                        merged_rect = candidate_rect
-                        merged_composition = list(getattr(candidate, "pdf_paragraph_composition", []) or [])
-                        absorbed_indices.append(candidate_index)
-                        continue
-                    if not _should_absorb_overlapping_rect_fragment(merged_rect, candidate_rect):
-                        continue
-                    merged_text = _merged_text_with_overlap(
-                        merged_text,
-                        str(getattr(candidate, "unicode", "") or ""),
-                        merged_rect,
-                        candidate_rect,
-                    )
-                    merged_rect = _rect_union([merged_rect, candidate_rect]) or merged_rect
-                    merged_composition.extend(list(getattr(candidate, "pdf_paragraph_composition", []) or []))
-                    absorbed_indices.append(candidate_index)
-                if len(absorbed_indices) < 3 or merged_rect is None:
+                    removed_indices.add(candidate_index)
+        return plan
+
+    def _apply_collapse_overlap(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        base_ids = {item["base_id"] for item in plan if item.get("base_id")}
+        absorbed_ids = {pid for item in plan for pid in item.get("absorbed_ids", [])}
+        if not base_ids or not absorbed_ids:
+            return False
+        collapsed = 0
+        samples: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 3:
+                continue
+            groups = _group_overlapping_same_baseline_paragraphs(paragraphs)
+            if not groups:
+                continue
+            removed_indices: set[int] = set()
+            for group in groups:
+                cluster = _build_overlap_collapse_cluster(paragraphs, group, removed_indices)
+                if cluster is None:
                     continue
-                base.unicode = merged_text
-                _set_box_rect(getattr(base, "box", None), merged_rect)
-                _set_plain_unicode_paragraph_text(base, merged_text)
-                base.optimal_scale = None
-                self._focus_postprocess_paragraph(base)
-                for candidate_index in absorbed_indices:
-                    if candidate_index == base_index:
+                base_record = self._record_for_paragraph(cluster.base)
+                if base_record is None or base_record.paragraph_id not in base_ids:
+                    continue
+                before_texts = [str(getattr(paragraph, "unicode", "") or "")[:80] for _index, paragraph in cluster.ordered_group]
+                cluster.base.unicode = cluster.merged_text
+                _set_box_rect(getattr(cluster.base, "box", None), cluster.merged_rect)
+                _set_plain_unicode_paragraph_text(cluster.base, cluster.merged_text)
+                cluster.base.optimal_scale = None
+                self._focus_postprocess_paragraph(cluster.base)
+                for candidate_index in cluster.absorbed_indices:
+                    if candidate_index == cluster.base_index:
                         continue
                     removed_indices.add(candidate_index)
                     collapsed += 1
-                if len(samples) < 8 and any(index in removed_indices for index, _paragraph in ordered_group if index != base_index):
+                if len(samples) < 8 and any(index in removed_indices for index, _paragraph in cluster.ordered_group if index != cluster.base_index):
                     samples.append(
                         {
                             "before": before_texts,
-                            "after": str(getattr(base, "unicode", "") or "")[:160],
-                            "rect": _box_rect(getattr(base, "box", None)),
+                            "after": str(getattr(cluster.base, "unicode", "") or "")[:160],
+                            "rect": _box_rect(getattr(cluster.base, "box", None)),
                         }
                     )
             if removed_indices:
@@ -665,28 +883,122 @@ class BabeldocHookContext:
                     if paragraph_index not in removed_indices
                 ]
         if collapsed:
-            self.applied_events.append(
-                {
-                    "action": "collapse_overlapping_same_baseline_fragments_before_translation",
-                    "pairs": collapsed,
-                    "samples": samples,
-                }
+            self._record_action(
+                "collapse_overlapping_same_baseline_fragments_before_translation",
+                rule_key="collapse_overlap",
+                decision="applied",
+                pairs=collapsed,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
             )
         return collapsed > 0
 
     def normalize_fragmented_paragraphs_before_translation(self, document: Any) -> bool:
+        rule_key = "normalize_fragmented"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_normalize_fragmented(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "split_multiline_paragraphs_before_translation",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return False
+        self._emit_rejected_plan(
+            "split_multiline_paragraphs_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_normalize_fragmented(document, self._allowed_plan_items(plan))
+
+    def _plan_normalize_fragmented(self, document: Any) -> list[dict[str, Any]]:
+        """Read-only: list every paragraph that would be split into visual lines.
+
+        Only ``fallback_line`` paragraphs are eligible (see
+        ``_supports_visual_line_split``).  A real multi-line prose body block is
+        explicitly marked ``reason=multiline_body_block`` so observe mode never
+        splits ordinary body text (convergence plan M1b §B3).
+        """
+
+        return self._plan_observe_multiline_body_blocks(document) + self._plan_split_compact_fallback_labels(document)
+
+    def _plan_observe_multiline_body_blocks(self, document: Any) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            for paragraph in getattr(page, "pdf_paragraph", []) or []:
+                if not _supports_visual_line_split(paragraph):
+                    continue
+                record = self._record_for_paragraph(paragraph)
+                rect = _box_rect(getattr(paragraph, "box", None))
+                text = str(getattr(paragraph, "unicode", "") or "")
+                if rect is None or record is None:
+                    continue
+                if not _looks_like_multiline_prose_block(paragraph, rect, text):
+                    continue
+                item = {
+                    "kind": "split",
+                    "paragraph_id": record.paragraph_id,
+                    "role": record.role,
+                    "reason": "multiline_body_block",
+                    "source": text[:120],
+                }
+                item.update(self._guard_split_record(record, "multiline_body_block"))
+                plan.append(item)
+        return plan
+
+    def _plan_split_compact_fallback_labels(self, document: Any) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            for paragraph in getattr(page, "pdf_paragraph", []) or []:
+                if not _supports_visual_line_split(paragraph):
+                    continue
+                record = self._record_for_paragraph(paragraph)
+                text = str(getattr(paragraph, "unicode", "") or "")
+                parts = _split_paragraph_by_visual_lines(
+                    paragraph,
+                    symbol_font_ids=self._symbol_font_ids_by_paragraph_object_id.get(id(paragraph), frozenset()),
+                )
+                if len(parts) <= 1:
+                    continue
+                item = {
+                    "kind": "split",
+                    "paragraph_id": record.paragraph_id if record else None,
+                    "role": record.role if record else "body",
+                    "reason": "fallback_line_visual_split",
+                    "source": text[:120],
+                    "parts": [str(getattr(part, "unicode", "") or "")[:80] for part in parts],
+                }
+                item.update(self._guard_split_record(record, "fallback_line_visual_split"))
+                plan.append(item)
+        return plan
+
+    def _apply_normalize_fragmented(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        eligible_ids = {
+            item["paragraph_id"]
+            for item in plan
+            if item.get("reason") == "fallback_line_visual_split" and item.get("paragraph_id")
+        }
+        if not eligible_ids:
+            return False
         split_lines = 0
-        split_samples = []
+        split_samples: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
             paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
             if not paragraphs:
                 continue
-            rewritten = []
+            rewritten: list[Any] = []
             for paragraph in paragraphs:
-                if not _supports_visual_line_split(paragraph):
+                record = self._record_for_paragraph(paragraph)
+                if record is None or record.paragraph_id not in eligible_ids:
                     rewritten.append(paragraph)
                     continue
-                parts = _split_paragraph_by_visual_lines(paragraph)
+                parts = _split_paragraph_by_visual_lines(
+                    paragraph,
+                    symbol_font_ids=self._symbol_font_ids_by_paragraph_object_id.get(id(paragraph), frozenset()),
+                )
                 rewritten.extend(parts)
                 if len(parts) <= 1:
                     continue
@@ -702,228 +1014,471 @@ class BabeldocHookContext:
                     )
             page.pdf_paragraph = rewritten
         if split_lines:
-            self.applied_events.append(
-                {
-                    "action": "split_multiline_paragraphs_before_translation",
-                    "paragraphs": split_lines,
-                    "samples": split_samples,
-                }
+            self._record_action(
+                "split_multiline_paragraphs_before_translation",
+                rule_key="normalize_fragmented",
+                decision="applied",
+                paragraphs=split_lines,
+                samples=split_samples,
+                role_counts=_structure_plan_role_counts(
+                    [item for item in plan if item.get("paragraph_id") in eligible_ids]
+                ),
             )
         return split_lines > 0
 
-    def remove_subsumed_same_line_duplicates_before_translation(self, document: Any) -> bool:
-        removed = 0
-        samples = []
-        for page in getattr(document, "page", []) or []:
-            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
-            if len(paragraphs) < 2:
-                continue
-            removed_indices: set[int] = set()
-            for candidate_index, candidate in enumerate(paragraphs):
-                if candidate_index in removed_indices:
-                    continue
-                anchor_index = _find_subsuming_same_line_anchor(paragraphs, candidate_index, removed_indices)
-                if anchor_index is None:
-                    continue
-                removed_indices.add(candidate_index)
-                self._focus_postprocess_paragraph(paragraphs[anchor_index])
-                removed += 1
-                if len(samples) < 8:
-                    samples.append(
-                        {
-                            "anchor": str(getattr(paragraphs[anchor_index], "unicode", "") or "")[:120],
-                            "duplicate": str(getattr(candidate, "unicode", "") or "")[:120],
-                            "rect": _box_rect(getattr(candidate, "box", None)),
-                        }
-                    )
-            if removed_indices:
-                page.pdf_paragraph = [
-                    paragraph
-                    for paragraph_index, paragraph in enumerate(paragraphs)
-                    if paragraph_index not in removed_indices
-                ]
-        if removed:
-            self.applied_events.append(
-                {
-                    "action": "remove_subsumed_same_line_duplicates_before_translation",
-                    "paragraphs": removed,
-                    "samples": samples,
-                }
+    def merge_same_line_fragment_bridges_before_translation(self, document: Any) -> bool:
+        rule_key = "merge_same_line_fragment_bridge"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_merge_same_line_fragment_bridges(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "merge_same_line_fragment_bridges_before_translation",
+                rule_key=rule_key,
+                plan=plan,
             )
-        return removed > 0
+            return False
+        self._emit_rejected_plan(
+            "merge_same_line_fragment_bridges_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_merge_same_line_fragment_bridges(document, self._allowed_plan_items(plan))
 
-    def split_fallback_line_technical_token_runs_before_translation(self, document: Any) -> bool:
-        split_runs = 0
-        samples = []
+    def _plan_merge_same_line_fragment_bridges(self, document: Any) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
-            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
-            if len(paragraphs) < 3:
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(getattr(page, "pdf_paragraph", []) or [])
+            ]
+            if len(ordered_items) < 2:
                 continue
-            rewritten: list[Any] = []
-            for index, paragraph in enumerate(paragraphs):
-                token_parts = _fallback_line_split_tokens_with_underscore_context(paragraph, paragraphs, index)
-                if len(token_parts) <= 1:
-                    rewritten.append(paragraph)
-                    continue
-                rewritten.extend(token_parts)
-                split_runs += 1
-                if len(samples) < 10:
-                    samples.append(
-                        {
-                            "source": str(getattr(paragraph, "unicode", "") or "")[:80],
-                            "parts": [str(getattr(part, "unicode", "") or "")[:40] for part in token_parts],
-                            "rect": _box_rect(getattr(paragraph, "box", None)),
-                        }
-                    )
-            page.pdf_paragraph = rewritten
-        if split_runs:
-            self.applied_events.append(
-                {
-                    "action": "split_fallback_line_technical_token_runs_before_translation",
-                    "paragraphs": split_runs,
-                    "samples": samples,
-                }
-            )
-        return split_runs > 0
-
-    def merge_fallback_line_underscore_compounds_before_translation(self, document: Any) -> bool:
-        merged = 0
-        samples = []
-        for page in getattr(document, "page", []) or []:
-            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
-            if len(paragraphs) < 3:
-                continue
-            ordered_items = [(paragraph, original_index) for original_index, paragraph in enumerate(paragraphs)]
             ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
-            removed_indices: set[int] = set()
-            for index in range(len(ordered_items) - 2):
-                if any(candidate_index in removed_indices for candidate_index in range(index, index + 3)):
+            restore: list[tuple[Any, str, list[Any], Any, tuple[float, float, float, float] | None, Any]] = []
+            consumed_indices: set[int] = set()
+            index = 0
+            while index < len(ordered_items):
+                if index in consumed_indices:
+                    index += 1
                     continue
-                left, left_original = ordered_items[index]
-                middle, middle_original = ordered_items[index + 1]
-                right, right_original = ordered_items[index + 2]
-                if not _can_merge_fallback_line_underscore_compound(left, middle, right):
-                    continue
-                _merge_paragraphs(left, middle, separator="")
-                _merge_paragraphs(left, right, separator="")
-                removed_indices.update({middle_original, right_original})
-                merged += 1
-                if len(samples) < 12:
-                    samples.append(
-                        {
-                            "parts": [
-                                str(getattr(left, "unicode", "") or "")[:32],
-                                str(getattr(middle, "unicode", "") or "")[:8],
-                                str(getattr(right, "unicode", "") or "")[:32],
-                            ],
-                            "merged": str(getattr(left, "unicode", "") or "")[:64],
-                            "rect": _box_rect(getattr(left, "box", None)),
-                        }
+                current, _current_original_index = ordered_items[index]
+                self._snapshot_for_restore(current, restore)
+                while True:
+                    candidate_index = self._best_same_line_fragment_bridge_candidate(
+                        current,
+                        index,
+                        ordered_items,
+                        consumed_indices,
                     )
-            if removed_indices:
-                page.pdf_paragraph = [
-                    paragraph
-                    for paragraph_index, paragraph in enumerate(paragraphs)
-                    if paragraph_index not in removed_indices
-                ]
+                    if candidate_index is None:
+                        break
+                    right, _right_original_index = ordered_items[candidate_index]
+                    decision = self._same_line_fragment_bridge_decision(current, right)
+                    if decision is None:
+                        break
+                    reason, separator = decision
+                    plan.append(self._same_line_fragment_bridge_plan_item(current, right, reason))
+                    _merge_paragraphs(current, right, separator=separator)
+                    consumed_indices.add(candidate_index)
+                index += 1
+            for paragraph, unicode_value, composition, box, rect, optimal_scale in restore:
+                paragraph.unicode = unicode_value
+                paragraph.pdf_paragraph_composition = composition
+                if box is not None:
+                    _set_box_rect(box, rect)
+                if optimal_scale is not None:
+                    paragraph.optimal_scale = optimal_scale
+        return plan
+
+    def _best_same_line_fragment_bridge_candidate(
+        self,
+        current: Any,
+        current_index: int,
+        ordered_items: list[tuple[Any, int]],
+        consumed_indices: set[int],
+    ) -> int | None:
+        current_rect = _box_rect(getattr(current, "box", None))
+        if current_rect is None:
+            return None
+        best: tuple[tuple[float, float, float], int] | None = None
+        for candidate_index, (candidate, _candidate_original_index) in enumerate(ordered_items):
+            if candidate_index == current_index or candidate_index in consumed_indices:
+                continue
+            candidate_rect = _box_rect(getattr(candidate, "box", None))
+            if candidate_rect is None or candidate_rect[0] < current_rect[0]:
+                continue
+            decision = self._same_line_fragment_bridge_decision(current, candidate)
+            if decision is None:
+                continue
+            reason, _separator = decision
+            guard = self._guard_same_line_fragment_bridge(current, candidate, reason)
+            if guard.get("guard_decision") == "rejected":
+                continue
+            gap = max(candidate_rect[0] - current_rect[2], -1.0)
+            priority = 0.0 if reason == "inline_punctuation" else 0.1 if reason == "inline_decimal_continuation" else 1.0
+            score = (priority, gap, candidate_rect[0])
+            if best is None or score < best[0]:
+                best = (score, candidate_index)
+        return None if best is None else best[1]
+
+    def _same_line_fragment_bridge_decision(self, left: Any, right: Any) -> tuple[str, str | None] | None:
+        if getattr(left, "xobj_id", None) != getattr(right, "xobj_id", None):
+            return None
+        right_text = str(getattr(right, "unicode", "") or "")
+        if _looks_like_dot_leader_fragment(right_text):
+            return None
+        left_rect = _box_rect(getattr(left, "box", None))
+        right_rect = _box_rect(getattr(right, "box", None))
+        if left_rect is None or right_rect is None:
+            return None
+        if self._should_attach_inline_punctuation_fragment(left, right):
+            return "inline_punctuation", ""
+        if _looks_like_inline_decimal_continuation(left, right):
+            return "inline_decimal_continuation", ""
+        if _looks_like_inline_broken_word_continuation(
+            str(getattr(left, "unicode", "") or ""),
+            str(getattr(right, "unicode", "") or ""),
+            left_rect,
+            right_rect,
+        ):
+            baseline_ok, _reason = _same_baseline_close_gap(left_rect, right_rect)
+            if baseline_ok:
+                return "broken_word_continuation", ""
+        if _looks_like_inline_micro_fragment_continuation(left, right) and self._has_mixed_region_micro_fragment_context(left, right):
+            return "inline_micro_fragment_continuation", ""
+        return None
+
+    def _has_mixed_region_micro_fragment_context(self, left: Any, right: Any) -> bool:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        left_region = self._record_layout_region(left_record)
+        right_region = self._record_layout_region(right_record)
+        if left_record is None or right_record is None or left_region is None or right_region is None:
+            return False
+        regions = {left_region.region, right_region.region}
+        if not regions <= {"body_column", "table", "unknown"}:
+            return False
+        return "table" in regions or "unknown" in regions
+
+    def _same_line_fragment_bridge_plan_item(self, left: Any, right: Any, reason: str) -> dict[str, Any]:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        item = {
+            "kind": "merge",
+            "left_id": left_record.paragraph_id if left_record else None,
+            "right_id": right_record.paragraph_id if right_record else None,
+            "left_role": left_record.role if left_record else "body",
+            "right_role": right_record.role if right_record else "body",
+            "reason": reason,
+            "left": str(getattr(left, "unicode", "") or "")[:80],
+            "right": str(getattr(right, "unicode", "") or "")[:80],
+            "rect": _box_rect(getattr(left, "box", None)),
+        }
+        item.update(self._guard_same_line_fragment_bridge(left, right, reason))
+        return item
+
+    def _guard_same_line_fragment_bridge(self, left: Any, right: Any, reason: str) -> dict[str, Any]:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        guard = self._guard_merge_records(left_record, right_record)
+        if guard.get("guard_decision") == "allowed":
+            return guard
+        if reason not in {
+            "inline_punctuation",
+            "inline_decimal_continuation",
+            "broken_word_continuation",
+            "inline_micro_fragment_continuation",
+        }:
+            return guard
+        left_region = self._record_layout_region(left_record)
+        right_region = self._record_layout_region(right_record)
+        if left_record is None or right_record is None or left_region is None or right_region is None:
+            return guard
+        left_rect = _box_rect(getattr(left, "box", None))
+        right_rect = _box_rect(getattr(right, "box", None))
+        if left_rect is None or right_rect is None:
+            return guard
+        baseline_ok, _baseline_reason = _same_baseline_close_gap(left_rect, right_rect)
+        if not baseline_ok:
+            return guard
+        if (
+            guard.get("guard_reason") == "unknown_region"
+            and left_region.region == "body_column"
+            and right_region.region == "unknown"
+            and right_record.role in {"body", "preserved_token"}
+        ):
+            return guard | {"guard_decision": "allowed", "guard_reason": "same_body_column_inline_bridge"}
+        if (
+            reason == "broken_word_continuation"
+            and guard.get("guard_reason") == "cross_column"
+            and left_region.region == "body_column"
+            and right_region.region == "body_column"
+            and _is_tight_inline_join(left_rect, right_rect)
+        ):
+            return guard | {"guard_decision": "allowed", "guard_reason": "tight_inline_column_boundary_bridge"}
+        if (
+            guard.get("guard_reason") in {"non_body_region", "unknown_region"}
+            and left_region.region in {"body_column", "table", "unknown"}
+            and right_region.region in {"body_column", "table", "unknown"}
+            and _looks_like_inline_micro_fragment_continuation(left, right)
+        ):
+            return guard | {"guard_decision": "allowed", "guard_reason": "dense_same_line_micro_fragment_bridge"}
+        if self._looks_like_safe_mixed_region_same_line_continuation(left, right):
+            return guard | {"guard_decision": "allowed", "guard_reason": "mixed_region_same_line_text_continuation"}
+        return guard
+
+    def _looks_like_safe_mixed_region_same_line_continuation(self, left: Any, right: Any) -> bool:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        left_region = self._record_layout_region(left_record)
+        right_region = self._record_layout_region(right_record)
+        if left_record is None or right_record is None or left_region is None or right_region is None:
+            return False
+        if left_record.role != "body" or right_record.role != "body":
+            return False
+        if {left_region.region, right_region.region} != {"body_column", "table"}:
+            return False
+        if left_record.page_number != right_record.page_number or left_record.xobj_id != right_record.xobj_id:
+            return False
+        left_rect = _box_rect(getattr(left, "box", None))
+        right_rect = _box_rect(getattr(right, "box", None))
+        if left_rect is None or right_rect is None:
+            return False
+        baseline_ok, _baseline_reason = _same_baseline_close_gap(left_rect, right_rect)
+        if not baseline_ok:
+            return False
+        return _looks_like_same_line_text_continuation(left, right)
+
+    def _apply_merge_same_line_fragment_bridges(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        allowed_pairs = {
+            (item.get("left_id"), item.get("right_id"))
+            for item in plan
+            if item.get("left_id") and item.get("right_id")
+        }
+        plan_by_pair = {
+            (item.get("left_id"), item.get("right_id")): item
+            for item in plan
+            if item.get("left_id") and item.get("right_id")
+        }
+        if not allowed_pairs:
+            return False
+        merged = 0
+        samples: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(getattr(page, "pdf_paragraph", []) or [])
+            ]
+            if len(ordered_items) < 2:
+                continue
+            ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
+            rewritten: list[tuple[int, Any]] = []
+            consumed_indices: set[int] = set()
+            index = 0
+            while index < len(ordered_items):
+                if index in consumed_indices:
+                    index += 1
+                    continue
+                current, current_original_index = ordered_items[index]
+                merged_original_indices = [current_original_index]
+                while True:
+                    candidate_index = self._best_same_line_fragment_bridge_candidate(
+                        current,
+                        index,
+                        ordered_items,
+                        consumed_indices,
+                    )
+                    if candidate_index is None:
+                        break
+                    right, right_original_index = ordered_items[candidate_index]
+                    left_record = self._record_for_paragraph(current)
+                    right_record = self._record_for_paragraph(right)
+                    pair_key = (
+                        left_record.paragraph_id if left_record else None,
+                        right_record.paragraph_id if right_record else None,
+                    )
+                    if pair_key not in allowed_pairs:
+                        break
+                    decision = self._same_line_fragment_bridge_decision(current, right)
+                    if decision is None:
+                        break
+                    _reason, separator = decision
+                    if len(samples) < 8:
+                        samples.append(dict(plan_by_pair.get(pair_key) or _same_line_merge_sample(current, right)))
+                    _merge_paragraphs(current, right, separator=separator)
+                    self._focus_postprocess_paragraph(current)
+                    merged_original_indices.append(right_original_index)
+                    consumed_indices.add(candidate_index)
+                    merged += 1
+                rewritten.append((min(merged_original_indices), current))
+                index += 1
+            rewritten.sort(key=lambda item: item[0])
+            page.pdf_paragraph = [paragraph for _original_index, paragraph in rewritten]
         if merged:
-            self.applied_events.append(
-                {
-                    "action": "merge_fallback_line_underscore_compounds_before_translation",
-                    "pairs": merged,
-                    "samples": samples,
-                }
+            self._record_action(
+                "merge_same_line_fragment_bridges_before_translation",
+                rule_key="merge_same_line_fragment_bridge",
+                decision="applied",
+                pairs=merged,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
             )
         return merged > 0
 
-    def normalize_fallback_line_texts_before_translation(self, document: Any) -> bool:
-        normalized = 0
-        samples = []
-        for page in getattr(document, "page", []) or []:
-            for paragraph in getattr(page, "pdf_paragraph", []) or []:
-                if getattr(paragraph, "layout_label", None) != "fallback_line":
-                    continue
-                rebuilt = _rebuild_fallback_line_text(paragraph)
-                if rebuilt is None:
-                    continue
-                original = str(getattr(paragraph, "unicode", "") or "")
-                if not rebuilt.strip() or rebuilt == original:
-                    continue
-                paragraph.unicode = rebuilt
-                normalized += 1
-                if len(samples) < 10:
-                    samples.append(
-                        {
-                            "before": original[:120],
-                            "after": rebuilt[:120],
-                            "rect": _box_rect(getattr(paragraph, "box", None)),
-                        }
-                    )
-        if normalized:
-            self.applied_events.append(
-                {
-                    "action": "normalize_fallback_line_texts_before_translation",
-                    "paragraphs": normalized,
-                    "samples": samples,
-                }
+    def merge_contiguous_body_lines_before_translation(self, document: Any) -> bool:
+        rule_key = "merge_contiguous_body_lines"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_merge_contiguous_body_lines(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "merge_contiguous_body_lines_before_translation",
+                rule_key=rule_key,
+                plan=plan,
             )
-        return normalized > 0
+            return False
+        self._emit_rejected_plan(
+            "merge_contiguous_body_lines_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_merge_contiguous_body_lines(document, self._allowed_plan_items(plan))
 
-    def merge_fallback_line_fragments_before_translation(self, document: Any) -> bool:
-        merged = 0
-        samples = []
+    def _plan_merge_contiguous_body_lines(self, document: Any) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
             paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
             if len(paragraphs) < 2:
                 continue
-            removed_indices: set[int] = set()
-            for index, fragment in enumerate(paragraphs):
-                if index in removed_indices or not _is_small_fallback_line_fragment(fragment):
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(paragraphs)
+            ]
+            ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
+            restore: list[tuple[Any, str, list[Any], Any, tuple[float, float, float, float] | None, Any]] = []
+            consumed_indices: set[int] = set()
+            index = 0
+            while index < len(ordered_items):
+                if index in consumed_indices:
+                    index += 1
                     continue
-                best_target_index = None
-                best_score = None
-                for target_index, target in enumerate(paragraphs):
-                    if target_index == index or target_index in removed_indices:
-                        continue
-                    score = _fallback_line_fragment_attachment_score(fragment, target)
-                    if score is None or (best_score is not None and score >= best_score):
-                        continue
-                    best_target_index = target_index
-                    best_score = score
-                if best_target_index is None:
-                    continue
-                _merge_paragraphs(paragraphs[best_target_index], fragment, separator="")
-                removed_indices.add(index)
-                merged += 1
-                if len(samples) < 10:
-                    samples.append(
-                        {
-                            "fragment": str(getattr(fragment, "unicode", "") or "")[:40],
-                            "target": str(getattr(paragraphs[best_target_index], "unicode", "") or "")[:80],
-                            "fragment_rect": _box_rect(getattr(fragment, "box", None)),
-                            "target_rect": _box_rect(getattr(paragraphs[best_target_index], "box", None)),
-                        }
+                current, _current_original_index = ordered_items[index]
+                self._snapshot_for_restore(current, restore)
+                while True:
+                    candidate_index = self._best_contiguous_body_line_candidate(
+                        current,
+                        index,
+                        ordered_items,
+                        consumed_indices,
                     )
-            if removed_indices:
-                page.pdf_paragraph = [
-                    paragraph
-                    for paragraph_index, paragraph in enumerate(paragraphs)
-                    if paragraph_index not in removed_indices
-                ]
-        if merged:
-            self.applied_events.append(
-                {
-                    "action": "merge_fallback_line_fragments_before_translation",
-                    "pairs": merged,
-                    "samples": samples,
-                }
-            )
-        return merged > 0
+                    if candidate_index is None:
+                        break
+                    right, _right_original_index = ordered_items[candidate_index]
+                    item = self._contiguous_body_line_plan_item(current, right)
+                    plan.append(item)
+                    if item.get("guard_decision") == "rejected":
+                        break
+                    _merge_paragraphs(current, right, separator=" ")
+                    consumed_indices.add(candidate_index)
+                index += 1
+            for paragraph, unicode_value, composition, box, rect, optimal_scale in restore:
+                paragraph.unicode = unicode_value
+                paragraph.pdf_paragraph_composition = composition
+                if box is not None:
+                    _set_box_rect(box, rect)
+                if optimal_scale is not None:
+                    paragraph.optimal_scale = optimal_scale
+        return plan
 
-    def merge_same_line_fragments_before_translation(self, document: Any) -> bool:
+    def _best_contiguous_body_line_candidate(
+        self,
+        current: Any,
+        current_index: int,
+        ordered_items: list[tuple[Any, int]],
+        consumed_indices: set[int],
+    ) -> int | None:
+        current_rect = _box_rect(getattr(current, "box", None))
+        if current_rect is None:
+            return None
+        best: tuple[tuple[float, float], int] | None = None
+        for candidate_index, (candidate, _candidate_original_index) in enumerate(ordered_items):
+            if candidate_index == current_index or candidate_index in consumed_indices:
+                continue
+            candidate_rect = _box_rect(getattr(candidate, "box", None))
+            if candidate_rect is None:
+                continue
+            if not self._should_merge_contiguous_body_lines(current, candidate):
+                continue
+            vertical_gap = current_rect[1] - candidate_rect[3]
+            score = (abs(vertical_gap), candidate_rect[0])
+            if best is None or score < best[0]:
+                best = (score, candidate_index)
+        return None if best is None else best[1]
+
+    def _should_merge_contiguous_body_lines(self, left: Any, right: Any) -> bool:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        if left_record is None or right_record is None:
+            return False
+        if left_record.role != "body" or right_record.role != "body":
+            return False
+        if left_record.layout_label != "plain text" or right_record.layout_label != "plain text":
+            return False
+        if left_record.page_number != right_record.page_number or left_record.xobj_id != right_record.xobj_id:
+            return False
+        left_region = self._record_layout_region(left_record)
+        right_region = self._record_layout_region(right_record)
+        if (
+            left_region is None
+            or right_region is None
+            or left_region.region != "body_column"
+            or right_region.region != "body_column"
+            or left_region.column_id != right_region.column_id
+        ):
+            return False
+        left_rect = _box_rect(getattr(left, "box", None))
+        right_rect = _box_rect(getattr(right, "box", None))
+        if left_rect is None or right_rect is None:
+            return False
+        return _looks_like_contiguous_body_line_pair(
+            str(getattr(left, "unicode", "") or ""),
+            str(getattr(right, "unicode", "") or ""),
+            left_rect,
+            right_rect,
+        )
+
+    def _contiguous_body_line_plan_item(self, left: Any, right: Any) -> dict[str, Any]:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        item = {
+            "kind": "merge",
+            "left_id": left_record.paragraph_id if left_record else None,
+            "right_id": right_record.paragraph_id if right_record else None,
+            "left_role": left_record.role if left_record else "body",
+            "right_role": right_record.role if right_record else "body",
+            "reason": "contiguous_body_line",
+            "left": str(getattr(left, "unicode", "") or "")[:80],
+            "right": str(getattr(right, "unicode", "") or "")[:80],
+            "rect": _box_rect(getattr(left, "box", None)),
+        }
+        item.update(self._guard_merge_records(left_record, right_record))
+        return item
+
+    def _apply_merge_contiguous_body_lines(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        allowed_pairs = {
+            (item.get("left_id"), item.get("right_id"))
+            for item in plan
+            if item.get("left_id") and item.get("right_id")
+        }
+        if not allowed_pairs:
+            return False
         merged = 0
-        samples = []
-        rejected_samples = []
+        samples: list[dict[str, Any]] = []
         for page in getattr(document, "page", []) or []:
             paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
             if len(paragraphs) < 2:
@@ -943,19 +1498,336 @@ class BabeldocHookContext:
                 current, current_original_index = ordered_items[index]
                 merged_original_indices = [current_original_index]
                 while True:
-                    candidate_index = self._best_same_line_fragment_candidate(
+                    candidate_index = self._best_contiguous_body_line_candidate(
                         current,
                         index,
                         ordered_items,
                         consumed_indices,
                     )
                     if candidate_index is None:
-                        candidate_index = self._best_wrapped_decimal_continuation_candidate(
-                            current,
-                            index,
-                            ordered_items,
-                            consumed_indices,
-                        )
+                        break
+                    right, right_original_index = ordered_items[candidate_index]
+                    left_record = self._record_for_paragraph(current)
+                    right_record = self._record_for_paragraph(right)
+                    pair_key = (
+                        left_record.paragraph_id if left_record else None,
+                        right_record.paragraph_id if right_record else None,
+                    )
+                    if pair_key not in allowed_pairs:
+                        break
+                    if len(samples) < 8:
+                        samples.append(_same_line_merge_sample(current, right))
+                    _merge_paragraphs(current, right, separator=" ")
+                    self._focus_postprocess_paragraph(current)
+                    merged_original_indices.append(right_original_index)
+                    consumed_indices.add(candidate_index)
+                    merged += 1
+                rewritten.append((min(merged_original_indices), current))
+                index += 1
+            rewritten.sort(key=lambda item: item[0])
+            page.pdf_paragraph = [paragraph for _original_index, paragraph in rewritten]
+        if merged:
+            self._record_action(
+                "merge_contiguous_body_lines_before_translation",
+                rule_key="merge_contiguous_body_lines",
+                decision="applied",
+                pairs=merged,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
+            )
+        return merged > 0
+
+    def split_wrapped_same_line_tails_before_translation(self, document: Any) -> bool:
+        rule_key = "split_wrapped_same_line_tail"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_split_wrapped_same_line_tails(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "split_wrapped_same_line_tail_before_translation",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return False
+        self._emit_rejected_plan(
+            "split_wrapped_same_line_tail_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_split_wrapped_same_line_tails(document, self._allowed_plan_items(plan))
+
+    def _plan_split_wrapped_same_line_tails(self, document: Any) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 2:
+                continue
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(paragraphs)
+            ]
+            ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
+            for right, _right_original_index in ordered_items:
+                right_record = self._record_for_paragraph(right)
+                if right_record is None or right_record.role != "body":
+                    continue
+                groups = _wrapped_same_line_tail_groups(right)
+                if groups is None:
+                    continue
+                first_group_rect = groups[0][1]
+                first_group_text = _composition_text(groups[0][0]).strip()
+                left = _best_wrapped_same_line_tail_left_neighbor(
+                    right,
+                    first_group_rect,
+                    first_group_text,
+                    ordered_items,
+                    self,
+                )
+                if left is None:
+                    continue
+                left_record = self._record_for_paragraph(left)
+                guard = self._guard_merge_records(left_record, right_record)
+                item = {
+                    "kind": "split",
+                    "paragraph_id": right_record.paragraph_id,
+                    "left_id": left_record.paragraph_id if left_record else None,
+                    "role": right_record.role,
+                    "left_role": left_record.role if left_record else "unknown",
+                    "reason": "wrapped_same_line_tail",
+                    "left": str(getattr(left, "unicode", "") or "")[:80],
+                    "source": str(getattr(right, "unicode", "") or "")[:120],
+                    "parts": [_composition_text(group).strip()[:80] for group, _rect in groups],
+                    "first_line_rect": first_group_rect,
+                    "source_rect": _box_rect(getattr(right, "box", None)),
+                }
+                item.update(guard)
+                plan.append(item)
+        return plan
+
+    def _apply_split_wrapped_same_line_tails(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        eligible_ids = {item["paragraph_id"] for item in plan if item.get("paragraph_id")}
+        if not eligible_ids:
+            return False
+        split_count = 0
+        samples: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if not paragraphs:
+                continue
+            rewritten: list[Any] = []
+            for paragraph in paragraphs:
+                record = self._record_for_paragraph(paragraph)
+                if record is None or record.paragraph_id not in eligible_ids:
+                    rewritten.append(paragraph)
+                    continue
+                parts = _split_paragraph_by_composition_groups(paragraph, _wrapped_same_line_tail_groups(paragraph))
+                if len(parts) <= 1:
+                    rewritten.append(paragraph)
+                    continue
+                merged_left = _pop_merge_left_neighbor_for_wrapped_tail(
+                    rewritten,
+                    parts[0],
+                    self,
+                )
+                if merged_left is not None:
+                    rewritten.append(merged_left)
+                    rewritten.extend(parts[1:])
+                else:
+                    rewritten.extend(parts)
+                for part in parts:
+                    self._focus_postprocess_paragraph(part)
+                split_count += len(parts) - 1
+                if len(samples) < 8:
+                    samples.append(
+                        {
+                            "source": str(getattr(paragraph, "unicode", "") or "")[:120],
+                            "parts": [str(getattr(part, "unicode", "") or "")[:80] for part in parts],
+                            "merged_left": merged_left is not None,
+                        }
+                    )
+            page.pdf_paragraph = rewritten
+        if split_count:
+            self._record_action(
+                "split_wrapped_same_line_tail_before_translation",
+                rule_key="split_wrapped_same_line_tail",
+                decision="applied",
+                paragraphs=split_count,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
+            )
+        return split_count > 0
+
+    def remove_subsumed_same_line_duplicates_before_translation(self, document: Any) -> bool:
+        rule_key = "remove_subsumed"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan = self._plan_remove_subsumed(document)
+        if not plan:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "remove_subsumed_same_line_duplicates_before_translation",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return False
+        self._emit_rejected_plan(
+            "remove_subsumed_same_line_duplicates_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_remove_subsumed(document, self._allowed_plan_items(plan))
+
+    def _plan_remove_subsumed(self, document: Any) -> list[dict[str, Any]]:
+        """Read-only: list candidate/anchor duplicate pairs that would be removed."""
+
+        plan: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 2:
+                continue
+            removed_indices: set[int] = set()
+            for candidate_index, candidate in enumerate(paragraphs):
+                if candidate_index in removed_indices:
+                    continue
+                anchor_index = _find_subsuming_same_line_anchor(paragraphs, candidate_index, removed_indices)
+                if anchor_index is None:
+                    continue
+                removed_indices.add(candidate_index)
+                candidate_record = self._record_for_paragraph(candidate)
+                anchor_record = self._record_for_paragraph(paragraphs[anchor_index])
+                item = {
+                    "kind": "remove",
+                    "candidate_id": candidate_record.paragraph_id if candidate_record else None,
+                    "anchor_id": anchor_record.paragraph_id if anchor_record else None,
+                    "role": (candidate_record.role if candidate_record else "body"),
+                    "reason": "subsumed_same_line_duplicate",
+                    "anchor": str(getattr(paragraphs[anchor_index], "unicode", "") or "")[:120],
+                    "duplicate": str(getattr(candidate, "unicode", "") or "")[:120],
+                    "rect": _box_rect(getattr(candidate, "box", None)),
+                }
+                item.update(self._guard_remove_records(candidate_record, anchor_record))
+                plan.append(item)
+        return plan
+
+    def _apply_remove_subsumed(self, document: Any, plan: list[dict[str, Any]]) -> bool:
+        candidate_ids = {item["candidate_id"] for item in plan if item.get("candidate_id")}
+        if not candidate_ids:
+            return False
+        removed = 0
+        samples: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 2:
+                continue
+            removed_indices: set[int] = set()
+            for candidate_index, candidate in enumerate(paragraphs):
+                if candidate_index in removed_indices:
+                    continue
+                anchor_index = _find_subsuming_same_line_anchor(paragraphs, candidate_index, removed_indices)
+                if anchor_index is None:
+                    continue
+                record = self._record_for_paragraph(candidate)
+                if record is None or record.paragraph_id not in candidate_ids:
+                    continue
+                removed_indices.add(candidate_index)
+                self._focus_postprocess_paragraph(paragraphs[anchor_index])
+                removed += 1
+                if len(samples) < 8:
+                    samples.append(
+                        {
+                            "anchor": str(getattr(paragraphs[anchor_index], "unicode", "") or "")[:120],
+                            "duplicate": str(getattr(candidate, "unicode", "") or "")[:120],
+                            "rect": _box_rect(getattr(candidate, "box", None)),
+                        }
+                    )
+            if removed_indices:
+                page.pdf_paragraph = [
+                    paragraph
+                    for paragraph_index, paragraph in enumerate(paragraphs)
+                    if paragraph_index not in removed_indices
+                ]
+        if removed:
+            self._record_action(
+                "remove_subsumed_same_line_duplicates_before_translation",
+                rule_key="remove_subsumed",
+                decision="applied",
+                paragraphs=removed,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
+            )
+        return removed > 0
+
+    def merge_same_line_fragments_before_translation(self, document: Any) -> bool:
+        rule_key = "merge_same_line"
+        if self.hook_policy.is_off(rule_key):
+            return False
+        plan, rejected = self._plan_merge_same_line(document)
+        if not plan and not rejected:
+            return False
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "merge_same_line_fragments_before_translation",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            if rejected:
+                self._record_action(
+                    "reject_same_line_fragment_merge",
+                    rule_key=rule_key,
+                    decision="rejected",
+                    samples=rejected,
+                    role_counts=_structure_plan_role_counts(rejected),
+                )
+            return False
+        self._emit_rejected_plan(
+            "merge_same_line_fragments_before_translation",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        return self._apply_merge_same_line(document, self._allowed_plan_items(plan), rejected)
+
+    def _plan_merge_same_line(self, document: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Read-only simulation of the same-line merge pass.
+
+        To stay consistent with the apply path, candidate decisions are computed
+        against the *accumulated* left state (merge grows ``current.unicode``
+        and its box rect).  We patch ``current`` in place while walking a page
+        and restore every touched attribute from a saved snapshot at the end, so
+        the document is left byte-identical.  Rejected near-miss pairs are also
+        captured for the sidecar.
+        """
+
+        plan: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 2:
+                continue
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(paragraphs)
+            ]
+            ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
+            # Track per-paragraph mutated state so we can restore it after planning.
+            restore: list[tuple[Any, str, Any, tuple[float, float, float, float] | None, Any]] = []
+            consumed_indices: set[int] = set()
+            index = 0
+            while index < len(ordered_items):
+                if index in consumed_indices:
+                    index += 1
+                    continue
+                current, _current_original_index = ordered_items[index]
+                self._snapshot_for_restore(current, restore)
+                while True:
+                    candidate_index = self._best_merge_continuation_candidate(
+                        current,
+                        index,
+                        ordered_items,
+                        consumed_indices,
+                    )
                     if candidate_index is None:
                         next_index = index + 1
                         while next_index < len(ordered_items) and next_index in consumed_indices:
@@ -963,57 +1835,167 @@ class BabeldocHookContext:
                         if next_index < len(ordered_items):
                             right, _right_original_index = ordered_items[next_index]
                             should_merge, reason = self._should_merge_same_line_fragments(current, right)
+                            left_record = self._record_for_paragraph(current)
+                            right_record = self._record_for_paragraph(right)
                             if (
                                 not should_merge
-                                and len(rejected_samples) < 12
+                                and len(rejected) < 12
                                 and _looks_like_potential_same_line_fragment_pair(current, right)
                             ):
-                                rejected_samples.append(
-                                    {
-                                        "left": str(getattr(current, "unicode", "") or "")[:120],
-                                        "right": str(getattr(right, "unicode", "") or "")[:120],
-                                        "left_rect": _box_rect(getattr(current, "box", None)),
-                                        "right_rect": _box_rect(getattr(right, "box", None)),
-                                        "reason": reason,
-                                    }
-                                )
+                                rejected.append(self._same_line_neighbor_reject_sample(current, right, reason))
                         break
                     right, right_original_index = ordered_items[candidate_index]
+                    left_record = self._record_for_paragraph(current)
+                    right_record = self._record_for_paragraph(right)
+                    is_punct = self._should_attach_inline_punctuation_fragment(current, right)
+                    should_merge, reason = (True, "inline_punctuation") if is_punct else self._should_merge_same_line_fragments(current, right)
+                    plan.append(self._same_line_merge_plan_item(current, right, reason if not is_punct else "inline_punctuation"))
+                    # Simulate the merge on current so the next candidate sees accumulated state.
+                    if is_punct:
+                        _merge_paragraphs(current, right, separator="")
+                    elif should_merge:
+                        _merge_paragraphs(current, right)
+                    else:
+                        _merge_paragraphs(current, right, separator="")
+                    consumed_indices.add(candidate_index)
+                index += 1
+            # Restore every paragraph we patched so the document is unchanged.
+            for paragraph, unicode_value, composition, box, rect, optimal_scale in restore:
+                paragraph.unicode = unicode_value
+                paragraph.pdf_paragraph_composition = composition
+                if box is not None:
+                    _set_box_rect(box, rect)
+                if optimal_scale is not None:
+                    paragraph.optimal_scale = optimal_scale
+        return plan, rejected
+
+    def _snapshot_for_restore(
+        self,
+        paragraph: Any,
+        restore: list[tuple[Any, str, list[Any], Any, tuple[float, float, float, float] | None, Any]],
+    ) -> None:
+        """Remember a paragraph's mutable state so observe planning can restore it."""
+
+        box = getattr(paragraph, "box", None)
+        restore.append(
+            (
+                paragraph,
+                str(getattr(paragraph, "unicode", "") or ""),
+                list(getattr(paragraph, "pdf_paragraph_composition", []) or []),
+                box,
+                _box_rect(box),
+                getattr(paragraph, "optimal_scale", None),
+            )
+        )
+
+    def _same_line_neighbor_reject_sample(self, left: Any, right: Any, reason: str) -> dict[str, Any]:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        item = {
+            "left": str(getattr(left, "unicode", "") or "")[:120],
+            "right": str(getattr(right, "unicode", "") or "")[:120],
+            "left_role": left_record.role if left_record else "unknown",
+            "right_role": right_record.role if right_record else "unknown",
+            "left_rect": _box_rect(getattr(left, "box", None)),
+            "right_rect": _box_rect(getattr(right, "box", None)),
+            "reason": reason,
+        }
+        item.update(self._guard_merge_records(left_record, right_record))
+        return item
+
+    def _same_line_merge_plan_item(self, left: Any, right: Any, reason: str) -> dict[str, Any]:
+        left_record = self._record_for_paragraph(left)
+        right_record = self._record_for_paragraph(right)
+        item = {
+            "kind": "merge",
+            "left_id": left_record.paragraph_id if left_record else None,
+            "right_id": right_record.paragraph_id if right_record else None,
+            "left_role": left_record.role if left_record else "body",
+            "right_role": right_record.role if right_record else "body",
+            "reason": reason,
+            "left": str(getattr(left, "unicode", "") or "")[:80],
+            "right": str(getattr(right, "unicode", "") or "")[:80],
+            "rect": _box_rect(getattr(left, "box", None)),
+        }
+        item.update(self._guard_merge_records(left_record, right_record))
+        return item
+
+    def _apply_merge_same_line(
+        self,
+        document: Any,
+        plan: list[dict[str, Any]],
+        rejected: list[dict[str, Any]],
+    ) -> bool:
+        if not plan:
+            return False
+        allowed_pairs = {
+            (item.get("left_id"), item.get("right_id"))
+            for item in plan
+            if item.get("left_id") and item.get("right_id")
+        }
+        if not allowed_pairs:
+            return False
+        # Re-run the real merge pass.  We do not replay ``plan`` item-by-item
+        # because the live ``current`` accumulates merged text/composition during
+        # the walk, and the candidate helpers already encode the same decisions.
+        # ``plan`` is only used as the apply/observe contract; the apply path
+        # reproduces it deterministically via the same helpers.
+        merged = 0
+        samples: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
+            if len(paragraphs) < 2:
+                continue
+            ordered_items = [
+                (paragraph, original_index)
+                for original_index, paragraph in enumerate(paragraphs)
+            ]
+            ordered_items.sort(key=lambda item: _paragraph_visual_sort_key(item[0], item[1]))
+            rewritten: list[tuple[int, Any]] = []
+            consumed_indices: set[int] = set()
+            index = 0
+            while index < len(ordered_items):
+                if index in consumed_indices:
+                    index += 1
+                    continue
+                current, current_original_index = ordered_items[index]
+                merged_original_indices = [current_original_index]
+                while True:
+                    candidate_index = self._best_merge_continuation_candidate(
+                        current,
+                        index,
+                        ordered_items,
+                        consumed_indices,
+                    )
+                    if candidate_index is None:
+                        break
+                    right, right_original_index = ordered_items[candidate_index]
+                    left_record = self._record_for_paragraph(current)
+                    right_record = self._record_for_paragraph(right)
+                    pair_key = (
+                        left_record.paragraph_id if left_record else None,
+                        right_record.paragraph_id if right_record else None,
+                    )
+                    if pair_key not in allowed_pairs:
+                        break
+                    sample = _same_line_merge_sample(current, right)
                     if self._should_attach_inline_punctuation_fragment(current, right):
                         if len(samples) < 8:
-                            samples.append(
-                                {
-                                    "left": str(getattr(current, "unicode", "") or "")[:80],
-                                    "right": str(getattr(right, "unicode", "") or "")[:80],
-                                    "rect": _box_rect(getattr(current, "box", None)),
-                                }
-                            )
+                            samples.append(sample)
                         _merge_paragraphs(current, right, separator="")
                         self._focus_postprocess_paragraph(current)
                         merged_original_indices.append(right_original_index)
                         consumed_indices.add(candidate_index)
                         merged += 1
                         continue
-                    should_merge, reason = self._should_merge_same_line_fragments(current, right)
+                    should_merge, _reason = self._should_merge_same_line_fragments(current, right)
                     if should_merge:
                         if len(samples) < 8:
-                            samples.append(
-                                {
-                                    "left": str(getattr(current, "unicode", "") or "")[:80],
-                                    "right": str(getattr(right, "unicode", "") or "")[:80],
-                                    "rect": _box_rect(getattr(current, "box", None)),
-                                }
-                            )
+                            samples.append(sample)
                         _merge_paragraphs(current, right)
                     else:
                         if len(samples) < 8:
-                            samples.append(
-                                {
-                                    "left": str(getattr(current, "unicode", "") or "")[:80],
-                                    "right": str(getattr(right, "unicode", "") or "")[:80],
-                                    "rect": _box_rect(getattr(current, "box", None)),
-                                }
-                            )
+                            samples.append(sample)
                         _merge_paragraphs(current, right, separator="")
                     self._focus_postprocess_paragraph(current)
                     merged_original_indices.append(right_original_index)
@@ -1025,19 +2007,21 @@ class BabeldocHookContext:
             page.pdf_paragraph = [paragraph for _original_index, paragraph in rewritten]
 
         if merged:
-            self.applied_events.append(
-                {
-                    "action": "merge_same_line_fragments_before_translation",
-                    "pairs": merged,
-                    "samples": samples,
-                }
+            self._record_action(
+                "merge_same_line_fragments_before_translation",
+                rule_key="merge_same_line",
+                decision="applied",
+                pairs=merged,
+                samples=samples,
+                role_counts=_structure_plan_role_counts(plan),
             )
-        if rejected_samples:
-            self.applied_events.append(
-                {
-                    "action": "reject_same_line_fragment_merge",
-                    "samples": rejected_samples,
-                }
+        if rejected:
+            self._record_action(
+                "reject_same_line_fragment_merge",
+                rule_key="merge_same_line",
+                decision="rejected",
+                samples=rejected,
+                role_counts=_structure_plan_role_counts(rejected),
             )
         return merged > 0
 
@@ -1096,6 +2080,28 @@ class BabeldocHookContext:
             return False, reason
         return True, "ok"
 
+    def _best_merge_continuation_candidate(
+        self,
+        current: Any,
+        current_index: int,
+        ordered_items: list[tuple[Any, int]],
+        consumed_indices: set[int],
+    ) -> int | None:
+        candidate_index = self._best_same_line_fragment_candidate(
+            current,
+            current_index,
+            ordered_items,
+            consumed_indices,
+        )
+        if candidate_index is not None:
+            return candidate_index
+        return self._best_wrapped_decimal_continuation_candidate(
+            current,
+            current_index,
+            ordered_items,
+            consumed_indices,
+        )
+
     def _best_same_line_fragment_candidate(
         self,
         current: Any,
@@ -1147,6 +2153,59 @@ class BabeldocHookContext:
         return None if best is None else best[1]
 
     def split_numbered_lists_before_typesetting(self, document: Any) -> None:
+        rule_key = "split_numbered_lists"
+        if self.hook_policy.is_off(rule_key):
+            return
+        plan = self._plan_split_numbered_lists(document)
+        if not plan:
+            return
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "split_numbered_paragraph_before_typesetting",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return
+        self._emit_rejected_plan(
+            "split_numbered_paragraph_before_typesetting",
+            rule_key=rule_key,
+            plan=plan,
+        )
+        self._apply_split_numbered_lists(document, self._allowed_plan_items(plan))
+
+    def _plan_split_numbered_lists(self, document: Any) -> list[dict[str, Any]]:
+        """Read-only: list numbered paragraphs that would be split by line marker.
+
+        Runs in the ``Typesetting`` stage (after translation) but obeys the same
+        structure policy as the pre-translation rules, per the convergence plan
+        (§现状校正-2 / §第二阶段-2): a translation-time split cannot bypass the
+        layout guard.
+        """
+
+        plan: list[dict[str, Any]] = []
+        for page in getattr(document, "page", []) or []:
+            for paragraph in getattr(page, "pdf_paragraph", []) or []:
+                record = self._record_for_paragraph(paragraph)
+                if record is None or not _has_inline_numbered_markers(record.text):
+                    continue
+                lines = [line.strip() for line in str(getattr(paragraph, "unicode", "") or "").splitlines() if line.strip()]
+                if len(lines) < 2:
+                    continue
+                item = {
+                    "kind": "split",
+                    "paragraph_id": record.paragraph_id,
+                    "role": record.role,
+                    "reason": "inline_numbered_markers",
+                    "lines": lines[:8],
+                }
+                item.update(self._guard_split_record(record, "inline_numbered_markers"))
+                plan.append(item)
+        return plan
+
+    def _apply_split_numbered_lists(self, document: Any, plan: list[dict[str, Any]]) -> None:
+        eligible_ids = {item["paragraph_id"] for item in plan if item.get("paragraph_id")}
+        if not eligible_ids:
+            return
         split_count = 0
         for page in getattr(document, "page", []) or []:
             paragraphs = list(getattr(page, "pdf_paragraph", []) or [])
@@ -1155,7 +2214,7 @@ class BabeldocHookContext:
             rewritten = []
             for paragraph in paragraphs:
                 record = self._record_for_paragraph(paragraph)
-                if record is None or not _has_inline_numbered_markers(record.text):
+                if record is None or record.paragraph_id not in eligible_ids:
                     rewritten.append(paragraph)
                     continue
                 lines = [line.strip() for line in str(getattr(paragraph, "unicode", "") or "").splitlines() if line.strip()]
@@ -1166,11 +2225,12 @@ class BabeldocHookContext:
                 split_count += 1
             page.pdf_paragraph = rewritten
         if split_count:
-            self.applied_events.append(
-                {
-                    "action": "split_numbered_paragraph_before_typesetting",
-                    "paragraphs": split_count,
-                }
+            self._record_action(
+                "split_numbered_paragraph_before_typesetting",
+                rule_key="split_numbered_lists",
+                decision="applied",
+                paragraphs=split_count,
+                role_counts=_structure_plan_role_counts(plan),
             )
 
     def normalize_body_font_sizes_before_typesetting(self, document: Any) -> None:
@@ -1220,12 +2280,12 @@ class BabeldocHookContext:
                         }
                     )
         if normalized_runs:
-            self.applied_events.append(
-                {
-                    "action": "normalize_body_font_sizes_before_typesetting",
-                    "runs": normalized_runs,
-                    "samples": samples,
-                }
+            self._record_action(
+                "normalize_body_font_sizes_before_typesetting",
+                rule_key="normalize_body_font_sizes",
+                decision="applied",
+                runs=normalized_runs,
+                samples=samples,
             )
 
     def replace_axis_label_render_units(
@@ -1322,14 +2382,14 @@ class BabeldocHookContext:
             }
             for entry in diagnostics[:8]
         ]
-        self.applied_events.append(
-            {
-                "action": "replace_page_axis_label_render_units",
-                "page_number": page_number,
-                "groups": len(replacement_units),
-                "characters": sum(entry["characters"] for entry in diagnostics),
-                "samples": samples,
-            }
+        self._record_action(
+            "replace_page_axis_label_render_units",
+            rule_key="render_axis_label",
+            decision="applied",
+            page_number=page_number,
+            groups=len(replacement_units),
+            characters=sum(entry["characters"] for entry in diagnostics),
+            samples=samples,
         )
         return replaced_units
 
@@ -1357,12 +2417,14 @@ class BabeldocHookContext:
         if self._reconciled:
             return
         self._reconciled = True
+        rule_key = "reconcile_repeated_edge"
+        plan: list[dict[str, Any]] = []
         for group_id, paragraph_ids in self.groups.items():
             leader_id = self._translated_leader_id(paragraph_ids)
             if leader_id is None:
                 continue
             leader_snapshot = self._translations[leader_id]
-            changed = 0
+            follower_ids: list[str] = []
             for paragraph_id in paragraph_ids:
                 if paragraph_id == leader_id:
                     continue
@@ -1370,18 +2432,56 @@ class BabeldocHookContext:
                 record = self.records_by_id.get(paragraph_id)
                 if paragraph is None or record is None:
                     continue
+                follower_ids.append(paragraph_id)
+            if follower_ids:
+                plan.append(
+                    {
+                        "kind": "reconcile",
+                        "group_id": group_id,
+                        "leader_id": leader_id,
+                        "follower_ids": follower_ids,
+                        "role": "running_edge_text",
+                        "reason": "repeated_edge_leader_sync",
+                    }
+                )
+        if not plan:
+            return
+        if self.hook_policy.is_off(rule_key):
+            return
+        if self.hook_policy.is_observe(rule_key):
+            self._emit_observed_plan(
+                "reconcile_repeated_edge_text",
+                rule_key=rule_key,
+                plan=plan,
+            )
+            return
+        # apply
+        changed_total = 0
+        for item in plan:
+            leader_snapshot = self._translations.get(item["leader_id"])
+            if leader_snapshot is None:
+                continue
+            changed = 0
+            for paragraph_id in item["follower_ids"]:
+                paragraph = self.paragraphs_by_id.get(paragraph_id)
+                if paragraph is None:
+                    continue
                 paragraph.unicode = leader_snapshot.unicode
                 paragraph.pdf_paragraph_composition = copy.deepcopy(leader_snapshot.composition)
                 changed += 1
             if changed:
-                self.applied_events.append(
-                    {
-                        "action": "reconcile_repeated_edge_text",
-                        "group_id": group_id,
-                        "leader_id": leader_id,
-                        "followers": changed,
-                    }
+                self._record_action(
+                    "reconcile_repeated_edge_text",
+                    rule_key=rule_key,
+                    decision="applied",
+                    role="running_edge_text",
+                    group_id=item["group_id"],
+                    leader_id=item["leader_id"],
+                    followers=changed,
+                    role_counts={"running_edge_text": changed},
                 )
+                changed_total += changed
+        return
 
     def write_sidecar(self, path: Path | None = None) -> Path | None:
         sidecar_path = path or (self.working_dir / "doc_translator_ir.json" if self.working_dir else None)
@@ -1394,12 +2494,14 @@ class BabeldocHookContext:
             if record.role != "body" or record.policy != "pass_through"
         ]
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "strategy": "babeldoc_internal_hooks_v1",
+            "hook_policy": self.hook_policy.to_summary(),
             "counts": self._role_counts(),
             "roles": roles,
             "groups": self.groups,
+            "layout_summaries": self._layout_summaries_payload(),
             "diagnostic_samples": self._diagnostic_samples(),
             "axis_diagnostics": self.axis_diagnostics,
             "phase_events": self.phase_events,
@@ -1477,6 +2579,7 @@ class BabeldocHookContext:
             for paragraph_index, paragraph in enumerate(getattr(page, "pdf_paragraph", []) or []):
                 paragraph_id = _paragraph_id(paragraph, page_index, paragraph_index)
                 record = self.records_by_id.get(paragraph_id)
+                layout_region = self.layout_regions_by_id.get(paragraph_id)
                 paragraph_payload = {
                     "paragraph_id": paragraph_id,
                     "page_number": _page_number(page, page_index),
@@ -1488,6 +2591,9 @@ class BabeldocHookContext:
                     "xobj_id": getattr(paragraph, "xobj_id", None),
                     "role": record.role if record is not None else "body",
                     "policy": record.policy if record is not None else "pass_through",
+                    "layout_region": layout_region.region if layout_region is not None else "unknown",
+                    "layout_column": layout_region.column_id if layout_region is not None else None,
+                    "layout_confidence": layout_region.confidence if layout_region is not None else 0.0,
                     "source_text": record.text if record is not None else None,
                     "source_rect": record.rect if record is not None else None,
                     "protected_tokens": self._protected_tokens.get(paragraph_id, []),
@@ -1510,6 +2616,7 @@ class BabeldocHookContext:
             "stage": stage,
             "paragraph_total": paragraph_total,
             "counts": self._role_counts(),
+            "layout_summaries": self._layout_summaries_payload(),
             "pages": pages_payload,
             "axis_diagnostics": copy.deepcopy(self.axis_diagnostics),
             "applied_events": copy.deepcopy(self.applied_events),
@@ -1532,12 +2639,41 @@ class BabeldocHookContext:
         records: list[_ParagraphRecord] = []
         pages = getattr(document, "page", []) or []
         self.paragraphs_by_id = {}
+        glyph_samples: list[dict[str, Any]] = []
+        glyph_normalized = 0
+        self._symbol_font_ids_by_paragraph_object_id = {}
+        self._detached_i2c_visual_record_ids = set()
         for page_index, page in enumerate(pages):
             page_number = _page_number(page, page_index)
             page_rect = _page_rect(page)
+            symbol_font_ids_by_xobj = _symbol_font_ids_by_xobj(page)
             paragraphs = getattr(page, "pdf_paragraph", []) or []
             for paragraph_index, paragraph in enumerate(paragraphs):
+                xobj_id = getattr(paragraph, "xobj_id", None)
+                symbol_font_ids = symbol_font_ids_by_xobj.get(xobj_id) or symbol_font_ids_by_xobj.get(None) or frozenset()
+                if symbol_font_ids:
+                    self._symbol_font_ids_by_paragraph_object_id[id(paragraph)] = symbol_font_ids
                 text = str(getattr(paragraph, "unicode", "") or "")
+                layout_label = getattr(paragraph, "layout_label", None)
+                if (
+                    layout_label in {"fallback_line", "figure_caption"}
+                    and self.hook_policy.is_apply("normalize_symbol_glyph_fallback_line_text")
+                ):
+                    rebuilt = _rebuild_fallback_line_text(paragraph, symbol_font_ids=symbol_font_ids)
+                    if rebuilt and rebuilt != text:
+                        paragraph.unicode = rebuilt
+                        if len(glyph_samples) < 8:
+                            glyph_samples.append(
+                                {
+                                    "page_number": page_number,
+                                    "paragraph_index": paragraph_index + 1,
+                                    "layout_label": layout_label,
+                                    "incoming_text": text[:120],
+                                    "outgoing_text": rebuilt[:120],
+                                }
+                            )
+                        glyph_normalized += 1
+                        text = rebuilt
                 if not text.strip():
                     continue
                 paragraph_id = _paragraph_id(paragraph, page_index, paragraph_index)
@@ -1557,6 +2693,25 @@ class BabeldocHookContext:
                 )
                 records.append(record)
                 self.paragraphs_by_id[paragraph_id] = paragraph
+        if self.hook_policy.is_apply("protect_detached_i2c_fallback_line_text"):
+            detached_samples = _detect_detached_i2c_fallback_line_records(records, self.paragraphs_by_id)
+            if detached_samples:
+                self._detached_i2c_visual_record_ids.update(sample["paragraph_id"] for sample in detached_samples)
+                self._record_action(
+                    "protect_detached_i2c_fallback_line_text",
+                    rule_key="protect_detached_i2c_fallback_line_text",
+                    decision="applied",
+                    paragraphs=len(detached_samples),
+                    samples=detached_samples[:8],
+                )
+        if glyph_normalized:
+            self._record_action(
+                "normalize_symbol_glyph_fallback_line_text",
+                rule_key="normalize_symbol_glyph_fallback_line_text",
+                decision="applied",
+                paragraphs=glyph_normalized,
+                samples=glyph_samples,
+            )
         return records
 
     def _classify_repeated_edge_text(self, records: list[_ParagraphRecord]) -> None:
@@ -1626,6 +2781,138 @@ class BabeldocHookContext:
                 return paragraph_id
         return None
 
+    def _build_page_layout_summaries(self, records: list[_ParagraphRecord]) -> None:
+        self.layout_regions_by_id = {}
+        self.page_layout_summaries = {}
+        by_page: dict[int, list[_ParagraphRecord]] = {}
+        for record in records:
+            by_page.setdefault(record.page_number, []).append(record)
+        for page_number, page_records in by_page.items():
+            summary, regions = _build_page_layout_summary(page_number, page_records)
+            self.page_layout_summaries[page_number] = summary
+            self.layout_regions_by_id.update({region.paragraph_id: region for region in regions})
+
+    def _layout_region_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for region in self.layout_regions_by_id.values():
+            key = region.region if region.column_id is None else f"{region.region}:{region.column_id}"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _layout_summaries_payload(self) -> list[dict[str, Any]]:
+        payload = []
+        for page_number in sorted(self.page_layout_summaries):
+            summary = self.page_layout_summaries[page_number]
+            payload.append(
+                {
+                    "page_number": summary.page_number,
+                    "columns": [
+                        {"column_id": column_id, "x1": round(x1, 3), "x2": round(x2, 3)}
+                        for column_id, x1, x2 in summary.columns
+                    ],
+                    "counts": summary.counts,
+                }
+            )
+        return payload
+
+    def _record_layout_region(self, record: _ParagraphRecord | None) -> _LayoutRegion | None:
+        if record is None:
+            return None
+        return self.layout_regions_by_id.get(record.paragraph_id)
+
+    def _guard_merge_records(
+        self,
+        left_record: _ParagraphRecord | None,
+        right_record: _ParagraphRecord | None,
+    ) -> dict[str, Any]:
+        if left_record is None or right_record is None:
+            return {"guard_decision": "rejected", "guard_reason": "missing_record"}
+        left_region = self._record_layout_region(left_record)
+        right_region = self._record_layout_region(right_record)
+        payload = _layout_guard_payload("left", left_region) | _layout_guard_payload("right", right_region)
+        if left_record.page_number != right_record.page_number:
+            return payload | {"guard_decision": "rejected", "guard_reason": "cross_page"}
+        if left_region is None or right_region is None:
+            return payload | {"guard_decision": "rejected", "guard_reason": "missing_layout_region"}
+        if left_region.region == "unknown" or right_region.region == "unknown":
+            return payload | {"guard_decision": "rejected", "guard_reason": "unknown_region"}
+        if left_region.region != "body_column" or right_region.region != "body_column":
+            return payload | {"guard_decision": "rejected", "guard_reason": "non_body_region"}
+        if left_region.column_id != right_region.column_id:
+            return payload | {"guard_decision": "rejected", "guard_reason": "cross_column"}
+        return payload | {"guard_decision": "allowed", "guard_reason": "same_body_column"}
+
+    def _guard_split_record(self, record: _ParagraphRecord | None, reason: str) -> dict[str, Any]:
+        region = self._record_layout_region(record)
+        payload = _layout_guard_payload("target", region)
+        if record is None:
+            return payload | {"guard_decision": "rejected", "guard_reason": "missing_record"}
+        if reason == "multiline_body_block":
+            return payload | {"guard_decision": "rejected", "guard_reason": "multiline_body_block"}
+        if reason == "fallback_line_visual_split" and _is_compact_technical_label_record(record):
+            return payload | {"guard_decision": "allowed", "guard_reason": "fallback_line_technical_label"}
+        if region is None or region.region == "unknown":
+            return payload | {"guard_decision": "rejected", "guard_reason": "unknown_region"}
+        if reason == "inline_numbered_markers" and region.region == "body_column":
+            return payload | {"guard_decision": "allowed", "guard_reason": "numbered_marker_same_region"}
+        return payload | {"guard_decision": "rejected", "guard_reason": "ordinary_body_split"}
+
+    def _guard_remove_records(
+        self,
+        candidate_record: _ParagraphRecord | None,
+        anchor_record: _ParagraphRecord | None,
+    ) -> dict[str, Any]:
+        guard = self._guard_merge_records(anchor_record, candidate_record)
+        if guard.get("guard_decision") == "allowed":
+            guard["guard_reason"] = "same_body_column_duplicate"
+        return guard
+
+    def _guard_collapse_records(
+        self,
+        base_record: _ParagraphRecord | None,
+        absorbed_records: list[_ParagraphRecord | None],
+    ) -> dict[str, Any]:
+        if base_record is None:
+            return {"guard_decision": "rejected", "guard_reason": "missing_base_record"}
+        rejected_guard: dict[str, Any] | None = None
+        for absorbed_record in absorbed_records:
+            guard = self._guard_remove_records(absorbed_record, base_record)
+            if guard.get("guard_decision") == "rejected":
+                rejected_guard = guard
+                break
+        base_region = self._record_layout_region(base_record)
+        if rejected_guard is not None:
+            if self._looks_like_safe_overlap_collapse_cluster(base_record, absorbed_records):
+                return _layout_guard_payload("base", base_region) | {
+                    "guard_decision": "allowed",
+                    "guard_reason": "safe_overlap_fragment_cluster",
+                }
+            return rejected_guard
+        return _layout_guard_payload("base", base_region) | {
+            "guard_decision": "allowed",
+            "guard_reason": "same_body_column_overlap",
+        }
+
+    def _looks_like_safe_overlap_collapse_cluster(
+        self,
+        base_record: _ParagraphRecord,
+        absorbed_records: list[_ParagraphRecord | None],
+    ) -> bool:
+        records = [base_record, *[record for record in absorbed_records if record is not None]]
+        if len(records) < 3 or len(records) != len(absorbed_records) + 1:
+            return False
+        if any(record.page_number != base_record.page_number for record in records):
+            return False
+        if any(record.xobj_id != base_record.xobj_id for record in records):
+            return False
+        for record in records:
+            if record.role in {"toc_entry", "vertical_label", "running_edge_text"} or record.rect is None:
+                return False
+            region = self._record_layout_region(record)
+            if region is not None and region.region not in {"body_column", "table", "unknown"}:
+                return False
+        return _records_look_like_overlapping_fragment_cluster(records)
+
     def _record_for_paragraph(self, paragraph: Any) -> _ParagraphRecord | None:
         debug_id = str(getattr(paragraph, "debug_id", "") or "")
         if debug_id and debug_id in self.records_by_id:
@@ -1637,6 +2924,131 @@ class BabeldocHookContext:
         for record in self.records_by_id.values():
             counts[record.role] = counts.get(record.role, 0) + 1
         return counts
+
+
+def _build_page_layout_summary(
+    page_number: int,
+    records: list[_ParagraphRecord],
+) -> tuple[_PageLayoutSummary, list[_LayoutRegion]]:
+    columns = _detect_body_columns(records)
+    regions = [_classify_layout_region(record, columns) for record in records]
+    counts: dict[str, int] = {}
+    for region in regions:
+        key = region.region if region.column_id is None else f"{region.region}:{region.column_id}"
+        counts[key] = counts.get(key, 0) + 1
+    return _PageLayoutSummary(page_number=page_number, columns=tuple(columns), counts=counts), regions
+
+
+def _detect_body_columns(records: list[_ParagraphRecord]) -> list[tuple[str, float, float]]:
+    candidates = [
+        record
+        for record in records
+        if record.rect is not None
+        and record.page_rect is not None
+        and record.role == "body"
+        and record.policy == "pass_through"
+        and not record.vertical
+        and not _is_edge_band(record)
+        and not _looks_like_layout_table_record(record)
+    ]
+    if len(candidates) < _LAYOUT_MIN_COLUMN_CANDIDATES:
+        return []
+
+    page_rect = candidates[0].page_rect
+    if page_rect is None:
+        return []
+    page_width = max(page_rect[2] - page_rect[0], 1.0)
+    centers = [
+        ((record.rect[0] + record.rect[2]) / 2.0, record)
+        for record in candidates
+        if record.rect is not None
+    ]
+    centers.sort(key=lambda item: item[0])
+    if len(centers) >= _LAYOUT_MIN_TWO_COLUMN_CANDIDATES:
+        gaps = [
+            (centers[index + 1][0] - centers[index][0], index)
+            for index in range(len(centers) - 1)
+        ]
+        largest_gap, split_index = max(gaps, key=lambda item: item[0])
+        left_records = [record for _center, record in centers[: split_index + 1]]
+        right_records = [record for _center, record in centers[split_index + 1 :]]
+        min_gap = max(
+            _LAYOUT_TWO_COLUMN_MIN_GAP_POINTS,
+            page_width * _LAYOUT_TWO_COLUMN_MIN_GAP_PAGE_RATIO,
+        )
+        if (
+            largest_gap >= min_gap
+            and len(left_records) >= _LAYOUT_MIN_RECORDS_PER_COLUMN
+            and len(right_records) >= _LAYOUT_MIN_RECORDS_PER_COLUMN
+        ):
+            return [
+                ("left", _records_min_x(left_records), _records_max_x(left_records)),
+                ("right", _records_min_x(right_records), _records_max_x(right_records)),
+            ]
+    return [("single", _records_min_x(candidates), _records_max_x(candidates))]
+
+
+def _classify_layout_region(
+    record: _ParagraphRecord,
+    columns: list[tuple[str, float, float]],
+) -> _LayoutRegion:
+    if record.role == "running_edge_text" or _is_edge_band(record):
+        return _LayoutRegion(record.paragraph_id, record.page_number, "edge", None, _LAYOUT_EDGE_CONFIDENCE, "edge_band")
+    if record.role == "vertical_label":
+        return _LayoutRegion(record.paragraph_id, record.page_number, "edge", None, _LAYOUT_VERTICAL_LABEL_CONFIDENCE, "vertical_label")
+    if _looks_like_layout_table_record(record):
+        return _LayoutRegion(record.paragraph_id, record.page_number, "table", None, _LAYOUT_TABLE_CONFIDENCE, "layout_label_table")
+    if _looks_like_layout_figure_record(record):
+        return _LayoutRegion(record.paragraph_id, record.page_number, "figure", None, _LAYOUT_FIGURE_CONFIDENCE, "layout_label_figure")
+    if record.role != "body" or record.policy != "pass_through" or record.rect is None:
+        return _LayoutRegion(record.paragraph_id, record.page_number, "unknown", None, 0.0, "non_body_or_missing_rect")
+    center_x = (record.rect[0] + record.rect[2]) / 2.0
+    for column_id, x1, x2 in columns:
+        tolerance = max(_LAYOUT_COLUMN_TOLERANCE_POINTS, (x2 - x1) * _LAYOUT_COLUMN_TOLERANCE_RATIO)
+        if x1 - tolerance <= center_x <= x2 + tolerance:
+            confidence = (
+                _LAYOUT_TWO_COLUMN_BODY_CONFIDENCE
+                if column_id in {"left", "right"}
+                else _LAYOUT_SINGLE_COLUMN_BODY_CONFIDENCE
+            )
+            return _LayoutRegion(record.paragraph_id, record.page_number, "body_column", column_id, confidence, "x_distribution")
+    return _LayoutRegion(record.paragraph_id, record.page_number, "unknown", None, 0.0, "outside_detected_columns")
+
+
+def _layout_guard_payload(prefix: str, region: _LayoutRegion | None) -> dict[str, Any]:
+    if region is None:
+        return {f"{prefix}_region": "unknown", f"{prefix}_column": None, f"{prefix}_layout_confidence": 0.0}
+    return {
+        f"{prefix}_region": region.region,
+        f"{prefix}_column": region.column_id,
+        f"{prefix}_layout_confidence": round(region.confidence, 3),
+    }
+
+
+def _looks_like_layout_table_record(record: _ParagraphRecord) -> bool:
+    label = str(record.layout_label or "").casefold()
+    return "table" in label
+
+
+def _looks_like_layout_figure_record(record: _ParagraphRecord) -> bool:
+    label = str(record.layout_label or "").casefold()
+    return any(token in label for token in ("figure", "image", "caption"))
+
+
+def _records_min_x(records: list[_ParagraphRecord]) -> float:
+    return min(record.rect[0] for record in records if record.rect is not None)
+
+
+def _records_max_x(records: list[_ParagraphRecord]) -> float:
+    return max(record.rect[2] for record in records if record.rect is not None)
+
+
+def _same_line_merge_sample(left: Any, right: Any) -> dict[str, Any]:
+    return {
+        "left": str(getattr(left, "unicode", "") or "")[:80],
+        "right": str(getattr(right, "unicode", "") or "")[:80],
+        "rect": _box_rect(getattr(left, "box", None)),
+    }
 
 
 def babeldoc_ir_sidecar_path(output_path: Path) -> Path:
@@ -1790,11 +3202,160 @@ def _looks_like_broken_word_boundary(left: str, right: str) -> bool:
     )
 
 
+def _looks_like_inline_broken_word_continuation(
+    left_text: str,
+    right_text: str,
+    left_rect: tuple[float, float, float, float],
+    right_rect: tuple[float, float, float, float],
+) -> bool:
+    left = unicodedata.normalize("NFKC", left_text).strip()
+    right = unicodedata.normalize("NFKC", right_text).strip()
+    if not left or not right:
+        return False
+    if _PAGE_NUMBER_RE.fullmatch(right):
+        return False
+    if not left[-1].isalpha() or not right[0].islower():
+        return False
+    if _SHORT_UPPER_TOKEN_RE.fullmatch(right) and not left[-1].islower():
+        return False
+    gap = right_rect[0] - left_rect[2]
+    height = max(min(left_rect[3] - left_rect[1], right_rect[3] - right_rect[1]), 1.0)
+    if not (-0.5 <= gap <= max(2.0, height * 0.25)):
+        return False
+    compact_right = re.sub(r"[^A-Za-z]", "", right)
+    if not re.match(r"^[a-z]{1,12}(?:\b|[A-Z])", compact_right):
+        return False
+    return bool(re.search(r"[a-z]", compact_right))
+
+
+def _is_tight_inline_join(
+    left_rect: tuple[float, float, float, float],
+    right_rect: tuple[float, float, float, float],
+) -> bool:
+    gap = right_rect[0] - left_rect[2]
+    height = max(min(left_rect[3] - left_rect[1], right_rect[3] - right_rect[1]), 1.0)
+    return -0.5 <= gap <= max(1.2, height * 0.12)
+
+
+def _looks_like_inline_micro_fragment_continuation(left: Any, right: Any) -> bool:
+    left_rect = _box_rect(getattr(left, "box", None))
+    right_rect = _box_rect(getattr(right, "box", None))
+    if left_rect is None or right_rect is None:
+        return False
+    baseline_ok, _reason = _same_baseline_close_gap(left_rect, right_rect)
+    if not baseline_ok:
+        return False
+    gap = right_rect[0] - left_rect[2]
+    height = max(min(left_rect[3] - left_rect[1], right_rect[3] - right_rect[1]), 1.0)
+    if not (-0.75 <= gap <= max(3.0, height * 0.42)):
+        return False
+    left_text = unicodedata.normalize("NFKC", str(getattr(left, "unicode", "") or "")).strip()
+    right_text = unicodedata.normalize("NFKC", str(getattr(right, "unicode", "") or "")).strip()
+    if not left_text or not right_text:
+        return False
+    if _PAGE_NUMBER_RE.fullmatch(left_text) or _PAGE_NUMBER_RE.fullmatch(right_text):
+        return False
+    if not (_is_inline_micro_text_fragment(left_text) or _is_inline_micro_text_fragment(right_text)):
+        return False
+    combined = f"{left_text}{right_text}"
+    return _looks_like_prose_fragment(combined)
+
+
+def _looks_like_same_line_text_continuation(left: Any, right: Any) -> bool:
+    left_text = unicodedata.normalize("NFKC", str(getattr(left, "unicode", "") or "")).strip()
+    right_text = unicodedata.normalize("NFKC", str(getattr(right, "unicode", "") or "")).strip()
+    if not _looks_like_mergeable_line_fragment(left_text, right_text):
+        return False
+    left_rect = _box_rect(getattr(left, "box", None))
+    right_rect = _box_rect(getattr(right, "box", None))
+    if left_rect is None or right_rect is None:
+        return False
+    baseline_ok, _reason = _same_baseline_close_gap(left_rect, right_rect)
+    if not baseline_ok:
+        return False
+    return _looks_like_broken_word_boundary(left_text, right_text) or (
+        not _ends_sentence_like(left_text) and _looks_like_lowercase_continuation(right_text)
+    )
+
+
+def _is_inline_micro_text_fragment(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    compact = _SPACE_COLLAPSE_RE.sub("", normalized)
+    if not compact or len(compact) > 18:
+        return False
+    if any(char.isalpha() for char in compact):
+        return True
+    return bool(re.fullmatch(r"[.。,:;!?-]+", compact))
+
+
+def _looks_like_inline_decimal_continuation(left: Any, right: Any) -> bool:
+    left_text = unicodedata.normalize("NFKC", str(getattr(left, "unicode", "") or "")).strip()
+    right_text = unicodedata.normalize("NFKC", str(getattr(right, "unicode", "") or "")).strip()
+    if re.search(r"[-+±]?\d+\.$", left_text) is None:
+        return False
+    if re.match(r"^\d+(?:[A-Za-z%°ΩΩµμ]|$)", right_text) is None:
+        return False
+    left_rect = _box_rect(getattr(left, "box", None))
+    right_rect = _box_rect(getattr(right, "box", None))
+    if left_rect is None or right_rect is None:
+        return False
+    baseline_ok, _reason = _same_baseline_close_gap(left_rect, right_rect)
+    return baseline_ok
+
+
 def _looks_like_prose_fragment(text: str) -> bool:
     letters = sum(1 for char in text if char.isalpha())
     if letters < 3:
         return False
     return bool(re.search(r"[a-z]", text)) or bool(re.search(r"\s", text))
+
+
+def _looks_like_contiguous_body_line_pair(
+    left_text: str,
+    right_text: str,
+    left_rect: tuple[float, float, float, float],
+    right_rect: tuple[float, float, float, float],
+) -> bool:
+    left = unicodedata.normalize("NFKC", str(left_text or "")).strip()
+    right = unicodedata.normalize("NFKC", str(right_text or "")).strip()
+    if not left or not right:
+        return False
+    if not _looks_like_prose_fragment(left) or not _looks_like_prose_fragment(right):
+        return False
+    if _ends_sentence_like(left):
+        return False
+    if not (_looks_like_broken_word_boundary(left, right) or _looks_like_lowercase_continuation(right)):
+        return False
+    left_height = max(left_rect[3] - left_rect[1], 1.0)
+    right_height = max(right_rect[3] - right_rect[1], 1.0)
+    vertical_gap = left_rect[1] - right_rect[3]
+    if not (-2.0 <= vertical_gap <= max(6.0, min(left_height, right_height) * 0.72)):
+        return False
+    left_width = left_rect[2] - left_rect[0]
+    right_width = right_rect[2] - right_rect[0]
+    if min(left_width, right_width) < 48.0:
+        return False
+    x_delta = abs(left_rect[0] - right_rect[0])
+    if x_delta > max(8.0, min(left_width, right_width) * 0.08):
+        return False
+    return True
+
+
+def _ends_sentence_like(text: str) -> bool:
+    stripped = unicodedata.normalize("NFKC", str(text or "")).rstrip()
+    if not stripped:
+        return False
+    return bool(re.search(r"[.!?。！？:：;；]\s*(?:[])}）】\"'”’]*)$", stripped))
+
+
+def _looks_like_lowercase_continuation(text: str) -> bool:
+    stripped = unicodedata.normalize("NFKC", str(text or "")).lstrip()
+    if not stripped:
+        return False
+    first = stripped[0]
+    if first.islower() or first.isdigit() or first in "([{（":
+        return True
+    return bool(re.match(r"(?:and|or|of|to|for|with|in|on|by|from|unless|that|which|as|so)\b", stripped, re.IGNORECASE))
 
 
 def _same_baseline_close_gap(
@@ -2023,6 +3584,85 @@ def _looks_like_overlapping_fragment_cluster(group: list[tuple[int, Any]]) -> bo
     return overlapping >= 3 and short_fragments >= 2
 
 
+def _records_look_like_overlapping_fragment_cluster(records: list[_ParagraphRecord]) -> bool:
+    if len(records) < 3:
+        return False
+    entries = [(record, record.rect, unicodedata.normalize("NFKC", record.text).strip()) for record in records]
+    if any(rect is None or not text for _record, rect, text in entries):
+        return False
+    anchor_record, anchor_rect, anchor_text = max(
+        entries,
+        key=lambda item: (len(_SPACE_COLLAPSE_RE.sub("", item[2])), item[1][2] - item[1][0]),
+    )
+    if len(_SPACE_COLLAPSE_RE.sub("", anchor_text)) < 24:
+        return False
+    overlapping = 0
+    short_fragments = 0
+    for record, rect, text in entries:
+        if record.paragraph_id == anchor_record.paragraph_id:
+            continue
+        if not _same_overlap_fragment_baseline(anchor_rect, rect):
+            return False
+        if _horizontal_overlap_width(anchor_rect, rect) <= 0 and rect[0] > anchor_rect[2] + 6.0:
+            return False
+        overlapping += 1
+        if len(_SPACE_COLLAPSE_RE.sub("", text)) <= 8:
+            short_fragments += 1
+    return overlapping >= 2 and short_fragments >= 2
+
+
+def _build_overlap_collapse_cluster(
+    paragraphs: list[Any],
+    group: list[int],
+    removed_indices: set[int],
+) -> _OverlapCollapseCluster | None:
+    live_group = [(index, paragraphs[index]) for index in group if index not in removed_indices]
+    if not _looks_like_overlapping_fragment_cluster(live_group):
+        return None
+    ordered_group = tuple(
+        sorted(
+            live_group,
+            key=lambda item: (
+                _box_rect(getattr(item[1], "box", None))
+                or (math.inf, math.inf, math.inf, math.inf)
+            )[0],
+        )
+    )
+    base_index, base = _overlapping_fragment_anchor(list(ordered_group))
+    merged_text = ""
+    merged_rect: tuple[float, float, float, float] | None = None
+    absorbed_indices: list[int] = []
+    for candidate_index, candidate in ordered_group:
+        candidate_rect = _box_rect(getattr(candidate, "box", None))
+        if candidate_rect is None:
+            continue
+        if merged_rect is None:
+            merged_text = str(getattr(candidate, "unicode", "") or "")
+            merged_rect = candidate_rect
+            absorbed_indices.append(candidate_index)
+            continue
+        if not _should_absorb_overlapping_rect_fragment(merged_rect, candidate_rect):
+            continue
+        merged_text = _merged_text_with_overlap(
+            merged_text,
+            str(getattr(candidate, "unicode", "") or ""),
+            merged_rect,
+            candidate_rect,
+        )
+        merged_rect = _rect_union([merged_rect, candidate_rect]) or merged_rect
+        absorbed_indices.append(candidate_index)
+    if len(absorbed_indices) < 3 or merged_rect is None:
+        return None
+    return _OverlapCollapseCluster(
+        ordered_group=ordered_group,
+        base_index=base_index,
+        base=base,
+        absorbed_indices=tuple(absorbed_indices),
+        merged_text=merged_text,
+        merged_rect=merged_rect,
+    )
+
+
 def _overlapping_fragment_anchor(group: list[tuple[int, Any]]) -> tuple[int, Any]:
     return max(
         group,
@@ -2031,20 +3671,6 @@ def _overlapping_fragment_anchor(group: list[tuple[int, Any]]) -> tuple[int, Any
             ((_box_rect(getattr(item[1], "box", None)) or (0.0, 0.0, 0.0, 0.0))[2] - (_box_rect(getattr(item[1], "box", None)) or (0.0, 0.0, 0.0, 0.0))[0]),
         ),
     )
-
-
-def _should_absorb_overlapping_fragment(left: Any, right: Any) -> bool:
-    if getattr(left, "xobj_id", None) != getattr(right, "xobj_id", None):
-        return False
-    left_rect = _box_rect(getattr(left, "box", None))
-    right_rect = _box_rect(getattr(right, "box", None))
-    if left_rect is None or right_rect is None or not _same_overlap_fragment_baseline(left_rect, right_rect):
-        return False
-    if right_rect[0] < left_rect[0] - 1.0:
-        return False
-    gap = right_rect[0] - left_rect[2]
-    overlap = _horizontal_overlap_width(left_rect, right_rect)
-    return overlap > 0 or gap <= 6.0
 
 
 def _should_absorb_overlapping_rect_fragment(
@@ -2090,6 +3716,48 @@ def _wrapped_decimal_continuation_score(
     if abs(right_rect[3] - left_rect[3]) > max(left_height, right_height) * 0.35:
         return None
     return (left_rect[1] - right_rect[1], abs(right_rect[0] - left_rect[0]))
+
+
+def _best_wrapped_same_line_tail_left_neighbor(
+    right: Any,
+    first_group_rect: tuple[float, float, float, float],
+    first_group_text: str,
+    ordered_items: list[tuple[Any, int]],
+    hook_context: BabeldocHookContext,
+) -> Any | None:
+    best: tuple[tuple[float, float], Any] | None = None
+    for left, _left_original_index in ordered_items:
+        if left is right:
+            continue
+        if getattr(left, "xobj_id", None) != getattr(right, "xobj_id", None):
+            continue
+        left_record = hook_context._record_for_paragraph(left)
+        right_record = hook_context._record_for_paragraph(right)
+        if left_record is None or right_record is None:
+            continue
+        if left_record.role != "body" or right_record.role != "body":
+            continue
+        guard = hook_context._guard_merge_records(left_record, right_record)
+        if guard.get("guard_decision") == "rejected":
+            continue
+        left_rect = _box_rect(getattr(left, "box", None))
+        if left_rect is None:
+            continue
+        if not _same_visual_line(left_rect, first_group_rect):
+            continue
+        if left_rect[2] > first_group_rect[0] + 1.0:
+            continue
+        gap = first_group_rect[0] - left_rect[2]
+        height = max(min(left_rect[3] - left_rect[1], first_group_rect[3] - first_group_rect[1]), 1.0)
+        if gap > max(8.0, height * 0.85):
+            continue
+        left_text = str(getattr(left, "unicode", "") or "")
+        if not _looks_like_mergeable_line_fragment(left_text, first_group_text):
+            continue
+        score = (gap, -left_rect[2])
+        if best is None or score < best[0]:
+            best = (score, left)
+    return None if best is None else best[1]
 
 
 def _merge_paragraphs(left: Any, right: Any, separator: str | None = None) -> None:
@@ -2579,6 +4247,139 @@ def _build_typesetting_fonts(page: Any, typesetter: Any) -> dict[str | int, Any]
     return fonts
 
 
+def _symbol_font_ids_by_xobj(page: Any) -> dict[int | str | None, frozenset[str]]:
+    page_symbol_ids = _symbol_font_ids(getattr(page, "pdf_font", []) or [])
+    by_xobj: dict[int | str | None, frozenset[str]] = {None: page_symbol_ids}
+    for xobj in getattr(page, "pdf_xobject", []) or []:
+        xobj_id = getattr(xobj, "xobj_id", None)
+        if xobj_id is None:
+            continue
+        by_xobj[xobj_id] = page_symbol_ids | _symbol_font_ids(getattr(xobj, "pdf_font", []) or [])
+    return by_xobj
+
+
+def _symbol_font_ids(fonts: list[Any]) -> frozenset[str]:
+    ids: set[str] = set()
+    for font in fonts:
+        font_id = getattr(font, "font_id", None)
+        if font_id is None:
+            continue
+        font_name = str(getattr(font, "name", "") or font_id)
+        if _is_symbol_font_name(font_name):
+            ids.add(str(font_id))
+    return frozenset(ids)
+
+
+def _is_symbol_font_name(font_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(font_name or "").lower())
+    return "symbol" in normalized
+
+
+def _detect_detached_i2c_fallback_line_records(
+    records: list[_ParagraphRecord],
+    paragraphs_by_id: dict[str, Any],
+) -> list[dict[str, Any]]:
+    by_group: dict[tuple[int, int | str | None], list[_ParagraphRecord]] = {}
+    for record in records:
+        if record.layout_label != "fallback_line" or record.rect is None:
+            continue
+        by_group.setdefault((record.page_number, record.xobj_id), []).append(record)
+
+    samples: list[dict[str, Any]] = []
+    for group_records in by_group.values():
+        superscripts = [record for record in group_records if _is_detached_i2c_superscript_record(record)]
+        if not superscripts:
+            continue
+        for record in group_records:
+            paragraph = paragraphs_by_id.get(record.paragraph_id)
+            if paragraph is None or not _looks_like_detached_i2c_host_text(record.text):
+                continue
+            matched_superscript = _matching_detached_i2c_superscript(paragraph, record, superscripts)
+            if matched_superscript is None:
+                continue
+            samples.append(
+                {
+                    "paragraph_id": record.paragraph_id,
+                    "superscript_id": matched_superscript.paragraph_id,
+                    "page_number": record.page_number,
+                    "text": record.text[:120],
+                    "semantic_text": _detached_i2c_semantic_text(record.text)[:120],
+                    "rect": record.rect,
+                    "superscript_rect": matched_superscript.rect,
+                }
+            )
+    return samples
+
+
+def _looks_like_detached_i2c_host_text(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    return bool(re.search(r"(?<![A-Za-z])I\s+C(?=\s+[A-Za-z][A-Za-z -]{2,40}\b)", normalized))
+
+
+def _detached_i2c_semantic_text(text: str) -> str:
+    return re.sub(r"(?<![A-Za-z])I\s+C(?=\s+[A-Za-z][A-Za-z -]{2,40}\b)", "I2C", str(text or ""))
+
+
+def _detached_i2c_visual_text(text: str) -> str:
+    return re.sub(r"(?<![A-Za-z])I2C(?=\s+\S)", "I C", str(text or ""))
+
+
+def _is_detached_i2c_superscript_record(record: _ParagraphRecord) -> bool:
+    if record.rect is None:
+        return False
+    text = unicodedata.normalize("NFKC", record.text).strip()
+    if text != "2":
+        return False
+    width = record.rect[2] - record.rect[0]
+    height = record.rect[3] - record.rect[1]
+    return width <= 4.2 and height <= 4.8
+
+
+def _matching_detached_i2c_superscript(
+    host_paragraph: Any,
+    host_record: _ParagraphRecord,
+    superscripts: list[_ParagraphRecord],
+) -> _ParagraphRecord | None:
+    i_char, c_char = _detached_i2c_host_boundary_chars(_collect_fallback_line_chars(host_paragraph))
+    if i_char is None or c_char is None:
+        return None
+    i_rect = _box_rect(getattr(i_char, "box", None))
+    c_rect = _box_rect(getattr(c_char, "box", None))
+    if i_rect is None or c_rect is None:
+        return None
+    base_height = max(i_rect[3] - i_rect[1], c_rect[3] - c_rect[1], 1.0)
+    i_center = (i_rect[0] + i_rect[2]) / 2
+    c_center = (c_rect[0] + c_rect[2]) / 2
+    top = min(i_rect[1], c_rect[1])
+    bottom = max(i_rect[3], c_rect[3])
+    best: tuple[float, _ParagraphRecord] | None = None
+    for superscript in superscripts:
+        if superscript.paragraph_id == host_record.paragraph_id or superscript.rect is None:
+            continue
+        rect = superscript.rect
+        center_x = (rect[0] + rect[2]) / 2
+        center_y = (rect[1] + rect[3]) / 2
+        if not i_center <= center_x <= c_center + base_height * 0.45:
+            continue
+        if not top - base_height * 0.9 <= center_y <= bottom + base_height * 0.9:
+            continue
+        score = abs(center_x - ((i_center + c_center) / 2)) + abs(center_y - top)
+        if best is None or score < best[0]:
+            best = (score, superscript)
+    return best[1] if best is not None else None
+
+
+def _detached_i2c_host_boundary_chars(chars: list[Any]) -> tuple[Any | None, Any | None]:
+    non_space = [char for char in chars if str(getattr(char, "char_unicode", "") or "").strip()]
+    for index, char in enumerate(non_space[:-1]):
+        if str(getattr(char, "char_unicode", "") or "") != "I":
+            continue
+        next_char = non_space[index + 1]
+        if str(getattr(next_char, "char_unicode", "") or "") == "C":
+            return char, next_char
+    return None, None
+
+
 def _paragraph_pdf_chars(paragraph: Any) -> list[Any]:
     chars = []
     for composition in getattr(paragraph, "pdf_paragraph_composition", []) or []:
@@ -2649,6 +4450,7 @@ def _composition_debug_payload(composition: list[Any]) -> list[dict[str, Any]]:
                     "kind": "formula",
                     "unicode": "".join(str(getattr(char, "char_unicode", "") or "") for char in formula_chars),
                     "char_count": len(formula_chars),
+                    "rect": _rect_union([_box_rect(getattr(char, "box", None)) for char in formula_chars]),
                 }
             )
             payload.append(entry)
@@ -3551,6 +5353,11 @@ def _set_plain_unicode_paragraph_text(paragraph: Any, text: str) -> None:
 
 def _protect_technical_tokens_in_text(text: str) -> tuple[str, list[tuple[str, str]]]:
     replacements: list[tuple[int, int]] = []
+    placeholder_spans = [
+        match.span()
+        for pattern in (_PLACEHOLDER_TOKEN_RE, _BABELDOC_STYLE_PLACEHOLDER_RE)
+        for match in pattern.finditer(text)
+    ]
     for pattern in (
         _TECHNICAL_COMPACT_EQUATION_RE,
         _PLACEHOLDER_BRIDGED_TECHNICAL_TOKEN_RE,
@@ -3565,6 +5372,8 @@ def _protect_technical_tokens_in_text(text: str) -> tuple[str, list[tuple[str, s
     ):
         for match in pattern.finditer(text):
             start, end = match.span()
+            if _span_inside_any(start, end, placeholder_spans):
+                continue
             if any(start < existing_end and end > existing_start for existing_start, existing_end in replacements):
                 continue
             replacements.append((start, end))
@@ -3584,6 +5393,10 @@ def _protect_technical_tokens_in_text(text: str) -> tuple[str, list[tuple[str, s
         cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces), protected
+
+
+def _span_inside_any(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(span_start <= start and end <= span_end for span_start, span_end in spans)
 
 
 def _protected_token_placeholder(token: str, *, index: int, start: int, end: int) -> str:
@@ -3662,7 +5475,11 @@ def _normalize_translation_input_text(
         applied_events.append(
             {
                 "action": "formula_placeholder_translation_input_override",
+                "rule_key": "formula_placeholder_translation_input_override",
+                "rule_kind": "text_only",
+                "decision": "applied",
                 "paragraph_id": record.paragraph_id,
+                "role": record.role,
                 "layout_label": record.layout_label,
                 "branch": branch,
                 "incoming_text": str(getattr(translate_input, "unicode", "") or "")[:180],
@@ -3679,7 +5496,11 @@ def _normalize_translation_input_text(
     applied_events.append(
         {
             "action": "composition_translation_input_override",
+            "rule_key": "composition_translation_input_override",
+            "rule_kind": "text_only",
+            "decision": "applied",
             "paragraph_id": record.paragraph_id,
+            "role": record.role,
             "layout_label": record.layout_label,
             "incoming_text": candidate[:180],
             "source_text": source[:180],
@@ -4116,11 +5937,16 @@ def _is_inline_punctuation_fragment(text: str) -> bool:
     return bool(normalized) and len(normalized) <= 2 and _INLINE_PUNCTUATION_FRAGMENT_RE.fullmatch(normalized) is not None
 
 
+def _looks_like_dot_leader_fragment(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    return len(normalized) >= 8 and re.fullmatch(r"[.\u00b7\u2026\s]+", normalized) is not None
+
+
 def _supports_visual_line_split(paragraph: Any) -> bool:
     return getattr(paragraph, "layout_label", None) == "fallback_line"
 
 
-def _split_paragraph_by_visual_lines(paragraph: Any) -> list[Any]:
+def _split_paragraph_by_visual_lines(paragraph: Any, *, symbol_font_ids: frozenset[str] = frozenset()) -> list[Any]:
     composition = list(getattr(paragraph, "pdf_paragraph_composition", []) or [])
     if not composition:
         return [paragraph]
@@ -4155,12 +5981,133 @@ def _split_paragraph_by_visual_lines(paragraph: Any) -> list[Any]:
             split_paragraph.unicode = _composition_text(ordered_group_items)
             group_rect = _rect_union([_composition_item_rect(item) for item in ordered_group_items]) or group["rect"]
             _set_box_rect(getattr(split_paragraph, "box", None), group_rect)
+            rebuilt_text = _rebuild_fallback_line_text(split_paragraph, symbol_font_ids=symbol_font_ids)
+            if rebuilt_text:
+                split_paragraph.unicode = rebuilt_text
             if hasattr(split_paragraph, "debug_id") and getattr(split_paragraph, "debug_id", None):
                 split_paragraph.debug_id = f"{split_paragraph.debug_id}:vline:{split_index}"
             split_paragraph.optimal_scale = None
             split_paragraphs.append(split_paragraph)
             split_index += 1
     return split_paragraphs
+
+
+def _wrapped_same_line_tail_groups(
+    paragraph: Any,
+) -> list[tuple[list[Any], tuple[float, float, float, float]]] | None:
+    composition = list(getattr(paragraph, "pdf_paragraph_composition", []) or [])
+    if not composition:
+        return None
+    line_items: list[tuple[Any, tuple[float, float, float, float]]] = []
+    for item in composition:
+        line_items.extend(_split_composition_item_by_visual_lines(item))
+    if len(line_items) < 2:
+        return None
+    ordered_items = sorted(line_items, key=lambda item: _visual_line_item_sort_key(item[1]))
+    grouped_lines: list[dict[str, Any]] = []
+    for item, rect in ordered_items:
+        if grouped_lines and _same_visual_line(grouped_lines[-1]["rect"], rect):
+            grouped_lines[-1]["items"].append((item, rect))
+            grouped_lines[-1]["rect"] = _rect_union([grouped_lines[-1]["rect"], rect])
+            continue
+        grouped_lines.append({"items": [(item, rect)], "rect": rect})
+    if len(grouped_lines) < 2:
+        return None
+    groups: list[tuple[list[Any], tuple[float, float, float, float]]] = []
+    for group in grouped_lines:
+        ordered_group = sorted(group["items"], key=lambda fragment: fragment[1][0])
+        items = [item for item, _rect in ordered_group]
+        rect = _rect_union([rect for _item, rect in ordered_group])
+        if rect is None:
+            return None
+        groups.append((items, rect))
+    if not _looks_like_wrapped_same_line_tail(paragraph, groups):
+        return None
+    return groups
+
+
+def _looks_like_wrapped_same_line_tail(
+    paragraph: Any,
+    groups: list[tuple[list[Any], tuple[float, float, float, float]]],
+) -> bool:
+    if len(groups) < 2:
+        return False
+    paragraph_rect = _box_rect(getattr(paragraph, "box", None))
+    if paragraph_rect is None:
+        return False
+    text = str(getattr(paragraph, "unicode", "") or "")
+    if not _looks_like_prose_fragment(text):
+        return False
+    first_items, first_rect = groups[0]
+    second_items, second_rect = groups[1]
+    first_text = _composition_text(first_items).strip()
+    second_text = _composition_text(second_items).strip()
+    if not first_text or not second_text:
+        return False
+    first_height = max(first_rect[3] - first_rect[1], 1.0)
+    second_height = max(second_rect[3] - second_rect[1], 1.0)
+    if first_rect[1] <= second_rect[1] + max(first_height, second_height) * 0.45:
+        return False
+    if first_rect[0] <= paragraph_rect[0] + max(10.0, first_height * 1.2):
+        return False
+    if abs(second_rect[0] - paragraph_rect[0]) > max(8.0, second_height * 0.8):
+        return False
+    return True
+
+
+def _split_paragraph_by_composition_groups(
+    paragraph: Any,
+    groups: list[tuple[list[Any], tuple[float, float, float, float]]] | None,
+) -> list[Any]:
+    if not groups or len(groups) < 2:
+        return [paragraph]
+    split_paragraphs = []
+    for index, (items, rect) in enumerate(groups, start=1):
+        split_paragraph = copy.deepcopy(paragraph)
+        split_paragraph.pdf_paragraph_composition = items
+        split_paragraph.unicode = _composition_text(items)
+        _set_box_rect(getattr(split_paragraph, "box", None), rect)
+        if hasattr(split_paragraph, "debug_id") and getattr(split_paragraph, "debug_id", None):
+            split_paragraph.debug_id = f"{split_paragraph.debug_id}:wrapped_tail:{index}"
+        split_paragraph.optimal_scale = None
+        split_paragraphs.append(split_paragraph)
+    return split_paragraphs
+
+
+def _pop_merge_left_neighbor_for_wrapped_tail(
+    rewritten: list[Any],
+    tail_first_part: Any,
+    hook_context: BabeldocHookContext,
+) -> Any | None:
+    if not rewritten:
+        return None
+    left = rewritten[-1]
+    left_record = hook_context._record_for_paragraph(left)
+    right_record = hook_context._record_for_paragraph(tail_first_part)
+    guard = hook_context._guard_merge_records(left_record, right_record)
+    if guard.get("guard_decision") == "rejected":
+        return None
+    left_rect = _box_rect(getattr(left, "box", None))
+    right_rect = _box_rect(getattr(tail_first_part, "box", None))
+    if left_rect is None or right_rect is None:
+        return None
+    if not _same_visual_line(left_rect, right_rect):
+        return None
+    mergeable_line_fragment = _looks_like_mergeable_line_fragment(
+        str(getattr(left, "unicode", "") or ""),
+        str(getattr(tail_first_part, "unicode", "") or ""),
+    )
+    inline_decimal_continuation = _looks_like_inline_decimal_continuation(left, tail_first_part)
+    if not mergeable_line_fragment and not inline_decimal_continuation:
+        return None
+    baseline_ok, _reason = _same_baseline_close_gap(left_rect, right_rect)
+    if not baseline_ok:
+        return None
+    rewritten.pop()
+    merged = copy.deepcopy(left)
+    _merge_paragraphs(merged, tail_first_part, separator="" if inline_decimal_continuation else None)
+    hook_context._focus_postprocess_paragraph(merged)
+    return merged
 
 
 def _should_split_visual_line_groups(paragraph: Any, grouped_lines: list[dict[str, Any]]) -> bool:
@@ -4324,98 +6271,6 @@ def _should_split_fallback_line_fragment_cluster(
     return True
 
 
-def _fallback_line_split_tokens_with_underscore_context(paragraph: Any, paragraphs: list[Any], index: int) -> list[Any]:
-    if getattr(paragraph, "layout_label", None) != "fallback_line":
-        return [paragraph]
-    text = unicodedata.normalize("NFKC", str(getattr(paragraph, "unicode", "") or "")).strip()
-    if not _looks_like_splitworthy_multiline_fallback_text(text):
-        return [paragraph]
-    paragraph_rect = _box_rect(getattr(paragraph, "box", None))
-    if paragraph_rect is None:
-        return [paragraph]
-    parts = _split_fallback_line_paragraph_items(paragraph)
-    if len(parts) <= 1:
-        return [paragraph]
-    split_parts = [item for item, _rect in parts]
-    if not _has_underscore_neighbors(paragraphs, paragraph_rect):
-        return [paragraph]
-    return split_parts
-
-
-def _split_fallback_line_paragraph_items(paragraph: Any) -> list[tuple[Any, tuple[float, float, float, float]]]:
-    expanded: list[tuple[Any, tuple[float, float, float, float]]] = []
-    for item in getattr(paragraph, "pdf_paragraph_composition", []) or []:
-        expanded.extend(_split_multiline_fallback_line_item(item))
-    return expanded
-
-
-def _has_underscore_neighbors(paragraphs: list[Any], paragraph_rect: tuple[float, float, float, float]) -> bool:
-    paragraph_height = max(paragraph_rect[3] - paragraph_rect[1], 1.0)
-    for neighbor in paragraphs:
-        if getattr(neighbor, "layout_label", None) != "fallback_line":
-            continue
-        neighbor_text = unicodedata.normalize("NFKC", str(getattr(neighbor, "unicode", "") or "")).strip()
-        if neighbor_text != "_":
-            continue
-        neighbor_rect = _box_rect(getattr(neighbor, "box", None))
-        if neighbor_rect is None:
-            continue
-        horizontal_gap = min(abs(neighbor_rect[0] - paragraph_rect[2]), abs(paragraph_rect[0] - neighbor_rect[2]))
-        if horizontal_gap > paragraph_height * 8.0:
-            continue
-        if _same_baseline_close_gap(paragraph_rect, neighbor_rect)[0] or _same_baseline_close_gap(neighbor_rect, paragraph_rect)[0]:
-            return True
-        overlap = min(paragraph_rect[3], neighbor_rect[3]) - max(paragraph_rect[1], neighbor_rect[1])
-        if overlap > 0:
-            return True
-    return False
-
-
-def _can_merge_fallback_line_underscore_compound(left: Any, middle: Any, right: Any) -> bool:
-    if any(getattr(paragraph, "layout_label", None) != "fallback_line" for paragraph in (left, middle, right)):
-        return False
-    left_text = unicodedata.normalize("NFKC", str(getattr(left, "unicode", "") or "")).strip()
-    middle_text = unicodedata.normalize("NFKC", str(getattr(middle, "unicode", "") or "")).strip()
-    right_text = unicodedata.normalize("NFKC", str(getattr(right, "unicode", "") or "")).strip()
-    if middle_text != "_" or not left_text or not right_text:
-        return False
-    if re.fullmatch(r"[A-Z0-9]+", left_text) is None:
-        return False
-    if re.fullmatch(r"[A-Z0-9]+", right_text) is None:
-        return False
-    left_rect = _box_rect(getattr(left, "box", None))
-    middle_rect = _box_rect(getattr(middle, "box", None))
-    right_rect = _box_rect(getattr(right, "box", None))
-    if left_rect is None or middle_rect is None or right_rect is None:
-        return False
-    if getattr(left, "xobj_id", None) != getattr(middle, "xobj_id", None) or getattr(left, "xobj_id", None) != getattr(right, "xobj_id", None):
-        return False
-    if not _same_fallback_line_band(left_rect, middle_rect, right_rect):
-        return False
-    if not _is_tight_underscore_bridge(left_rect, middle_rect) or not _is_tight_underscore_bridge(middle_rect, right_rect):
-        return False
-    return True
-
-
-def _same_fallback_line_band(
-    left_rect: tuple[float, float, float, float],
-    middle_rect: tuple[float, float, float, float],
-    right_rect: tuple[float, float, float, float],
-) -> bool:
-    centers = [((rect[1] + rect[3]) / 2) for rect in (left_rect, middle_rect, right_rect)]
-    heights = [max(rect[3] - rect[1], 1.0) for rect in (left_rect, middle_rect, right_rect)]
-    return max(centers) - min(centers) <= max(heights) * 0.55
-
-
-def _is_tight_underscore_bridge(
-    left_rect: tuple[float, float, float, float],
-    right_rect: tuple[float, float, float, float],
-) -> bool:
-    gap = right_rect[0] - left_rect[2]
-    height = max(min(left_rect[3] - left_rect[1], right_rect[3] - right_rect[1]), 1.0)
-    return -2.0 <= gap <= max(6.0, height * 0.8)
-
-
 def _split_composition_item_by_visual_lines(item: Any) -> list[tuple[Any, tuple[float, float, float, float]]]:
     same_style = getattr(item, "pdf_same_style_characters", None)
     if same_style is not None:
@@ -4525,16 +6380,16 @@ def _composition_text(composition: list[Any]) -> str:
     return "".join(parts)
 
 
-def _rebuild_fallback_line_text(paragraph: Any) -> str | None:
+def _rebuild_fallback_line_text(paragraph: Any, *, symbol_font_ids: frozenset[str] | set[str] | None = None) -> str | None:
     chars = _collect_fallback_line_chars(paragraph)
     if len(chars) < 2:
         return None
     if not _looks_like_single_line_fallback_label(paragraph, chars):
         return None
-    rebuilt = _rebuild_compact_technical_label_text(paragraph, chars)
-    if rebuilt is None:
-        ordered = sorted(chars, key=_fallback_line_char_sort_key)
-        rebuilt = _fallback_line_text_from_chars(ordered).strip()
+    resolved_symbol_font_ids = symbol_font_ids
+    if resolved_symbol_font_ids is None:
+        resolved_symbol_font_ids = frozenset()
+    rebuilt = _rebuild_compact_technical_label_text(paragraph, chars, symbol_font_ids=frozenset(resolved_symbol_font_ids))
     return rebuilt or None
 
 
@@ -4555,19 +6410,27 @@ def _collect_fallback_line_chars(paragraph: Any) -> list[Any]:
     return chars
 
 
-def _rebuild_compact_technical_label_text(paragraph: Any, chars: list[Any]) -> str | None:
-    if not _is_compact_technical_label_candidate(paragraph, chars):
-        return None
+def _rebuild_compact_technical_label_text(
+    paragraph: Any,
+    chars: list[Any],
+    *,
+    symbol_font_ids: frozenset[str],
+) -> str | None:
     ordered = _sort_compact_technical_label_chars(chars)
     if len(ordered) < 2:
         return None
-    rebuilt = _fallback_line_text_from_chars(ordered).strip()
+    has_semantic_repair = _has_symbol_glyph_unit_repair(ordered, symbol_font_ids) or _has_i2c_superscript_geometry(ordered)
+    if not has_semantic_repair:
+        return None
+    if not _is_compact_technical_label_candidate(paragraph, ordered, has_semantic_repair=has_semantic_repair):
+        return None
+    rebuilt = _fallback_line_text_from_chars(ordered, symbol_font_ids=symbol_font_ids).strip()
     if not rebuilt:
         return None
-    return _normalize_compact_technical_label_text(rebuilt)
+    return _normalize_compact_technical_label_text(rebuilt, ordered)
 
 
-def _is_compact_technical_label_candidate(paragraph: Any, chars: list[Any]) -> bool:
+def _is_compact_technical_label_candidate(paragraph: Any, chars: list[Any], *, has_semantic_repair: bool = False) -> bool:
     layout_label = getattr(paragraph, "layout_label", None)
     if layout_label not in {"fallback_line", "figure_caption"}:
         return False
@@ -4575,16 +6438,19 @@ def _is_compact_technical_label_candidate(paragraph: Any, chars: list[Any]) -> b
     compact = _SPACE_COLLAPSE_RE.sub("", source_text)
     if not compact or len(compact) > 48:
         return False
-    if len(chars) < 4:
+    if len(chars) < 4 and not has_semantic_repair:
         return False
     if "\n" in source_text:
         return False
+    if has_semantic_repair:
+        return True
     technical_signals = (
         _TECHNICAL_IDENTIFIER_RE.search(source_text),
         _TECHNICAL_NUMBER_UNIT_RE.search(source_text),
         _TECHNICAL_RATIO_TOKEN_RE.search(source_text),
         _TECHNICAL_UNIT_RE.search(source_text),
         re.search(r"[=()/±°^]|[A-Z]\d", source_text),
+        _has_i2c_superscript_geometry(_sort_compact_technical_label_chars(chars)),
     )
     if not any(technical_signals):
         return False
@@ -4626,9 +6492,10 @@ def _dominant_compact_label_baseline(chars: list[Any]) -> float | None:
     return sum(values) / len(values)
 
 
-def _normalize_compact_technical_label_text(text: str) -> str:
+def _normalize_compact_technical_label_text(text: str, chars: list[Any]) -> str:
     normalized = _normalize_fallback_line_token_spacing(text)
-    normalized = re.sub(r"(?<![A-Za-z])I\s*C(?![A-Za-z])", "I2C", normalized)
+    if _has_i2c_superscript_geometry(chars):
+        normalized = re.sub(r"(?<![A-Za-z])I\s*(?:2\s*C|C\s*2)(?![A-Za-z])", "I2C", normalized)
     normalized = re.sub(r"\(\s+\)", "()", normalized)
     return normalized
 
@@ -4658,11 +6525,11 @@ def _fallback_line_char_sort_key(char: Any) -> tuple[float, float, float]:
     return (x1, (y1 + y2) / 2, y1)
 
 
-def _fallback_line_text_from_chars(chars: list[Any]) -> str:
+def _fallback_line_text_from_chars(chars: list[Any], *, symbol_font_ids: frozenset[str] = frozenset()) -> str:
     parts: list[str] = []
     previous = None
-    for char in chars:
-        current_text = str(getattr(char, "char_unicode", "") or "")
+    for index, char in enumerate(chars):
+        current_text = _fallback_line_semantic_char_text(chars, index, symbol_font_ids)
         if not current_text:
             previous = char
             continue
@@ -4670,7 +6537,126 @@ def _fallback_line_text_from_chars(chars: list[Any]) -> str:
             parts.append(" ")
         parts.append(current_text)
         previous = char
-    return _normalize_fallback_line_token_spacing("".join(parts))
+    normalized = _normalize_fallback_line_token_spacing("".join(parts))
+    if _has_i2c_superscript_geometry(chars):
+        normalized = re.sub(r"(?<![A-Za-z])I\s*(?:2\s*C|C\s*2)(?![A-Za-z])", "I2C", normalized)
+    return normalized
+
+
+def _fallback_line_semantic_char_text(chars: list[Any], index: int, symbol_font_ids: frozenset[str]) -> str:
+    char = chars[index]
+    text = str(getattr(char, "char_unicode", "") or "")
+    if not text or not _uses_symbol_font(char, symbol_font_ids):
+        return text
+    if text == "m" and _symbol_m_is_micro_unit(chars, index):
+        return "µ"
+    if text == "W" and _symbol_w_is_ohm_unit(chars, index):
+        return "Ω"
+    return text
+
+
+def _has_symbol_glyph_unit_repair(chars: list[Any], symbol_font_ids: frozenset[str]) -> bool:
+    for index, char in enumerate(chars):
+        text = str(getattr(char, "char_unicode", "") or "")
+        if text and _fallback_line_semantic_char_text(chars, index, symbol_font_ids) != text:
+            return True
+    return False
+
+
+def _uses_symbol_font(char: Any, symbol_font_ids: frozenset[str]) -> bool:
+    font_id = getattr(getattr(char, "pdf_style", None), "font_id", None)
+    return font_id is not None and str(font_id) in symbol_font_ids
+
+
+def _symbol_m_is_micro_unit(chars: list[Any], index: int) -> bool:
+    right = _next_non_space_char(chars, index)
+    if right is None:
+        return False
+    right_text = str(getattr(right, "char_unicode", "") or "")
+    if right_text not in {"F", "A", "V", "s", "S"}:
+        return False
+    return _chars_are_unit_neighbors(chars[index], right)
+
+
+def _symbol_w_is_ohm_unit(chars: list[Any], index: int) -> bool:
+    left = _previous_non_space_char(chars, index)
+    if left is None:
+        return False
+    left_text = str(getattr(left, "char_unicode", "") or "")
+    if not (left_text.isdigit() or left_text in {"k", "K", "M"}):
+        return False
+    return _chars_are_unit_neighbors(left, chars[index])
+
+
+def _previous_non_space_char(chars: list[Any], index: int) -> Any | None:
+    for candidate in reversed(chars[:index]):
+        if str(getattr(candidate, "char_unicode", "") or "").strip():
+            return candidate
+    return None
+
+
+def _next_non_space_char(chars: list[Any], index: int) -> Any | None:
+    for candidate in chars[index + 1 :]:
+        if str(getattr(candidate, "char_unicode", "") or "").strip():
+            return candidate
+    return None
+
+
+def _chars_are_unit_neighbors(left: Any, right: Any) -> bool:
+    left_rect = _box_rect(getattr(left, "box", None))
+    right_rect = _box_rect(getattr(right, "box", None))
+    if left_rect is None or right_rect is None:
+        return False
+    gap = right_rect[0] - left_rect[2]
+    if gap < -0.7:
+        return True
+    font_sizes = []
+    for char in (left, right):
+        size = float(getattr(getattr(char, "pdf_style", None), "font_size", 0) or 0)
+        if size > 0:
+            font_sizes.append(size)
+    font_size = min(font_sizes) if font_sizes else 7.0
+    return gap <= max(1.8, font_size * 0.32)
+
+
+def _has_i2c_superscript_geometry(chars: list[Any]) -> bool:
+    non_space = [char for char in chars if str(getattr(char, "char_unicode", "") or "").strip()]
+    for index, char in enumerate(non_space):
+        if str(getattr(char, "char_unicode", "") or "") != "I":
+            continue
+        next_chars = non_space[index + 1 : index + 3]
+        if len(next_chars) < 2:
+            continue
+        texts = [str(getattr(candidate, "char_unicode", "") or "") for candidate in next_chars]
+        if texts == ["2", "C"] and _looks_like_superscript_between_i_and_c(char, next_chars[0], next_chars[1]):
+            return True
+        if texts == ["C", "2"] and _looks_like_superscript_between_i_and_c(char, next_chars[1], next_chars[0]):
+            return True
+    return False
+
+
+def _looks_like_superscript_between_i_and_c(i_char: Any, two_char: Any, c_char: Any) -> bool:
+    i_rect = _box_rect(getattr(i_char, "box", None))
+    two_rect = _box_rect(getattr(two_char, "box", None))
+    c_rect = _box_rect(getattr(c_char, "box", None))
+    if i_rect is None or two_rect is None or c_rect is None:
+        return False
+    base_top = min(i_rect[1], c_rect[1])
+    base_height = max(i_rect[3] - i_rect[1], c_rect[3] - c_rect[1], 1.0)
+    two_height = two_rect[3] - two_rect[1]
+    if two_height > base_height * 0.9:
+        return False
+    expanded_top = base_top - base_height * 0.45
+    expanded_bottom = max(i_rect[3], c_rect[3]) + base_height * 0.45
+    two_center_y = (two_rect[1] + two_rect[3]) / 2
+    if not expanded_top <= two_center_y <= expanded_bottom:
+        return False
+    i_center = (i_rect[0] + i_rect[2]) / 2
+    c_center = (c_rect[0] + c_rect[2]) / 2
+    two_center = (two_rect[0] + two_rect[2]) / 2
+    if c_center - i_center > max(14.0, base_height * 2.2):
+        return False
+    return i_center <= two_center <= c_center + base_height * 0.35
 
 
 def _should_insert_fallback_line_space(previous: Any, current: Any, current_text: str) -> bool:
@@ -4729,13 +6715,28 @@ def _should_merge_fallback_line_tokens(left: str, right: str) -> bool:
         return False
     left_last = left[-1]
     right_first = right[0]
+    if left_last in {"k", "K", "M"} and right_first in {"Ω", "Ω"}:
+        return True
     if left_last in "(/_-" or right_first in "/_-)":
         return True
     if _looks_like_compact_technical_token_join(left, right):
         return True
     if len(left) == 1 or len(right) == 1:
-        return any(char.isalnum() for char in (left_last, right_first))
+        return _looks_like_short_pin_or_bus_token_join(left, right)
     if left_last.isupper() and right_first.isupper() and min(len(left), len(right)) <= 2:
+        return True
+    return False
+
+
+def _looks_like_short_pin_or_bus_token_join(left: str, right: str) -> bool:
+    combined = f"{left}{right}"
+    if not re.fullmatch(r"[A-Za-z0-9]+", combined):
+        return False
+    if _TECHNICAL_IDENTIFIER_RE.fullmatch(combined):
+        return True
+    if re.fullmatch(r"(?:AIN|GPIO|ADDR|ALERT|SCL|SDA|VDD|VSS|GND|A|D)\d{1,2}", combined, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\d{1,2}(?:V|A|F|S|Hz|kHz|MHz|SPS)", combined, re.IGNORECASE):
         return True
     return False
 
@@ -4770,86 +6771,6 @@ def _looks_like_compact_technical_token_join(left: str, right: str) -> bool:
     return False
 
 
-def _is_small_fallback_line_fragment(paragraph: Any) -> bool:
-    if getattr(paragraph, "layout_label", None) != "fallback_line":
-        return False
-    chars = _collect_fallback_line_chars(paragraph)
-    if not _looks_like_single_line_fallback_label(paragraph, chars):
-        return False
-    text = unicodedata.normalize("NFKC", str(getattr(paragraph, "unicode", "") or "")).strip()
-    collapsed = _SPACE_COLLAPSE_RE.sub("", text)
-    if not collapsed or len(collapsed) != 1:
-        return False
-    return collapsed.isdigit()
-
-
-def _fallback_line_fragment_attachment_score(fragment: Any, target: Any) -> float | None:
-    if _is_fallback_line_underscore_band_paragraph(fragment) or _is_fallback_line_underscore_band_paragraph(target):
-        return None
-    if getattr(target, "layout_label", None) != "fallback_line":
-        return None
-    fragment_text = unicodedata.normalize("NFKC", str(getattr(fragment, "unicode", "") or "")).strip()
-    target_text = unicodedata.normalize("NFKC", str(getattr(target, "unicode", "") or "")).strip()
-    if not fragment_text or not target_text or _is_small_fallback_line_fragment(target):
-        return None
-    if _creates_ambiguous_numeric_token(fragment_text, target_text):
-        return None
-    if getattr(fragment, "xobj_id", None) != getattr(target, "xobj_id", None):
-        return None
-    fragment_rect = _box_rect(getattr(fragment, "box", None))
-    target_rect = _box_rect(getattr(target, "box", None))
-    if fragment_rect is None or target_rect is None:
-        return None
-    if not _looks_like_superscript_or_subscript_fragment(fragment_rect, target_rect):
-        return None
-    fragment_width = fragment_rect[2] - fragment_rect[0]
-    target_width = target_rect[2] - target_rect[0]
-    target_height = max(target_rect[3] - target_rect[1], 1.0)
-    if target_height > 10.5:
-        return None
-    if target_width <= 0 or fragment_width > target_width * 0.4:
-        return None
-    fragment_height = max(fragment_rect[3] - fragment_rect[1], 1.0)
-    if fragment_rect[1] <= target_rect[3] and fragment_rect[3] >= target_rect[1]:
-        return None
-    fragment_center_x = _rect_center_x(fragment_rect)
-    if fragment_center_x > target_rect[0] + target_width * 0.45:
-        return None
-    horizontal_cover = target_rect[0] - 3.0 <= fragment_center_x <= target_rect[2] + 3.0
-    left_gap = abs(fragment_rect[2] - target_rect[0])
-    right_gap = abs(fragment_rect[0] - target_rect[2])
-    if not horizontal_cover and min(left_gap, right_gap) > max(fragment_height, target_height) * 1.8:
-        return None
-    vertical_gap = min(abs(fragment_rect[1] - target_rect[3]), abs(target_rect[1] - fragment_rect[3]))
-    if vertical_gap > max(fragment_height, target_height) * 1.2:
-        return None
-    union_rect = _rect_union([fragment_rect, target_rect])
-    if union_rect is None:
-        return None
-    union_height = union_rect[3] - union_rect[1]
-    if union_height > max(fragment_height, target_height) * 3.0:
-        return None
-    return vertical_gap + min(left_gap, right_gap)
-
-
-def _creates_ambiguous_numeric_token(fragment_text: str, target_text: str) -> bool:
-    fragment = unicodedata.normalize("NFKC", str(fragment_text or "")).strip()
-    target = unicodedata.normalize("NFKC", str(target_text or "")).strip()
-    if not fragment or not target:
-        return False
-    merged_left = f"{fragment}{target}"
-    merged_right = f"{target}{fragment}"
-    ambiguous_patterns = (
-        r"[-+±]?\d+(?:[.,]\d+)?[A-Za-z]{2,}",
-        r"[A-Za-z]{2,}[-+±]?\d+(?:[.,]\d+)?[A-Za-z]+",
-    )
-    return any(
-        re.fullmatch(pattern, candidate) is not None
-        for candidate in (merged_left, merged_right)
-        for pattern in ambiguous_patterns
-    )
-
-
 def _detect_fallback_line_underscore_bands(records: list[_ParagraphRecord]) -> set[str]:
     grouped: dict[tuple[int, int | None], list[_ParagraphRecord]] = {}
     for record in records:
@@ -4873,6 +6794,99 @@ def _detect_fallback_line_underscore_bands(records: list[_ParagraphRecord]) -> s
                 if _rects_share_fallback_line_band(base_rect, candidate.rect):
                     protected.add(candidate.paragraph_id)
     return protected
+
+
+def _detect_schematic_figure_label_ids(records: list[_ParagraphRecord]) -> set[str]:
+    grouped: dict[tuple[int, int | str | None], list[_ParagraphRecord]] = {}
+    for record in records:
+        if record.layout_label != "fallback_line" or record.rect is None:
+            continue
+        grouped.setdefault((record.page_number, record.xobj_id), []).append(record)
+    preserved: set[str] = set()
+    for group_records in grouped.values():
+        anchors = [record for record in group_records if _looks_like_schematic_anchor_label(record)]
+        if len(anchors) < 6:
+            continue
+        cluster_rect = _rect_union([record.rect for record in anchors])
+        if cluster_rect is None:
+            continue
+        for record in group_records:
+            if record.paragraph_id in preserved:
+                continue
+            if not _looks_like_schematic_damaged_label(record):
+                continue
+            if _inside_schematic_label_cluster(record.rect, cluster_rect):
+                preserved.add(record.paragraph_id)
+    return preserved
+
+
+def _looks_like_schematic_anchor_label(record: _ParagraphRecord) -> bool:
+    text = unicodedata.normalize("NFKC", record.text).strip()
+    compact = _SPACE_COLLAPSE_RE.sub("", text)
+    if not compact:
+        return False
+    if _TECHNICAL_IDENTIFIER_RE.search(compact):
+        return True
+    if _TECHNICAL_NUMBER_UNIT_RE.search(text) or _TECHNICAL_RATIO_TOKEN_RE.search(text):
+        return True
+    if re.fullmatch(r"(?:AIN|SCL|SDA|VDD|GND|ADDR|ALERT|JTAG|ON|OFF|SAMPLE|S\d+|DOUT/DRDY|DIN|CLK)[A-Z0-9./() -]*", compact, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?V", compact, re.IGNORECASE):
+        return True
+    return False
+
+
+def _looks_like_schematic_damaged_label(record: _ParagraphRecord) -> bool:
+    if record.rect is None:
+        return False
+    text = unicodedata.normalize("NFKC", record.text).strip()
+    compact = _SPACE_COLLAPSE_RE.sub("", text)
+    if not compact:
+        return False
+    x1, y1, x2, y2 = record.rect
+    width = x2 - x1
+    height = y2 - y1
+    if height > 9.5 or width > 90.0:
+        return False
+    if _looks_like_translatable_fallback_line_text(text) and not _looks_like_schematic_extraction_noise(text):
+        return False
+    if _is_preserve_candidate(record):
+        return True
+    return _looks_like_schematic_extraction_noise(text)
+
+
+def _looks_like_schematic_extraction_noise(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    compact = _SPACE_COLLAPSE_RE.sub("", normalized)
+    if not compact:
+        return False
+    if re.search(r"\bF\d{2,}[A-Za-z]\b", normalized):
+        return True
+    if re.search(r"\b[A-Z]{1,4}/[A-Z]\s+[A-Z]\b", normalized):
+        return True
+    if re.search(r"\b[A-Z]\s+[A-Z0-9/]\s+[A-Z]\b", normalized):
+        return True
+    if re.search(r"\b[A-Za-z]+[A-Z][a-z]*e\b", compact) and re.search(r"\b[A-Z]\s+[A-Z]", normalized):
+        return True
+    return False
+
+
+def _inside_schematic_label_cluster(
+    rect: tuple[float, float, float, float],
+    cluster_rect: tuple[float, float, float, float],
+) -> bool:
+    x1, y1, x2, y2 = cluster_rect
+    width = max(x2 - x1, 1.0)
+    height = max(y2 - y1, 1.0)
+    expanded = (
+        x1 - max(18.0, width * 0.08),
+        y1 - max(14.0, height * 0.16),
+        x2 + max(18.0, width * 0.08),
+        y2 + max(14.0, height * 0.16),
+    )
+    center_x = (rect[0] + rect[2]) / 2
+    center_y = (rect[1] + rect[3]) / 2
+    return expanded[0] <= center_x <= expanded[2] and expanded[1] <= center_y <= expanded[3]
 
 
 def _is_fallback_line_underscore_band_paragraph(paragraph_or_record: Any) -> bool:
@@ -4906,19 +6920,6 @@ def _rects_share_fallback_line_band(
         return False
     horizontal_gap = min(abs(right_rect[0] - left_rect[2]), abs(left_rect[0] - right_rect[2]))
     return horizontal_gap <= max(left_height, right_height) * 8.0
-
-
-def _looks_like_superscript_or_subscript_fragment(
-    fragment_rect: tuple[float, float, float, float],
-    target_rect: tuple[float, float, float, float],
-) -> bool:
-    target_height = max(target_rect[3] - target_rect[1], 1.0)
-    fragment_height = max(fragment_rect[3] - fragment_rect[1], 1.0)
-    if fragment_height > target_height * 0.92:
-        return False
-    target_center_y = (target_rect[1] + target_rect[3]) / 2
-    fragment_center_y = (fragment_rect[1] + fragment_rect[3]) / 2
-    return abs(fragment_center_y - target_center_y) >= target_height * 0.3
 
 
 def _characters_text(chars: list[Any]) -> str:

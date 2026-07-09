@@ -7,7 +7,6 @@ import {
   copy,
   defaultUploadState,
   downloadJob,
-  downloadJobDebugArtifact,
   refreshAll,
   retryJob,
   selectJob,
@@ -218,10 +217,6 @@ function canRetry(job) {
 
 function canCancel(job) {
   return activeJobStatuses.has(job.status);
-}
-
-function canDownloadDebugArtifacts(job) {
-  return job.status === "completed" && job.output_file && !isJobExpired(job);
 }
 
 onMounted(() => {
@@ -468,15 +463,6 @@ onBeforeUnmount(() => {
               <span>{{ copy("输出文件", "Output file") }}</span>
               <strong :title="state.selectedJob.output_file?.original_name || ''">{{ state.selectedJob.output_file?.original_name || "—" }}</strong>
             </div>
-          </div>
-
-          <div v-if="canDownloadDebugArtifacts(state.selectedJob)" class="button-row">
-            <button class="ghost-button" type="button" @click="downloadJobDebugArtifact(state.selectedJob.id, 'structure-before')">
-              {{ copy("下载切分前 JSON", "Download pre-split JSON") }}
-            </button>
-            <button class="ghost-button" type="button" @click="downloadJobDebugArtifact(state.selectedJob.id, 'structure-after')">
-              {{ copy("下载切分后 JSON", "Download post-split JSON") }}
-            </button>
           </div>
 
           <div class="timeline">

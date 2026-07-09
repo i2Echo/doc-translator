@@ -299,9 +299,9 @@ sidecar 需要记录每个结构 action 的 guard 结果，便于后续排查。
 | 双栏论文 | `translate.cli.text.with.figure.pdf` | 跨栏、图文混排、竖排 arXiv |
 | 未知字体论文 | `translate.cli.font.unknown.pdf` | 字体 fallback、正文重排 |
 | datasheet | `lm555.pdf` 首页/多页 | 图表、表格、页眉页脚、技术 token |
-| TI datasheet | `ADS1113-source.pdf` 前几页 | 多栏、技术单位、页脚、表格 |
-| TOC 文档 | 后续补充 | 点导引、页码保留 |
-| 扫描/OCR 文档 | 后续补充 | OCR workaround、白底擦除 |
+| TI datasheet | `ADS1113-p01-p02.pdf`、`ADS1113-p03-p04.pdf`、`ADS1113-p11-p12.pdf` | 多栏、技术单位、页脚、表格、wrapped same-line tail 粘连、电路图短标注 |
+| TOC 文档 | `toc-dot-leaders.pdf` | 点导引、页码保留 |
+| 扫描/OCR 文档 | `scanned-ocr-smoke.pdf` | OCR workaround、白底擦除 |
 
 ### 2. 输出对比指标
 
@@ -450,4 +450,25 @@ Milestone 4 风险最高，必须在 Milestone 3b 变绿后再做。`babeldoc_ho
 
 ## 下一步建议
 
-优先做 Milestone 1a、Milestone 1b 和 Milestone 3a：先把结构规则变成可开关、可 observe、可解释，再做单 PDF metrics runner 作为量化尺子。之后再推进 Milestone 2 的页面布局 guard，最后把单 PDF 尺子扩展成 Milestone 3b 的批量门禁。
+当前已完成 Milestone 1a、Milestone 1b、Milestone 3a、Milestone 2 第一版 layout guard、Milestone 3b，以及 Milestone 4。
+
+已落地能力：
+
+1. `HookPolicy` per-rule 开关层，结构规则默认 `observe`。
+2. 结构规则 plan/apply 拆分，sidecar schema v2 记录 `decision`、`role_counts`、guard 信息。
+3. `PageLayoutSummary` 第一版，支持 `body_column`、`edge`、`table`、`figure`、`unknown`，并接入 merge/split/remove/collapse/split-numbered guard。
+4. 单 PDF runner 和批量 runner，固定样本 baseline 进入版本化目录。
+5. 批量硬门禁覆盖普通正文 structure applied、overflow、cross-column allowed、unknown/non-body allowed、普通正文 split allowed。
+6. 未接线 fallback_line 结构死规则已删除，避免后续误激活。
+7. 第一版 layout guard 的列识别、区域置信度和容差阈值已收束为命名常量，后续调参可以直接对照语义修改。
+8. `normalize_fragmented` 已拆为 `observe_multiline_body_blocks` 与 `split_compact_fallback_labels` 两条内部计划路径。
+9. `merge_same_line` 的候选链、plan item 和 reject sample 构造已提为小 helper，plan/apply 仍复用原判定顺序。
+10. `collapse_overlap` 的 cluster 构造已由 plan/apply 共享，并修复了 plan 阶段潜在未定义变量路径。
+11. 新增通用 `merge_same_line_fragment_bridge` 与 `split_wrapped_same_line_tail` 白名单规则，分别修复同 baseline 断词/小数/内联标点碎片、以及同列行尾碎片被粘到下一视觉行 paragraph 的抽取形态；规则不依赖文件名、页码、厂商或固定短语。
+12. 新增电路图 `fallback_line` 短标注保护：对同页同 xobj 的图形技术标注簇，只 preserve 短小且明显抽取损坏/紧凑技术化的标签，避免源文本层损坏后进入普通翻译路径。
+
+下一步建议：
+
+1. 继续用真实坏样本扩充固定样本集，优先替换或补充更贴近生产文档的 TOC 和扫描/OCR 样本。
+2. 新增坏样本时先进入 `tests/regression/inputs/` 和 baseline，再讨论规则变化。
+3. BabelDOC 升级或 `_build_hooked_high_level()` 覆盖点变化时，必须跑完整容器 batch。

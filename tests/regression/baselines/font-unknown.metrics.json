@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "input": "font-unknown",
+  "paragraph_total_before": 7,
+  "paragraph_total_after": 7,
+  "structure_actions_by_decision": {
+    "normalize_pdf_font_traits": {
+      "applied": 1,
+      "observed": 0,
+      "rejected": 0,
+      "skipped": 0,
+      "unknown": 0
+    },
+    "reject_same_line_fragment_merge": {
+      "applied": 0,
+      "observed": 0,
+      "rejected": 1,
+      "skipped": 0,
+      "unknown": 0
+    },
+    "protect_technical_tokens": {
+      "applied": 2,
+      "observed": 0,
+      "rejected": 0,
+      "skipped": 0,
+      "unknown": 0
+    }
+  },
+  "structure_actions_by_role": {
+    "reject_same_line_fragment_merge": {
+      "body": 4
+    }
+  },
+  "structure_guard_decisions": {
+    "same_body_column": {
+      "allowed": 2,
+      "rejected": 0
+    }
+  },
+  "body_role_structure_decisions": {
+    "applied": 0,
+    "observed": 0,
+    "rejected": 4,
+    "skipped": 0
+  },
+  "multiline_prose_rewrites": {
+    "rejected_multi_line_blocks": 0,
+    "observed_multiline_body_block": 0
+  },
+  "font_size_normalize_hits": 0,
+  "page_text_coverage": {
+    "available": true,
+    "pages": [
+      {
+        "page": 1,
+        "coverage": 0.3031
+      }
+    ]
+  },
+  "overflow_paragraphs": {
+    "available": true,
+    "method": "bbox_proxy_v1",
+    "total": 0,
+    "per_page": [
+      {
+        "page": 1,
+        "overflow_blocks": 0
+      }
+    ]
+  },
+  "hook_policy": {
+    "kind_defaults": {
+      "text_only": "apply",
+      "style_only": "apply",
+      "structure": "observe",
+      "render": "apply"
+    },
+    "modes": {
+      "protect_technical_tokens": "apply",
+      "skip_translation": "apply",
+      "translate_toc_title_only": "apply",
+      "restore_source_line_breaks": "apply",
+      "restore_neighbor_protected_placeholders": "apply",
+      "restore_definition_line_styles_after_translation": "apply",
+      "formula_placeholder_translation_input_override": "apply",
+      "composition_translation_input_override": "apply",
+      "normalize_pdf_font_traits": "apply",
+      "restore_vertical_passthrough_layout": "apply",
+      "normalize_body_font_sizes": "apply",
+      "normalize_fragmented": "observe",
+      "merge_same_line": "observe",
+      "remove_subsumed": "observe",
+      "collapse_overlap": "observe",
+      "split_numbered_lists": "observe",
+      "reconcile_repeated_edge": "observe",
+      "render_axis_label": "apply"
+    },
+    "by_kind": {
+      "text_only": {
+        "protect_technical_tokens": "apply",
+        "skip_translation": "apply",
+        "translate_toc_title_only": "apply",
+        "restore_source_line_breaks": "apply",
+        "restore_neighbor_protected_placeholders": "apply",
+        "restore_definition_line_styles_after_translation": "apply",
+        "formula_placeholder_translation_input_override": "apply",
+        "composition_translation_input_override": "apply"
+      },
+      "style_only": {
+        "normalize_pdf_font_traits": "apply",
+        "restore_vertical_passthrough_layout": "apply",
+        "normalize_body_font_sizes": "apply"
+      },
+      "structure": {
+        "normalize_fragmented": "observe",
+        "merge_same_line": "observe",
+        "remove_subsumed": "observe",
+        "collapse_overlap": "observe",
+        "split_numbered_lists": "observe",
+        "reconcile_repeated_edge": "observe"
+      },
+      "render": {
+        "render_axis_label": "apply"
+      }
+    },
+    "env_var_names": {
+      "protect_technical_tokens": "PDF_HOOK_TEXT_PROTECT_TECHNICAL_TOKENS",
+      "skip_translation": "PDF_HOOK_TEXT_SKIP_TRANSLATION",
+      "translate_toc_title_only": "PDF_HOOK_TEXT_TRANSLATE_TOC_TITLE",
+      "restore_source_line_breaks": "PDF_HOOK_TEXT_RESTORE_SOURCE_LINE_BREAKS",
+      "restore_neighbor_protected_placeholders": "PDF_HOOK_TEXT_RESTORE_NEIGHBOR_PLACEHOLDERS",
+      "restore_definition_line_styles_after_translation": "PDF_HOOK_TEXT_RESTORE_DEFINITION_STYLES",
+      "formula_placeholder_translation_input_override": "PDF_HOOK_TEXT_FORMULA_PLACEHOLDER_OVERRIDE",
+      "composition_translation_input_override": "PDF_HOOK_TEXT_COMPOSITION_INPUT_OVERRIDE",
+      "normalize_pdf_font_traits": "PDF_HOOK_STYLE_NORMALIZE_PDF_FONT_TRAITS",
+      "restore_vertical_passthrough_layout": "PDF_HOOK_STYLE_RESTORE_VERTICAL_LAYOUT",
+      "normalize_body_font_sizes": "PDF_HOOK_STYLE_NORMALIZE_BODY_FONT_SIZES",
+      "normalize_fragmented": "PDF_HOOK_STRUCTURE_NORMALIZE_FRAGMENTED",
+      "merge_same_line": "PDF_HOOK_STRUCTURE_MERGE_SAME_LINE",
+      "remove_subsumed": "PDF_HOOK_STRUCTURE_REMOVE_SUBSUMED",
+      "collapse_overlap": "PDF_HOOK_STRUCTURE_COLLAPSE_OVERLAP",
+      "split_numbered_lists": "PDF_HOOK_STRUCTURE_SPLIT_NUMBERED_LISTS",
+      "reconcile_repeated_edge": "PDF_HOOK_STRUCTURE_RECONCILE_REPEATED_EDGE",
+      "render_axis_label": "PDF_HOOK_RENDER_AXIS_LABEL"
+    }
+  },
+  "role_counts": {
+    "body": 7
+  }
+}

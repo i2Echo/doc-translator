@@ -540,13 +540,6 @@ export async function downloadJob(jobId) {
   triggerDownload(blob, filename);
 }
 
-export async function downloadJobDebugArtifact(jobId, artifactKind) {
-  const response = await authedRequest(`/jobs/${jobId}/debug-artifacts/${artifactKind}`, {}, { raw: true });
-  const blob = await response.blob();
-  const filename = contentDispositionFilename(response.headers.get("content-disposition"), `${artifactKind}-${jobId}.json`);
-  triggerDownload(blob, filename);
-}
-
 export async function saveSettings(payload) {
   state.pending.settings = true;
   state.messages.settings = "";

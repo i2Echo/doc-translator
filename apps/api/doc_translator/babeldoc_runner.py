@@ -9,6 +9,7 @@ from types import FunctionType, SimpleNamespace
 from typing import Any, Callable
 
 from doc_translator.babeldoc_hooks import BabeldocHookContext
+from doc_translator.hook_policy import HookPolicy
 from doc_translator.settings_service import RuntimeSettings
 
 
@@ -45,7 +46,7 @@ def translate_pdf_with_babeldoc_library(
     import httpx
     import openai
 
-    hook_context = BabeldocHookContext()
+    hook_context = BabeldocHookContext(hook_policy=HookPolicy.from_env())
     set_translate_rate_limiter(qps)
 
     translator = OpenAITranslator(
@@ -190,9 +191,25 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
         def process(self, document: Any) -> Any:
             result = super().process(document)
             hook_context.normalize_font_traits(document)
-            if hook_context.normalize_fragmented_paragraphs_before_translation(document):
-                hook_context.note_phase("normalize_fragmented_paragraphs_before_translation")
             hook_context.classify_document(document)
+            if hook_context.normalize_fragmented_paragraphs_before_translation(document):
+                hook_context.classify_document(document)
+                hook_context.note_phase("normalize_fragmented_paragraphs_before_translation")
+            if hook_context.merge_same_line_fragment_bridges_before_translation(document):
+                hook_context.classify_document(document)
+                hook_context.note_phase("merge_same_line_fragment_bridges_before_translation")
+            if hook_context.merge_contiguous_body_lines_before_translation(document):
+                hook_context.classify_document(document)
+                hook_context.note_phase("merge_contiguous_body_lines_before_translation")
+            if hook_context.split_wrapped_same_line_tails_before_translation(document):
+                hook_context.classify_document(document)
+                hook_context.note_phase("split_wrapped_same_line_tails_before_translation")
+                if hook_context.merge_same_line_fragment_bridges_before_translation(document):
+                    hook_context.classify_document(document)
+                    hook_context.note_phase("merge_same_line_fragment_bridges_after_wrapped_tail_split")
+                if hook_context.merge_contiguous_body_lines_before_translation(document):
+                    hook_context.classify_document(document)
+                    hook_context.note_phase("merge_contiguous_body_lines_after_wrapped_tail_split")
             if hook_context.merge_same_line_fragments_before_translation(document):
                 hook_context.classify_document(document)
             if hook_context.remove_subsumed_same_line_duplicates_before_translation(document):
@@ -281,6 +298,21 @@ def _build_hooked_high_level(high_level: Any, hook_context: BabeldocHookContext)
             )
             self.il_translator.use_as_fallback = True
 
+        def _build_llm_prompt(
+            self,
+            json_input_str: str,
+            title_paragraph: Any | None,
+            local_title_paragraph: Any | None,
+            batch_text_for_glossary_matching: str,
+        ) -> str:
+            prompt = super()._build_llm_prompt(
+                json_input_str=json_input_str,
+                title_paragraph=title_paragraph,
+                local_title_paragraph=local_title_paragraph,
+                batch_text_for_glossary_matching=batch_text_for_glossary_matching,
+            )
+            return _strengthen_llm_slice_boundary_prompt(prompt)
+
         def translate(self, docs: Any) -> Any:
             result = super().translate(docs)
             hook_context.reconcile_translation()
@@ -330,6 +362,19 @@ def _clone_function_with_globals(function: Any, globals_copy: dict[str, Any]) ->
     cloned.__kwdefaults__ = function.__kwdefaults__
     cloned.__annotations__ = dict(getattr(function, "__annotations__", {}))
     return cloned
+
+
+def _strengthen_llm_slice_boundary_prompt(prompt: str) -> str:
+    marker = "2. Input paragraphs may be **sliced pieces of the same original paragraph**."
+    if marker not in prompt or "Do NOT complete missing sentence parts" in prompt:
+        return prompt
+    extra_rules = (
+        "\n   - Translate only the words that appear inside that paragraph's own input.\n"
+        "   - Do NOT complete missing sentence parts from neighboring inputs or contextual hints.\n"
+        "   - If an input starts or ends mid-sentence, keep the translation fragment incomplete in the same way.\n"
+        "   - Adjacent inputs are context for terminology only, not content you may copy into this output."
+    )
+    return prompt.replace(marker, f"{marker}{extra_rules}", 1)
 
 
 def _jsonable_progress_event(event: dict[str, Any]) -> dict[str, Any]:
