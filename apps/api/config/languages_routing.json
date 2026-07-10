@@ -1,12 +1,16 @@
 {
   "zh": {
     "regular": [
+      "SourceHanSansCN-Regular.ttf",
+      "NotoSansCJKsc-Regular.ttf",
       "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Regular.ttf",
       "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
       "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
       "C:\\Windows\\Fonts\\msyh.ttc"
     ],
     "bold": [
+      "SourceHanSansCN-Bold.ttf",
+      "NotoSansCJKsc-Bold.ttf",
       "/usr/share/fonts/truetype/noto/NotoSansCJKsc-Bold.ttf",
       "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
       "C:\\Windows\\Fonts\\msyhbd.ttc"

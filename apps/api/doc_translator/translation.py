@@ -26,7 +26,7 @@ from doc_translator.db import SessionLocal
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
 from doc_translator.preview import load_or_create_preview
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
-from doc_translator.storage import build_output_target, file_checksum
+from doc_translator.storage import build_output_target, file_checksum, translated_output_name
 from doc_translator.translators.prompt_builder import build_terminology_instruction
 from doc_translator.translators.trie_matcher import default_terminology_matcher
 
@@ -928,7 +928,8 @@ def run_translation_job(job_id: str) -> None:
         input_file = job.input_file
         input_path = str(_ensure_input_file_available(session, job))
         extension = Path(input_file.original_name).suffix.lower()
-        output_path = build_output_target(runtime, input_file.original_name, extension)
+        output_path = build_output_target(runtime, input_file.original_name, extension, job.target_language)
+        output_display_name = translated_output_name(input_file.original_name, job.target_language, extension)
         page_count: int | None
 
         if extension == ".pdf":
@@ -942,7 +943,7 @@ def run_translation_job(job_id: str) -> None:
             raise RuntimeError("Unsupported file type")
 
         output_file = JobFile(
-            original_name=output_path.name,
+            original_name=output_display_name,
             stored_name=output_path.name,
             storage_path=str(output_path),
             content_type=input_file.content_type,

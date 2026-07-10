@@ -1378,8 +1378,7 @@ svg {
   overflow: hidden;
   white-space: normal;
   overflow-wrap: anywhere;
-  font-family: Arial, Helvetica, sans-serif;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   visibility: hidden;
   pointer-events: none;
 }

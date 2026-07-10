@@ -43,6 +43,70 @@ const loadedPdfUrls = {
   source: null,
   translated: null,
 };
+const PDF_LANGUAGE_LAYOUT = {
+  zh: {
+    minFontSize: 8,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.4,
+    fontFamily: '"Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif',
+  },
+  en: {
+    minFontSize: 6.5,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.5,
+    fontFamily: 'Arial, "Liberation Sans", "Noto Sans", sans-serif',
+  },
+  ja: {
+    minFontSize: 7.5,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.3,
+    fontFamily: '"Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif',
+  },
+  ko: {
+    minFontSize: 8,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.4,
+    fontFamily: '"Noto Sans KR", "Malgun Gothic", sans-serif',
+  },
+  ms: {
+    minFontSize: 6,
+    stepDown: 0.8,
+    lineHeightMultiplier: 1.5,
+    fontFamily: 'Arial, "Liberation Sans", "Noto Sans", sans-serif',
+  },
+  th: {
+    minFontSize: 7.5,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.2,
+    fontFamily: '"Noto Sans Thai", "Leelawadee UI", sans-serif',
+  },
+  vi: {
+    minFontSize: 7,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.25,
+    fontFamily: 'Arial, "Liberation Sans", "Noto Sans", sans-serif',
+  },
+};
+const PDF_LANGUAGE_ALIASES = {
+  "zh": "zh",
+  "zh-cn": "zh",
+  chinese: "zh",
+  "simplified chinese": "zh",
+  en: "en",
+  english: "en",
+  ja: "ja",
+  japanese: "ja",
+  ko: "ko",
+  korean: "ko",
+  ms: "ms",
+  malay: "ms",
+  th: "th",
+  thai: "th",
+  vi: "vi",
+  vietnamese: "vi",
+};
+const PDF_SERIF_FONT_HINTS = ["serif", "times", "roman", "song", "ming", "mincho", "cambria", "georgia", "simsun"];
+const PDF_MONO_FONT_HINTS = ["mono", "courier", "consola", "fixed"];
 
 let pdfjsPromise = null;
 let resizeTimer = null;
@@ -73,6 +137,7 @@ const pdfPages = computed(() => {
   return [...state.previewDraft.pages].sort((left, right) => (left.page_num || 0) - (right.page_num || 0));
 });
 
+const repeatedPdfEdgeTexts = computed(() => collectRepeatedPdfEdgeTexts(pdfPages.value));
 const pageCount = computed(() => pdfPages.value.length || 1);
 const currentDraftPage = computed(() => pdfPages.value.find((page) => page.page_num === currentPdfPage.value) || pdfPages.value[0] || null);
 const currentPdfItems = computed(() => editablePdfItems(currentDraftPage.value));
@@ -93,13 +158,15 @@ function editablePdfItems(page) {
 
   return page.blocks.flatMap((block) => {
     if ((block.type || "text") === "table") {
-      return block.cells.map((cell) => ({
+      return block.cells
+        .map((cell) => ({
         id: cell.cell_id,
         label: `${copy("单元格", "Cell")} R${cell.row_index} C${cell.col_index}`,
         source: cell.src_text,
         pageNum: page.page_num,
         model: cell,
-      }));
+        }))
+        .filter((item) => !isPdfItemReadOnly(page, item));
     }
 
     return [
@@ -110,7 +177,7 @@ function editablePdfItems(page) {
         pageNum: page.page_num,
         model: block,
       },
-    ];
+    ].filter((item) => !isPdfItemReadOnly(page, item));
   });
 }
 
@@ -142,6 +209,57 @@ function itemRectSize(item) {
   };
 }
 
+function normalizePdfLanguageCode(language) {
+  return PDF_LANGUAGE_ALIASES[String(language || "").trim().toLowerCase()] || "";
+}
+
+function pdfLanguageLayout() {
+  return PDF_LANGUAGE_LAYOUT[normalizePdfLanguageCode(state.previewData?.target_language)] || {
+    minFontSize: 6,
+    stepDown: 0.5,
+    lineHeightMultiplier: 1.12,
+    fontFamily: 'Arial, "Noto Sans", sans-serif',
+  };
+}
+
+function normalizedPdfFontName(fontName) {
+  return String(fontName || "")
+    .replace(/^[A-Z]{6}\+/, "")
+    .toLowerCase();
+}
+
+function pdfFontNameHasHint(fontName, hints) {
+  const normalizedName = normalizedPdfFontName(fontName);
+  return hints.some((hint) => normalizedName.includes(hint));
+}
+
+function pdfItemFontFamily(item) {
+  const fontName = item?.model?.font_name || "";
+  if (pdfFontNameHasHint(fontName, PDF_MONO_FONT_HINTS)) {
+    return '"Courier New", Consolas, monospace';
+  }
+  if (!normalizePdfLanguageCode(state.previewData?.target_language) && pdfFontNameHasHint(fontName, PDF_SERIF_FONT_HINTS)) {
+    return '"Times New Roman", Georgia, serif';
+  }
+  return pdfLanguageLayout().fontFamily;
+}
+
+function pdfItemMeasureStartFontSize(item) {
+  const layout = pdfLanguageLayout();
+  return Math.max(
+    Number(item?.model?.font_size_original || 0),
+    Number(item?.model?.font_size_current || 0),
+    layout.minFontSize
+  );
+}
+
+function pdfItemLineHeight(fontSize, { compact = false } = {}) {
+  if (compact) {
+    return fontSize;
+  }
+  return Math.max(fontSize * pdfLanguageLayout().lineHeightMultiplier, fontSize + 1);
+}
+
 function canonicalImmunityText(text) {
   return String(text ?? "")
     .normalize("NFKC")
@@ -149,6 +267,101 @@ function canonicalImmunityText(text) {
     .replace(/[\u2010-\u2015\u2212]/g, "-")
     .replace(/[\s\n\r]/g, "")
     .replace(/^[,;:|，；：、]+|[,;:|，；：、]+$/g, "");
+}
+
+function itemText(item) {
+  return String(item?.model?.src_text ?? item?.model?.tgt_text ?? item?.source ?? "");
+}
+
+function pdfEdgeBandSize(pageHeight) {
+  return Math.max(pageHeight * 0.05, 28);
+}
+
+function isNearPdfPageEdge(page, item) {
+  const rect = item?.model?.rect;
+  const pageHeight = Number(page?.page_height || 0);
+  if (!Array.isArray(rect) || rect.length !== 4 || pageHeight <= 0) {
+    return false;
+  }
+
+  const edgeBand = pdfEdgeBandSize(pageHeight);
+  return rect[1] <= edgeBand || rect[3] >= pageHeight - edgeBand;
+}
+
+function isLikelyPdfPageMarker(text) {
+  const normalized = String(text ?? "")
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return /^(?:[-–—]?\s*)?(?:page|p\.?|第)?\s*(?:\d{1,4}|[ivxlcdm]{1,8})(?:\s*(?:\/|of)\s*\d{1,4})?(?:\s*[)\].-])?$/.test(normalized);
+}
+
+function collectRepeatedPdfEdgeTexts(pages) {
+  const counts = new Map();
+
+  for (const page of pages || []) {
+    const seenOnPage = new Set();
+    for (const item of editablePdfCandidates(page)) {
+      if (!isNearPdfPageEdge(page, item)) {
+        continue;
+      }
+
+      const canonicalText = canonicalImmunityText(itemText(item));
+      if (!canonicalText || seenOnPage.has(canonicalText)) {
+        continue;
+      }
+
+      seenOnPage.add(canonicalText);
+      counts.set(canonicalText, (counts.get(canonicalText) || 0) + 1);
+    }
+  }
+
+  return counts;
+}
+
+function editablePdfCandidates(page) {
+  if (!page) {
+    return [];
+  }
+
+  return page.blocks.flatMap((block) => {
+    if ((block.type || "text") === "table") {
+      return block.cells.map((cell) => ({
+        id: cell.cell_id,
+        label: `${copy("单元格", "Cell")} R${cell.row_index} C${cell.col_index}`,
+        source: cell.src_text,
+        pageNum: page.page_num,
+        model: cell,
+      }));
+    }
+
+    return [
+      {
+        id: block.block_id,
+        label: `${copy("文本块", "Text block")} ${block.block_id.slice(0, 8)}`,
+        source: block.src_text,
+        pageNum: page.page_num,
+        model: block,
+      },
+    ];
+  });
+}
+
+function isPdfItemReadOnly(page, item) {
+  if (!isNearPdfPageEdge(page, item)) {
+    return false;
+  }
+
+  const canonicalText = canonicalImmunityText(itemText(item));
+  if (canonicalText && (repeatedPdfEdgeTexts.value.get(canonicalText) || 0) >= 2) {
+    return true;
+  }
+
+  return isLikelyPdfPageMarker(itemText(item));
 }
 
 function isEligibleForImmunity(item) {
@@ -177,17 +390,17 @@ function measurePdfItem(item) {
   const diagramLabel = height < 18 && isSingleLineText(item.model.tgt_text);
   const multilineBlock = !isSingleLineText(item.model.tgt_text);
   const allowedHeight = multilineBlock ? height + Math.max(4, height * 0.1) : height;
-  const minFontSize = 7.5;
-  const originalSize = Number(item.model.font_size_original || item.model.font_size_current || 10);
-  let fontSize = Math.max(Number(item.model.font_size_current || originalSize), minFontSize);
+  const layout = pdfLanguageLayout();
+  const minFontSize = layout.minFontSize;
+  let fontSize = Math.max(pdfItemMeasureStartFontSize(item), minFontSize);
   let overflow = false;
 
   sandbox.style.width = `${allowedWidth}px`;
   sandbox.style.maxWidth = `${allowedWidth}px`;
   sandbox.style.height = `${allowedHeight}px`;
-  sandbox.style.fontFamily = "Arial, Helvetica, sans-serif";
+  sandbox.style.fontFamily = pdfItemFontFamily(item);
   sandbox.style.fontWeight = item.model.font_style === "BOLD" ? "700" : "400";
-  sandbox.style.letterSpacing = "-0.02em";
+  sandbox.style.letterSpacing = "0";
   sandbox.style.setProperty("padding", "0", "important");
   sandbox.style.setProperty("margin", "0", "important");
   sandbox.style.textAlign = item.model.alignment === "CENTER" ? "center" : "left";
@@ -198,16 +411,15 @@ function measurePdfItem(item) {
     if (diagramLabel) {
       sandbox.style.setProperty("line-height", "1", "important");
     } else {
-      sandbox.style.setProperty("line-height", `${Math.max(fontSize * 1.18, fontSize + 1)}px`);
+      sandbox.style.setProperty("line-height", `${pdfItemLineHeight(fontSize)}px`);
     }
     overflow = sandbox.scrollWidth > allowedWidth + 0.5 || sandbox.scrollHeight > allowedHeight + 0.5;
     if (!overflow || fontSize === minFontSize) {
       break;
     }
-    fontSize = Math.max(minFontSize, Math.round((fontSize - 0.5) * 10) / 10);
+    fontSize = Math.max(minFontSize, Math.round((fontSize - layout.stepDown) * 10) / 10);
   }
 
-  item.model.font_size_current = Math.round(fontSize * 10) / 10;
   item.model.layout_status = overflow ? "overflow" : "ok";
 }
 
@@ -950,7 +1162,7 @@ onUnmounted(async () => {
         </div>
 
         <div ref="editorScroller" class="editor-scroll-area pdf-editor-grid" @scroll="handleEditorScroll">
-          <template v-if="currentDraftPage">
+          <template v-if="currentDraftPage && currentPdfItems.length">
             <article
               v-for="item in currentPdfItems"
               :key="item.id"
@@ -985,6 +1197,9 @@ onUnmounted(async () => {
               </p>
             </article>
           </template>
+          <div v-else-if="currentDraftPage" class="empty-state">
+            {{ copy("当前页只有页头或页脚内容，默认不开放编辑。", "This page only has header or footer content, which is read-only by default.") }}
+          </div>
         </div>
 
         <div ref="layoutSandbox" class="layout-sandbox" aria-hidden="true"></div>

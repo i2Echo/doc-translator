@@ -12,6 +12,32 @@ SUPPORTED_EXTENSIONS = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
+_TRANSLATED_FILENAME_LANGUAGE_ALIASES = {
+    "auto": "auto",
+    "auto detect": "auto",
+    "zh": "zh",
+    "zh-cn": "zh",
+    "chinese": "zh",
+    "en": "en",
+    "english": "en",
+    "ja": "ja",
+    "japanese": "ja",
+    "ko": "ko",
+    "korean": "ko",
+    "ms": "ms",
+    "malay": "ms",
+    "th": "th",
+    "thai": "th",
+    "vi": "vi",
+    "vietnamese": "vi",
+    "es": "es",
+    "spanish": "es",
+    "fr": "fr",
+    "french": "fr",
+    "de": "de",
+    "german": "de",
+}
+
 
 def ensure_storage_directories(root_path: str) -> dict[str, Path]:
     root = Path(root_path)
@@ -71,10 +97,19 @@ def persist_upload(file: UploadFile, runtime: RuntimeSettings) -> dict:
     }
 
 
-def build_output_target(runtime: RuntimeSettings, input_name: str, extension: str) -> Path:
+def translated_output_name(input_name: str, target_language: str, extension: str) -> str:
+    stem = Path(input_name).stem
+    normalized_language = target_language.strip().casefold()
+    language_suffix = _TRANSLATED_FILENAME_LANGUAGE_ALIASES.get(normalized_language, normalized_language or "translated")
+    return f"{stem}-{language_suffix}{extension}"
+
+
+def build_output_target(runtime: RuntimeSettings, input_name: str, extension: str, target_language: str) -> Path:
     directories = ensure_storage_directories(runtime.local_storage_path)
     stem = Path(input_name).stem
-    return directories["results"] / f"{stem}-translated-{uuid4().hex[:8]}{extension}"
+    normalized_language = target_language.strip().casefold()
+    language_suffix = _TRANSLATED_FILENAME_LANGUAGE_ALIASES.get(normalized_language, normalized_language or "translated")
+    return directories["results"] / f"{stem}-{language_suffix}-{uuid4().hex[:8]}{extension}"
 
 
 def file_checksum(path: Path) -> str:

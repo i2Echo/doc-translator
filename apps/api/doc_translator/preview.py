@@ -27,7 +27,7 @@ from doc_translator.storage import file_checksum
 
 DOCX_PREVIEW_PARAGRAPH_LIMIT = 8
 DOCX_PREVIEW_CHAR_LIMIT = 2200
-PREVIEW_SCHEMA_VERSION = 9
+PREVIEW_SCHEMA_VERSION = 10
 PDF_PREVIEW_TEXT_GRANULARITY = "visual-paragraph"
 PDF_CJK_SERIF_FONTFILES = (
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -698,18 +698,21 @@ def _resolve_pdf_render_font(
     uses_cjk_font = script_font in {"china-s", "japan", "korea"}
     needs_embedded_font = _pdf_text_needs_embedded_font(text)
 
-    if language_profile is not None and language_profile.prefer_external_font and not wants_mono and not wants_symbol:
+    if needs_embedded_font and language_profile is not None and language_profile.prefer_external_font and not wants_mono and not wants_symbol:
         external_font = _pdf_external_profile_render_font(language_profile, wants_bold=wants_bold)
         if external_font is not None:
             return external_font
 
-    if ((prefer_external_cjk_font and uses_cjk_font) or needs_embedded_font) and not wants_mono and not wants_symbol:
+    if (prefer_external_cjk_font and uses_cjk_font) and not wants_mono and not wants_symbol:
         external_font = _pdf_external_cjk_render_font(script_font, wants_serif=wants_serif)
         if external_font is not None:
             return external_font
-        if needs_embedded_font:
-            raise ValueError("Missing embeddable PDF font for edited CJK text. Rebuild the backend image or mount the BabelDOC font cache.")
-        return _pdf_cjk_render_font(script_font, wants_serif=wants_serif)
+
+    if needs_embedded_font and not wants_mono and not wants_symbol:
+        external_font = _pdf_external_cjk_render_font(script_font, wants_serif=wants_serif)
+        if external_font is not None:
+            return external_font
+        raise ValueError("Missing embeddable PDF font for edited CJK text. Rebuild the backend image or mount the BabelDOC font cache.")
 
     matched_resource = _match_page_font_resource(page_fonts, preferred_font_name, wants_bold=wants_bold)
     if matched_resource is None:
@@ -1571,12 +1574,16 @@ def _build_pdf_text_blocks(
         {
             "type": "text",
             "rect": [round(block.rect.x0, 2), round(block.rect.y0, 2), round(block.rect.x1, 2), round(block.rect.y1, 2)],
-            "font_name": block.dominant_font,
-            "font_size_original": block.average_font_size,
-            "font_size_current": block.average_font_size,
+            "font_name": _dominant_font_name_in_rect(
+                target_fragments,
+                block.rect,
+                fallback_text=_extract_fragment_text_in_rect(target_fragments, block.rect) or block.text,
+            ),
+            "font_size_original": _average_font_size_in_rect(target_fragments, block.rect),
+            "font_size_current": _average_font_size_in_rect(target_fragments, block.rect),
             "src_text": _extract_fragment_text_in_rect(source_fragments, block.rect),
             "tgt_text": _extract_fragment_text_in_rect(target_fragments, block.rect),
-            **_pdf_item_metadata(block.rect, page_width, fragments),
+            **_pdf_item_metadata(block.rect, page_width, target_fragments),
         }
         for block in merged_blocks
     ]
@@ -2620,9 +2627,12 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
             force_bold = block.get("font_style") == "BOLD"
             rotation = int(block.get("rotation") or 0)
             requested_font_size = max(
-                float(update.get("font_size_final") or 0.0),
-                float(block.get("font_size_original") or 0.0),
-                float(block.get("font_size_current") or 0.0),
+                float(
+                    update.get("font_size_final")
+                    or block.get("font_size_current")
+                    or block.get("font_size_original")
+                    or 0.0
+                ),
                 PDF_MIN_REDRAW_FONT_SIZE,
             )
             if block_kind == "cell":
@@ -2654,8 +2664,7 @@ def _apply_pdf_preview_updates(job: TranslationJob, preview: dict, block_updates
                 "layout_status": str(update.get("layout_status") or block.get("layout_status") or "ok"),
             }
 
-        document.subset_fonts(fallback=True)
-        document.save(temp_path, garbage=4, deflate=True, clean=True, deflate_fonts=True)
+        document.save(temp_path, garbage=4, deflate=True, clean=True, deflate_fonts=False)
     except Exception:
         if temp_path.exists():
             temp_path.unlink()

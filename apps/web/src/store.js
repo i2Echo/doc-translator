@@ -233,7 +233,7 @@ function previewEditablePayload() {
             updates.push({
               cell_id: draftCell.cell_id,
               tgt_text: draftCell.tgt_text,
-              font_size_final: draftCell.font_size_current,
+              font_size_final: originalCell.font_size_current || originalCell.font_size_original,
               layout_status: draftCell.layout_status || "ok",
             });
           }
@@ -245,7 +245,7 @@ function previewEditablePayload() {
         updates.push({
           block_id: draftBlock.block_id,
           tgt_text: draftBlock.tgt_text,
-          font_size_final: draftBlock.font_size_current,
+          font_size_final: originalBlock.font_size_current || originalBlock.font_size_original,
           layout_status: draftBlock.layout_status || "ok",
         });
       }
