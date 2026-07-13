@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onUnmounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
+import { renderAsync as renderDocx } from "docx-preview";
 import {
   clearPreviewState,
   copy,
@@ -25,6 +26,8 @@ const sourceScroller = ref(null);
 const translatedScroller = ref(null);
 const editorScroller = ref(null);
 const layoutSandbox = ref(null);
+const docxSourceHost = ref(null);
+const docxTranslatedHost = ref(null);
 const activePdfItemId = ref("");
 const currentPdfPage = ref(1);
 const pdfStageAspect = reactive({
@@ -114,8 +117,10 @@ let renderQueue = Promise.resolve();
 let syncingScroll = false;
 let resetPdfOnNextDocumentsChange = false;
 let layoutMeasureTimer = null;
+let docxRenderVersion = 0;
 
 const isPdf = computed(() => state.previewData?.document_kind === "pdf");
+const isDocx = computed(() => state.previewData?.document_kind === "docx");
 const isEditing = computed(() => state.previewMode === "edit");
 const title = computed(() => state.previewData?.output_name || state.previewJob?.output_file?.original_name || "");
 const referencePdfKind = computed(() => (isEditing.value ? "translated" : "source"));
@@ -905,6 +910,64 @@ function schedulePdfRender() {
   }, 90);
 }
 
+async function fetchDocx(url) {
+  const headers = state.token ? { Authorization: `Bearer ${state.token}` } : undefined;
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`Failed to load DOCX (${response.status}).`);
+  }
+  return response.arrayBuffer();
+}
+
+async function renderDocxDocuments() {
+  if (!isDocx.value) {
+    return;
+  }
+
+  const sourceUrl = state.previewDocuments.sourceUrl;
+  const translatedUrl = state.previewDocuments.translatedUrl;
+  if (!sourceUrl) {
+    return;
+  }
+
+  const version = ++docxRenderVersion;
+  await nextTick();
+  const sourceHost = docxSourceHost.value;
+  const translatedHost = docxTranslatedHost.value;
+  if (!sourceHost) {
+    return;
+  }
+
+  sourceHost.replaceChildren();
+  translatedHost?.replaceChildren();
+  try {
+    const sourceDocument = await fetchDocx(sourceUrl);
+    if (version !== docxRenderVersion) {
+      return;
+    }
+    const options = {
+      breakPages: true,
+      ignoreFonts: false,
+      ignoreHeight: false,
+      ignoreWidth: false,
+      renderFooters: true,
+      renderHeaders: true,
+    };
+    await renderDocx(sourceDocument, sourceHost, undefined, options);
+    if (translatedHost && translatedUrl) {
+      const translatedDocument = await fetchDocx(translatedUrl);
+      if (version !== docxRenderVersion) {
+        return;
+      }
+      await renderDocx(translatedDocument, translatedHost, undefined, options);
+    }
+  } catch (error) {
+    if (version === docxRenderVersion) {
+      state.messages.preview = error.message;
+    }
+  }
+}
+
 watch(
   () => props.jobId,
   (jobId) => {
@@ -935,6 +998,16 @@ watch(
 );
 
 watch(
+  () => [state.previewDocuments.sourceUrl, state.previewDocuments.translatedUrl, isEditing.value],
+  () => {
+    if (!isDocx.value) {
+      return;
+    }
+    void renderDocxDocuments();
+  }
+);
+
+watch(
   () => state.previewMode,
   () => {
     if (!isPdf.value || state.pending.preview) {
@@ -958,6 +1031,7 @@ watch(
 window.addEventListener("resize", schedulePdfRender);
 
 onUnmounted(async () => {
+  docxRenderVersion += 1;
   window.removeEventListener("resize", schedulePdfRender);
   window.clearTimeout(resizeTimer);
   window.clearTimeout(layoutMeasureTimer);
@@ -1222,28 +1296,49 @@ onUnmounted(async () => {
       </article>
     </section>
 
-    <section v-else-if="state.previewData" class="preview-body preview-body--docx">
+    <section
+      v-else-if="state.previewData && isDocx"
+      class="preview-body preview-body--docx"
+      :class="{ 'preview-body--docx-editor': isEditing }"
+    >
       <article class="preview-column preview-column--docx">
-        <div class="docx-preview-stack">
+        <div class="preview-column__head">
+          <strong>{{ copy("原文 DOCX", "Source DOCX") }}</strong>
+          <span>{{ state.previewJob?.input_file?.original_name }}</span>
+        </div>
+        <div class="docx-render-scroll">
+          <div ref="docxSourceHost" class="docx-render-host"></div>
+        </div>
+      </article>
+
+      <article v-if="!isEditing" class="preview-column preview-column--docx">
+        <div class="preview-column__head">
+          <strong>{{ copy("译文 DOCX", "Translated DOCX") }}</strong>
+          <span>{{ title }}</span>
+        </div>
+        <div class="docx-render-scroll">
+          <div ref="docxTranslatedHost" class="docx-render-host"></div>
+        </div>
+      </article>
+
+      <article v-else class="preview-column preview-column--docx preview-column--docx-editor">
+        <div class="preview-column__head">
+          <div class="preview-column-title">
+            <strong>{{ copy("右侧编辑区", "Editor") }}</strong>
+            <span>{{ title }}</span>
+          </div>
+          <span>{{ previewDirty ? copy("草稿未保存", "Unsaved draft") : copy("无待保存修改", "No pending edits") }}</span>
+        </div>
+
+        <div class="docx-preview-stack docx-preview-stack--editor">
           <article v-for="page in state.previewDraft.pages" :key="page.id" class="docx-preview-card">
-            <div class="preview-column__head">
+            <div class="editor-item-head">
               <strong>{{ page.label || copy("文档段落", "Document section") }}</strong>
               <span>{{ page.id }}</span>
             </div>
-
-            <div class="preview-text-grid">
-              <section class="text-panel">
-                <h3>{{ copy("原文", "Source") }}</h3>
-                <pre>{{ page.source_text || copy("没有原文内容。", "No source text available.") }}</pre>
-              </section>
-              <section class="text-panel">
-                <h3>{{ isEditing ? copy("译文编辑", "Translated editor") : copy("译文", "Translated") }}</h3>
-                <span v-if="isEditing" class="control-shell control-shell--textarea">
-                  <textarea v-model="page.translated_text" rows="10"></textarea>
-                </span>
-                <pre v-else>{{ page.translated_text || copy("没有译文内容。", "No translated text available.") }}</pre>
-              </section>
-            </div>
+            <span class="control-shell control-shell--textarea">
+              <textarea v-model="page.translated_text" rows="10"></textarea>
+            </span>
           </article>
         </div>
       </article>

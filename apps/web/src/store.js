@@ -536,7 +536,10 @@ export async function retryJob(jobId) {
 export async function downloadJob(jobId) {
   const response = await authedRequest(`/jobs/${jobId}/download`, {}, { raw: true });
   const blob = await response.blob();
-  const filename = contentDispositionFilename(response.headers.get("content-disposition"), `translated-${jobId}`);
+  const job = state.jobs.find((candidate) => candidate.id === jobId) || (state.previewJob?.id === jobId ? state.previewJob : null);
+  const outputName = job?.output_file?.original_name || "";
+  const fallback = outputName.toLowerCase().endsWith(".docx") ? outputName : `translated-${jobId}`;
+  const filename = contentDispositionFilename(response.headers.get("content-disposition"), fallback);
   triggerDownload(blob, filename);
 }
 
@@ -632,6 +635,8 @@ export async function loadPreview(jobId) {
 
     if (preview.document_kind === "pdf") {
       loadPreviewDocuments(jobId, preview.updated_at);
+    } else if (preview.document_kind === "docx") {
+      loadPreviewDocuments(jobId, preview.updated_at);
     }
   } finally {
     state.pending.preview = false;
@@ -682,7 +687,7 @@ export async function savePreview() {
     });
     state.previewData = preview;
     state.previewDraft = restoreQuarantinedPdfEdits(clonePreview(preview), quarantined);
-    if (preview.document_kind === "pdf") {
+    if (preview.document_kind === "pdf" || preview.document_kind === "docx") {
       refreshTranslatedPreviewDocument(state.previewJob.id, preview.updated_at);
     }
     state.messages.preview =

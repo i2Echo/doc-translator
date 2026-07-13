@@ -14,7 +14,10 @@ from tempfile import NamedTemporaryFile
 
 import fitz
 from docx import Document
+from docx.document import Document as DocumentType
+from docx.text.paragraph import Paragraph
 
+from doc_translator.docx_translator import _collect_text_spans, _set_text
 from doc_translator.interceptors.alignment_sniffer import sniff_alignment
 from doc_translator.interceptors.grouper import dominant_value
 from doc_translator.interceptors.weight_detector import detect_font_style
@@ -1732,16 +1735,32 @@ def _page_item_sort_key(item: dict[str, object]) -> tuple[float, float]:
     return (float(rect[1]), float(rect[0]))
 
 
-def _docx_paragraph_texts(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    document = Document(path)
-    texts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+def _docx_visible_paragraphs(document: DocumentType) -> list[Paragraph]:
+    paragraphs: list[Paragraph] = []
+    seen: set[int] = set()
+
+    def add(candidates) -> None:
+        for paragraph in candidates:
+            if not paragraph.text.strip():
+                continue
+            identity = id(paragraph._element)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            paragraphs.append(paragraph)
+
+    add(document.paragraphs)
     for table in document.tables:
         for row in table.rows:
             for cell in row.cells:
-                texts.extend(paragraph.text.strip() for paragraph in cell.paragraphs if paragraph.text.strip())
-    return texts
+                add(cell.paragraphs)
+    return paragraphs
+
+
+def _docx_paragraph_texts(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return [paragraph.text.strip() for paragraph in _docx_visible_paragraphs(Document(path))]
 
 
 def _build_pdf_pages(source_path: Path, output_path: Path) -> list[dict[str, object]]:
@@ -1831,10 +1850,11 @@ def _build_pdf_pages(source_path: Path, output_path: Path) -> list[dict[str, obj
 
 
 def _append_docx_preview_page(
-    pages: list[dict[str, str]],
+    pages: list[dict[str, object]],
     page_index: int,
     source_parts: list[str],
     translated_parts: list[str],
+    paragraph_indexes: list[int],
 ) -> None:
     pages.append(
         {
@@ -1842,11 +1862,12 @@ def _append_docx_preview_page(
             "label": f"Section {page_index}",
             "source_text": "\n\n".join(part for part in source_parts if part).strip(),
             "translated_text": "\n\n".join(part for part in translated_parts if part).strip(),
+            "paragraph_indexes": paragraph_indexes.copy(),
         }
     )
 
 
-def _build_docx_pages(source_path: Path, output_path: Path) -> list[dict[str, str]]:
+def _build_docx_pages(source_path: Path, output_path: Path) -> list[dict[str, object]]:
     source_paragraphs = _docx_paragraph_texts(source_path)
     translated_paragraphs = _docx_paragraph_texts(output_path)
     total = max(len(source_paragraphs), len(translated_paragraphs))
@@ -1857,12 +1878,14 @@ def _build_docx_pages(source_path: Path, output_path: Path) -> list[dict[str, st
                 "label": "Section 1",
                 "source_text": "",
                 "translated_text": "",
+                "paragraph_indexes": [],
             }
         ]
 
-    pages: list[dict[str, str]] = []
+    pages: list[dict[str, object]] = []
     source_parts: list[str] = []
     translated_parts: list[str] = []
+    paragraph_indexes: list[int] = []
     char_count = 0
 
     for index in range(total):
@@ -1870,14 +1893,17 @@ def _build_docx_pages(source_path: Path, output_path: Path) -> list[dict[str, st
         translated_text = translated_paragraphs[index] if index < len(translated_paragraphs) else ""
         source_parts.append(source_text)
         translated_parts.append(translated_text)
+        if index < len(translated_paragraphs):
+            paragraph_indexes.append(index)
         char_count += len(source_text) + len(translated_text)
 
         reached_limit = len(source_parts) >= DOCX_PREVIEW_PARAGRAPH_LIMIT or char_count >= DOCX_PREVIEW_CHAR_LIMIT
         is_last = index == total - 1
         if reached_limit or is_last:
-            _append_docx_preview_page(pages, len(pages) + 1, source_parts, translated_parts)
+            _append_docx_preview_page(pages, len(pages) + 1, source_parts, translated_parts, paragraph_indexes)
             source_parts = []
             translated_parts = []
+            paragraph_indexes = []
             char_count = 0
 
     return pages
@@ -1955,6 +1981,13 @@ def _preview_uses_current_pdf_text_granularity(payload: dict) -> bool:
     return payload.get("document_kind") != "pdf" or (
         payload.get("schema_version") == PREVIEW_SCHEMA_VERSION
         and payload.get("pdf_text_granularity") == PDF_PREVIEW_TEXT_GRANULARITY
+    )
+
+
+def _preview_has_docx_paragraph_indexes(payload: dict) -> bool:
+    return payload.get("document_kind") != "docx" or all(
+        isinstance(page, dict) and isinstance(page.get("paragraph_indexes"), list)
+        for page in payload.get("pages", [])
     )
 
 
@@ -2210,6 +2243,9 @@ def load_or_create_preview(job: TranslationJob, *, force: bool = False, migrate_
             preview_changed = _cleanup_pdf_preview_text_content(existing_preview) or preview_changed
         if extension == ".pdf" and _preview_needs_pdf_font_metadata(existing_preview):
             preview_changed = _enrich_pdf_preview_font_metadata(existing_preview, job) or preview_changed
+        if extension == ".docx" and not _preview_has_docx_paragraph_indexes(existing_preview):
+            existing_preview = build_job_preview(job, created_at=existing_preview.get("created_at"))
+            preview_changed = True
         if preview_changed:
             _write_preview(sidecar_path, existing_preview)
         return existing_preview
@@ -2219,16 +2255,68 @@ def load_or_create_preview(job: TranslationJob, *, force: bool = False, migrate_
     return payload
 
 
-def _update_docx_preview(preview: dict, page_updates: list[dict[str, str]]) -> dict:
+def _split_docx_preview_text(text: str, expected_count: int) -> list[str]:
+    if expected_count <= 0:
+        return []
+    parts = [part.strip() for part in re.split(r"\n\s*\n", str(text or "").strip())] if str(text or "").strip() else []
+    if len(parts) < expected_count:
+        return [*parts, *([""] * (expected_count - len(parts)))]
+    if len(parts) > expected_count:
+        return [*parts[: expected_count - 1], "\n\n".join(parts[expected_count - 1 :])]
+    return parts
+
+
+def _replace_docx_paragraph_text(paragraph: Paragraph, text: str) -> None:
+    spans = [span for span in _collect_text_spans(paragraph) if span.elements]
+    if not spans:
+        raise ValueError("DOCX paragraph has no editable text spans")
+    first, *rest = spans
+    first.replace(text)
+    for span in rest:
+        for element in span.elements:
+            _set_text(element, "")
+
+
+def _apply_docx_preview_updates(job: TranslationJob, preview: dict, page_updates: list[dict[str, str]]) -> dict:
+    if job.output_file is None:
+        raise ValueError("Translated DOCX does not exist")
+
+    output_path = Path(job.output_file.storage_path)
+    if not output_path.exists():
+        raise ValueError("Translated DOCX does not exist")
+
+    document = Document(output_path)
+    paragraphs = _docx_visible_paragraphs(document)
     page_lookup = {page["id"]: page for page in preview["pages"]}
+
     for update in page_updates:
         page_id = update["id"]
-        if page_id not in page_lookup:
+        page = page_lookup.get(page_id)
+        if page is None:
             raise ValueError(f"Preview page '{page_id}' does not exist")
-        page_lookup[page_id]["translated_text"] = update["translated_text"]
+        paragraph_indexes = [int(index) for index in page.get("paragraph_indexes", [])]
+        replacement_texts = _split_docx_preview_text(update["translated_text"], len(paragraph_indexes))
+        for paragraph_index, replacement_text in zip(paragraph_indexes, replacement_texts, strict=True):
+            if paragraph_index >= len(paragraphs):
+                raise ValueError(f"DOCX paragraph index '{paragraph_index}' does not exist")
+            _replace_docx_paragraph_text(paragraphs[paragraph_index], replacement_text)
 
-    preview["updated_at"] = _utcnow_iso()
-    return preview
+    with NamedTemporaryFile("wb", suffix=output_path.suffix, dir=output_path.parent, delete=False) as handle:
+        temp_path = Path(handle.name)
+
+    try:
+        document.save(temp_path)
+        Document(temp_path)
+        temp_path.replace(output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    job.output_file.size_bytes = output_path.stat().st_size
+    job.output_file.checksum = file_checksum(output_path)
+    return build_job_preview(job, created_at=preview.get("created_at"))
 
 
 def _ensure_pdf_render_font(page: fitz.Page, font: PdfRenderFont) -> None:
@@ -2728,6 +2816,8 @@ def update_preview(job: TranslationJob, update_payload: dict) -> dict:
     if not isinstance(page_updates, list):
         raise ValueError("DOCX preview updates require page content")
 
-    updated_preview = _update_docx_preview(preview, page_updates)
+    if not _preview_has_docx_paragraph_indexes(preview):
+        preview = build_job_preview(job, created_at=preview.get("created_at"))
+    updated_preview = _apply_docx_preview_updates(job, preview, page_updates)
     _write_preview(sidecar, updated_preview)
     return updated_preview

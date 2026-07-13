@@ -15,7 +15,6 @@ from typing import Callable
 import fitz
 import httpx
 import pytesseract
-from docx import Document
 from PIL import Image
 from sqlalchemy.orm import Session, selectinload
 
@@ -23,8 +22,9 @@ from doc_translator.audit import record_audit
 from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path, babeldoc_structure_snapshot_path
 from doc_translator.babeldoc_runner import BabeldocLibraryResult, translate_pdf_with_babeldoc_library
 from doc_translator.db import SessionLocal
+from doc_translator.docx_translator import translate_docx
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
-from doc_translator.preview import load_or_create_preview
+from doc_translator.preview import load_or_create_preview, preview_sidecar_path
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
 from doc_translator.storage import build_output_target, file_checksum, translated_output_name
 from doc_translator.translators.prompt_builder import build_terminology_instruction
@@ -217,6 +217,7 @@ def update_job_state(
     error_message: str | None = None,
     message: str | None = None,
     details: dict | None = None,
+    commit: bool = True,
 ) -> None:
     if status is not None:
         job.status = status
@@ -230,7 +231,8 @@ def update_job_state(
         job.completed_at = datetime.now(timezone.utc)
     if message:
         add_job_event(session, job, message, level="error" if status == JobStatus.FAILED else "info", details=details)
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def ensure_not_cancelled(session: Session, job: TranslationJob) -> None:
@@ -702,53 +704,6 @@ def _translate_prepared_pdf_with_babeldoc_hooks(
     )
 
 
-def _paragraph_targets(document: Document) -> list:
-    targets = [paragraph for paragraph in document.paragraphs if paragraph.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                targets.extend(paragraph for paragraph in cell.paragraphs if paragraph.text.strip())
-    return targets
-
-
-def replace_paragraph_text(paragraph, text: str) -> None:
-    element = paragraph._element
-    for child in list(element):
-        if child.tag.endswith("}r") or child.tag.endswith("}hyperlink"):
-            element.remove(child)
-    paragraph.add_run(text)
-
-
-def translate_docx(
-    input_path: str,
-    output_path: Path,
-    translator: OpenAICompatibleTranslator,
-    job: TranslationJob,
-    session: Session,
-) -> int | None:
-    document = Document(input_path)
-    targets = _paragraph_targets(document)
-    texts = [paragraph.text for paragraph in targets]
-
-    def on_progress(index: int, total: int) -> None:
-        progress = 20 + int((index / max(total, 1)) * 60)
-        update_job_state(session, job, status=JobStatus.TRANSLATING, progress=progress)
-
-    translated = translate_segments(
-        translator,
-        texts,
-        source_language=job.source_language,
-        target_language=job.target_language,
-        preserve_line_breaks=True,
-        on_progress=on_progress,
-        cancel_check=lambda: ensure_not_cancelled(session, job),
-    )
-    for paragraph, translated_text in zip(targets, translated, strict=True):
-        replace_paragraph_text(paragraph, translated_text)
-    document.save(output_path)
-    return None
-
-
 def _restore_input_file_from_duplicate(session: Session, input_file: JobFile, target_path: Path) -> Path | None:
     candidates = (
         session.query(JobFile)
@@ -902,6 +857,14 @@ def test_model_connection(runtime: RuntimeSettings) -> tuple[int, str]:
     return translator.test_connection()
 
 
+def _remove_docx_result(output_path: Path) -> None:
+    for path in (output_path, preview_sidecar_path(str(output_path))):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove incomplete DOCX result", extra={"path": str(path), "error": str(exc)})
+
+
 def run_translation_job(job_id: str) -> None:
     session = SessionLocal()
     try:
@@ -937,8 +900,28 @@ def run_translation_job(job_id: str) -> None:
         elif extension == ".docx":
             translator = OpenAICompatibleTranslator(runtime)
             update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating DOCX content")
-            page_count = translate_docx(input_path, output_path, translator, job, session)
-            update_job_state(session, job, status=JobStatus.REBUILDING, progress=88, message="Writing translated DOCX")
+            page_count = translate_docx(
+                input_path,
+                output_path,
+                translator=translator,
+                translate_segments=translate_segments,
+                source_language=job.source_language,
+                target_language=job.target_language,
+                on_progress=lambda index, total: update_job_state(
+                    session,
+                    job,
+                    status=JobStatus.TRANSLATING,
+                    progress=20 + int((index / max(total, 1)) * 60),
+                ),
+                cancel_check=lambda: ensure_not_cancelled(session, job),
+                on_rebuilding=lambda: update_job_state(
+                    session,
+                    job,
+                    status=JobStatus.REBUILDING,
+                    progress=88,
+                    message="Writing translated DOCX",
+                ),
+            )
         else:
             raise RuntimeError("Unsupported file type")
 
@@ -967,7 +950,14 @@ def run_translation_job(job_id: str) -> None:
                 raise
             logger.warning("Preview preparation failed", extra={"job_id": job.id, "error": str(exc)})
             add_job_event(session, job, "Preview could not be prepared", details={"error": str(exc)})
-        update_job_state(session, job, status=JobStatus.COMPLETED, progress=100, message="Translation completed")
+        update_job_state(
+            session,
+            job,
+            status=JobStatus.COMPLETED,
+            progress=100,
+            message="Translation completed",
+            commit=extension != ".docx",
+        )
         record_audit(
             session,
             action="jobs.completed",
@@ -980,6 +970,10 @@ def run_translation_job(job_id: str) -> None:
         logger.info("Completed translation job", extra={"job_id": job.id})
     except JobCancelledError:
         if "job" in locals():
+            if locals().get("extension") == ".docx" and "output_path" in locals():
+                _remove_docx_result(output_path)
+            session.rollback()
+            job = session.get(TranslationJob, job_id) or job
             update_job_state(session, job, status=JobStatus.CANCELLED, progress=job.progress, message="Job cancelled")
             record_audit(
                 session,
@@ -993,6 +987,10 @@ def run_translation_job(job_id: str) -> None:
     except Exception as exc:
         if "job" in locals():
             logger.exception("Translation job failed", extra={"job_id": job.id})
+            if locals().get("extension") == ".docx" and "output_path" in locals():
+                _remove_docx_result(output_path)
+            session.rollback()
+            job = session.get(TranslationJob, job_id) or job
             update_job_state(
                 session,
                 job,
