@@ -18,7 +18,7 @@ from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health
 from doc_translator.models import JobEvent, JobFile, JobStatus, TranslationJob
 from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path, babeldoc_structure_snapshot_path
-from doc_translator.preview import preview_sidecar_path
+from doc_translator.preview import ppt_preview_pdf_path, preview_sidecar_path
 from doc_translator.queueing import TRANSLATION_QUEUE_KEY, get_redis_client
 from doc_translator.settings_service import get_runtime_settings
 from doc_translator.translation import run_translation_job
@@ -92,6 +92,7 @@ class WorkerRuntime:
                     previous_status = job.status
                     job.status = JobStatus.CANCELLED
                     job.completed_at = datetime.now(timezone.utc)
+                    job.events.clear()
                     session.add(
                         JobEvent(
                             job_id=job.id,
@@ -117,6 +118,7 @@ class WorkerRuntime:
                     job.started_at = None
                     job.completed_at = None
                     job.error_message = None
+                    job.events.clear()
                     session.add(
                         JobEvent(
                             job_id=job.id,
@@ -217,6 +219,8 @@ class WorkerRuntime:
                     Path(job_file.storage_path).unlink(missing_ok=True)
                     if job_file.kind.value == "output":
                         preview_sidecar_path(job_file.storage_path).unlink(missing_ok=True)
+                        ppt_preview_pdf_path(job_file.storage_path, "source").unlink(missing_ok=True)
+                        ppt_preview_pdf_path(job_file.storage_path, "translated").unlink(missing_ok=True)
                         babeldoc_ir_sidecar_path(Path(job_file.storage_path)).unlink(missing_ok=True)
                         babeldoc_structure_snapshot_path(Path(job_file.storage_path), "before_translation").unlink(missing_ok=True)
                         babeldoc_structure_snapshot_path(Path(job_file.storage_path), "after_translation").unlink(missing_ok=True)

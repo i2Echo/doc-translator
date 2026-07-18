@@ -10,12 +10,15 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 import fitz
 from docx import Document
 from docx.document import Document as DocumentType
 from docx.text.paragraph import Paragraph
+from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
+from openpyxl.utils import get_column_letter
 
 from doc_translator.docx_translator import _collect_text_spans, _set_text
 from doc_translator.interceptors.alignment_sniffer import sniff_alignment
@@ -25,12 +28,16 @@ from doc_translator.render_guards.cascade_scaler import minimum_sibling_font_siz
 from doc_translator.render_guards.font_router import font_route_for_language
 from doc_translator.render_guards.line_wrapper import apply_thai_word_wrap_shield
 from doc_translator.models import TranslationJob
+from doc_translator.pptx_translator import convert_office_to_pdf, convert_ppt_to_pptx, read_pptx_text_sections, replace_pptx_paragraphs
 from doc_translator.storage import file_checksum
 
 
 DOCX_PREVIEW_PARAGRAPH_LIMIT = 8
 DOCX_PREVIEW_CHAR_LIMIT = 2200
 PREVIEW_SCHEMA_VERSION = 10
+XLSX_PREVIEW_SCHEMA_VERSION = 2
+XLSX_PREVIEW_DEFAULT_COLUMN_WIDTH = 8.43
+XLSX_PREVIEW_DEFAULT_ROW_HEIGHT = 18
 PDF_PREVIEW_TEXT_GRANULARITY = "visual-paragraph"
 PDF_CJK_SERIF_FONTFILES = (
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -1909,6 +1916,387 @@ def _build_docx_pages(source_path: Path, output_path: Path) -> list[dict[str, ob
     return pages
 
 
+def _xlsx_cells(worksheet) -> dict[str, object]:
+    return {
+        cell.coordinate: cell
+        for row in worksheet.iter_rows()
+        for cell in row
+        if cell.value is not None
+    }
+
+
+def _xlsx_text(cell) -> str:
+    return "" if cell is None or cell.value is None else str(cell.value)
+
+
+def _xlsx_color(color) -> str | None:
+    if color is None or color.type != "rgb" or not color.rgb:
+        return None
+    value = str(color.rgb)
+    if len(value) == 8 and value[:2].lower() == "00":
+        return None
+    return f"#{value[-6:]}"
+
+
+def _xlsx_border_style(side) -> str | None:
+    if side is None or not side.style:
+        return None
+    color = _xlsx_color(side.color) or "#c8c8c8"
+    return f"1px solid {color}"
+
+
+def _xlsx_cell_style(cell) -> dict[str, str]:
+    if cell is None or isinstance(cell, MergedCell):
+        return {}
+
+    style: dict[str, str] = {}
+    font = cell.font
+    fill = cell.fill
+    alignment = cell.alignment
+    border = cell.border
+
+    if font.name:
+        style["fontFamily"] = font.name
+    if font.sz:
+        style["fontSize"] = f"{float(font.sz):g}pt"
+    if font.bold:
+        style["fontWeight"] = "700"
+    if font.italic:
+        style["fontStyle"] = "italic"
+    if font.underline:
+        style["textDecoration"] = "underline"
+    font_color = _xlsx_color(font.color)
+    if font_color:
+        style["color"] = font_color
+
+    fill_color = _xlsx_color(fill.fgColor)
+    if fill.fill_type == "solid" and fill_color:
+        style["backgroundColor"] = fill_color
+
+    if alignment.horizontal:
+        style["textAlign"] = alignment.horizontal
+    if alignment.vertical:
+        style["verticalAlign"] = alignment.vertical
+    if alignment.wrap_text:
+        style["whiteSpace"] = "pre-wrap"
+
+    for field_name, css_name in (
+        ("left", "borderLeft"),
+        ("right", "borderRight"),
+        ("top", "borderTop"),
+        ("bottom", "borderBottom"),
+    ):
+        border_value = _xlsx_border_style(getattr(border, field_name))
+        if border_value:
+            style[css_name] = border_value
+
+    return style
+
+
+def _xlsx_column_width(worksheet, column_index: int) -> dict[str, object]:
+    letter = get_column_letter(column_index)
+    dimension = worksheet.column_dimensions.get(letter)
+    width = float(dimension.width if dimension and dimension.width else XLSX_PREVIEW_DEFAULT_COLUMN_WIDTH)
+    pixel_width = min(max(round(width * 7 + 6), 44), 280)
+    return {
+        "index": column_index,
+        "letter": letter,
+        "width": pixel_width,
+        "hidden": bool(dimension.hidden) if dimension else False,
+    }
+
+
+def _xlsx_row_height(worksheet, row_index: int) -> dict[str, object]:
+    dimension = worksheet.row_dimensions.get(row_index)
+    height = float(dimension.height if dimension and dimension.height else XLSX_PREVIEW_DEFAULT_ROW_HEIGHT)
+    return {
+        "index": row_index,
+        "height": min(max(round(height * 4 / 3), 22), 120),
+        "hidden": bool(dimension.hidden) if dimension else False,
+    }
+
+
+def _xlsx_merged_cells(worksheet) -> dict[str, dict[str, object]]:
+    merged_cells: dict[str, dict[str, object]] = {}
+    for merged_range in worksheet.merged_cells.ranges:
+        anchor = worksheet.cell(merged_range.min_row, merged_range.min_col).coordinate
+        for row_index in range(merged_range.min_row, merged_range.max_row + 1):
+            for column_index in range(merged_range.min_col, merged_range.max_col + 1):
+                coordinate = worksheet.cell(row_index, column_index).coordinate
+                if coordinate == anchor:
+                    merged_cells[coordinate] = {
+                        "row_span": merged_range.max_row - merged_range.min_row + 1,
+                        "col_span": merged_range.max_col - merged_range.min_col + 1,
+                    }
+                else:
+                    merged_cells[coordinate] = {
+                        "merged_parent": anchor,
+                    }
+    return merged_cells
+
+
+def _xlsx_grid_bounds(source_cells: dict[str, object], output_cells: dict[str, object], output_sheet) -> tuple[int, int, int, int]:
+    cells = [*source_cells.values(), *output_cells.values()]
+    for merged_range in output_sheet.merged_cells.ranges:
+        cells.append(output_sheet.cell(merged_range.min_row, merged_range.min_col))
+        cells.append(output_sheet.cell(merged_range.max_row, merged_range.max_col))
+
+    if not cells:
+        return 1, 1, 1, 1
+
+    return (
+        min(cell.row for cell in cells),
+        max(cell.row for cell in cells),
+        min(cell.column for cell in cells),
+        max(cell.column for cell in cells),
+    )
+
+
+def _build_xlsx_sheets(source_path: Path, output_path: Path) -> list[dict[str, object]]:
+    source_workbook = load_workbook(source_path, data_only=False, keep_links=True, rich_text=True)
+    output_workbook = None
+
+    try:
+        output_workbook = load_workbook(output_path, data_only=False, keep_links=True, rich_text=True)
+        source_sheets = {worksheet.title: worksheet for worksheet in source_workbook.worksheets}
+        sheets: list[dict[str, object]] = []
+        for sheet_index, output_sheet in enumerate(output_workbook.worksheets, start=1):
+            source_cells = _xlsx_cells(source_sheets[output_sheet.title]) if output_sheet.title in source_sheets else {}
+            output_cells = _xlsx_cells(output_sheet)
+            min_row, max_row, min_col, max_col = _xlsx_grid_bounds(source_cells, output_cells, output_sheet)
+            merged_cells = _xlsx_merged_cells(output_sheet)
+            source_sheet = source_sheets.get(output_sheet.title)
+            columns = [_xlsx_column_width(output_sheet, column_index) for column_index in range(min_col, max_col + 1)]
+            rows = [_xlsx_row_height(output_sheet, row_index) for row_index in range(min_row, max_row + 1)]
+            cells: list[dict[str, object]] = []
+            for row_index in range(min_row, max_row + 1):
+                for column_index in range(min_col, max_col + 1):
+                    coordinate = output_sheet.cell(row_index, column_index).coordinate
+                    merged = merged_cells.get(coordinate, {})
+                    if "merged_parent" in merged:
+                        cells.append(
+                            {
+                                "coordinate": coordinate,
+                                "row_index": row_index,
+                                "col_index": column_index,
+                                "source_text": "",
+                                "translated_text": "",
+                                "value_type": "value",
+                                "editable": False,
+                                "row_span": 1,
+                                "col_span": 1,
+                                "merged_parent": merged["merged_parent"],
+                                "style": {},
+                            }
+                        )
+                        continue
+
+                    source_value_cell = source_cells.get(coordinate)
+                    output_value_cell = output_cells.get(coordinate)
+                    source_cell = source_value_cell
+                    output_cell = output_value_cell
+                    if source_cell is None and source_sheet is not None:
+                        source_cell = source_sheet.cell(row_index, column_index)
+                    if output_cell is None:
+                        output_cell = output_sheet.cell(row_index, column_index)
+                    reference_cell = output_cell or source_cell
+                    editable = (
+                        output_value_cell is not None
+                        and output_value_cell.data_type != "f"
+                        and isinstance(output_value_cell.value, str)
+                    ) or (
+                        output_value_cell is None
+                        and source_value_cell is not None
+                        and source_value_cell.data_type != "f"
+                        and isinstance(source_value_cell.value, str)
+                    )
+                    is_formula = (source_value_cell is not None and source_value_cell.data_type == "f") or (
+                        output_value_cell is not None and output_value_cell.data_type == "f"
+                    )
+                    cells.append(
+                        {
+                            "coordinate": coordinate,
+                            "row_index": reference_cell.row,
+                            "col_index": reference_cell.column,
+                            "source_text": _xlsx_text(source_cell),
+                            "translated_text": _xlsx_text(output_cell),
+                            "value_type": "formula" if is_formula else "text" if editable else "value",
+                            "editable": editable,
+                            "row_span": int(merged.get("row_span", 1)),
+                            "col_span": int(merged.get("col_span", 1)),
+                            "style": _xlsx_cell_style(output_cell) or _xlsx_cell_style(source_cell),
+                        }
+                    )
+            sheets.append(
+                {
+                    "id": f"sheet-{sheet_index}",
+                    "name": output_sheet.title,
+                    "state": output_sheet.sheet_state,
+                    "columns": columns,
+                    "rows": rows,
+                    "cells": cells,
+                }
+            )
+        return sheets
+    finally:
+        source_workbook.close()
+        if output_workbook is not None:
+            output_workbook.close()
+
+
+def _preview_has_xlsx_sheets(payload: dict) -> bool:
+    return payload.get("document_kind") == "xlsx" and payload.get("xlsx_preview_version") == XLSX_PREVIEW_SCHEMA_VERSION and all(
+        isinstance(sheet, dict)
+        and "id" in sheet
+        and "name" in sheet
+        and "state" in sheet
+        and isinstance(sheet.get("columns"), list)
+        and isinstance(sheet.get("rows"), list)
+        and isinstance(sheet.get("cells"), list)
+        and all(isinstance(cell, dict) and "coordinate" in cell for cell in sheet.get("cells", []))
+        for sheet in payload.get("sheets", [])
+    )
+
+
+def _apply_xlsx_preview_updates(job: TranslationJob, preview: dict, cell_updates: list[dict[str, str]]) -> dict:
+    if job.output_file is None:
+        raise ValueError("Translated XLSX does not exist")
+
+    output_path = Path(job.output_file.storage_path)
+    if not output_path.exists():
+        raise ValueError("Translated XLSX does not exist")
+
+    sheet_lookup = {sheet["id"]: sheet for sheet in preview["sheets"]}
+    editable_cells = {
+        (sheet["id"], cell["coordinate"])
+        for sheet in preview["sheets"]
+        for cell in sheet["cells"]
+        if cell["editable"]
+    }
+    workbook = load_workbook(output_path, data_only=False, keep_links=True, rich_text=True)
+    temp_path: Path | None = None
+
+    try:
+        for update in cell_updates:
+            sheet = sheet_lookup.get(update["sheet_id"])
+            if sheet is None:
+                raise ValueError(f"Preview sheet '{update['sheet_id']}' does not exist")
+            coordinate = update["coordinate"]
+            if (update["sheet_id"], coordinate) not in editable_cells:
+                raise ValueError(f"XLSX cell '{coordinate}' is not editable")
+            cell = workbook[sheet["name"]][coordinate]
+            if cell.data_type == "f" or (cell.value is not None and not isinstance(cell.value, str)):
+                raise ValueError(f"XLSX cell '{coordinate}' is not editable")
+            cell.value = update["translated_text"]
+            cell.data_type = "s"
+            for preview_cell in sheet["cells"]:
+                if preview_cell["coordinate"] == coordinate:
+                    preview_cell["translated_text"] = update["translated_text"]
+                    break
+
+        with NamedTemporaryFile("wb", suffix=output_path.suffix, dir=output_path.parent, delete=False) as handle:
+            temp_path = Path(handle.name)
+        workbook.save(temp_path)
+        validation_workbook = load_workbook(temp_path, read_only=True, data_only=False, keep_links=True)
+        validation_workbook.close()
+        temp_path.replace(output_path)
+    finally:
+        workbook.close()
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    preview["updated_at"] = _utcnow_iso()
+    return preview
+
+
+def _read_pptx_sections(path: Path) -> list:
+    if path.suffix.lower() == ".ppt":
+        with TemporaryDirectory(prefix="ppt-preview-") as temp_dir:
+            converted_path = convert_ppt_to_pptx(path, Path(temp_dir))
+            return read_pptx_text_sections(converted_path)
+    if path.suffix.lower() != ".pptx":
+        return []
+    return read_pptx_text_sections(path)
+
+
+def ppt_preview_pdf_path(output_path: str | Path, variant: str) -> Path:
+    path = Path(output_path)
+    if variant not in {"source", "translated"}:
+        raise ValueError("Invalid PPT preview variant")
+    return path.with_name(f"{path.name}.{variant}.preview.pdf")
+
+
+def _render_ppt_preview_pdf(source_path: Path, output_path: Path) -> None:
+    temp_dir_path = output_path.parent
+    temp_dir_path.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="ppt-preview-", dir=temp_dir_path) as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        try:
+            rendered_path = convert_office_to_pdf(source_path, temp_dir_path)
+        except RuntimeError:
+            if source_path.suffix.lower() != ".ppt":
+                raise
+            converted_pptx = convert_ppt_to_pptx(source_path, temp_dir_path)
+            rendered_path = convert_office_to_pdf(converted_pptx, temp_dir_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered_path.replace(output_path)
+
+
+def load_or_create_ppt_preview_pdf(job: TranslationJob, variant: str) -> Path:
+    if job.output_file is None:
+        raise ValueError("Preview is unavailable until translation output is created")
+    if variant not in {"source", "translated"}:
+        raise ValueError("Invalid PPT preview variant")
+
+    source_path = Path(job.input_file.storage_path if variant == "source" else job.output_file.storage_path)
+    output_path = ppt_preview_pdf_path(job.output_file.storage_path, variant)
+    if not output_path.exists() or output_path.stat().st_mtime < source_path.stat().st_mtime:
+        _render_ppt_preview_pdf(source_path, output_path)
+    return output_path
+
+
+def _build_pptx_pages(source_path: Path, output_path: Path) -> list[dict[str, object]]:
+    source_sections = {section.part_name: section for section in _read_pptx_sections(source_path)}
+    translated_sections = {section.part_name: section for section in read_pptx_text_sections(output_path)}
+    ordered_part_names = [section.part_name for section in read_pptx_text_sections(output_path)]
+    ordered_part_names.extend(part_name for part_name in source_sections if part_name not in translated_sections)
+
+    pages: list[dict[str, object]] = []
+    for part_name in ordered_part_names:
+        source_section = source_sections.get(part_name)
+        translated_section = translated_sections.get(part_name)
+        source_paragraphs = source_section.paragraphs if source_section is not None else []
+        translated_paragraphs = translated_section.paragraphs if translated_section is not None else []
+        total = max(len(source_paragraphs), len(translated_paragraphs))
+        if total == 0:
+            continue
+        label = (translated_section or source_section).label
+        pages.append(
+            {
+                "id": f"slide-section-{len(pages) + 1}",
+                "label": label,
+                "source_text": "\n\n".join(source_paragraphs).strip(),
+                "translated_text": "\n\n".join(translated_paragraphs).strip(),
+                "paragraph_refs": [
+                    {"part_name": part_name, "paragraph_index": index}
+                    for index in range(len(translated_paragraphs))
+                ],
+            }
+        )
+
+    if pages:
+        return pages
+    return [
+        {
+            "id": "slide-section-1",
+            "label": "Slide 1",
+            "source_text": "",
+            "translated_text": "",
+            "paragraph_refs": [],
+        }
+    ]
+
+
 def build_job_preview(job: TranslationJob, *, created_at: str | None = None) -> dict:
     if job.output_file is None:
         raise ValueError("Preview is unavailable until translation output is created")
@@ -1918,10 +2306,20 @@ def build_job_preview(job: TranslationJob, *, created_at: str | None = None) -> 
     extension = output_path.suffix.lower()
     if extension == ".pdf":
         pages = _build_pdf_pages(input_path, output_path)
+        sheets = []
         document_kind = "pdf"
     elif extension == ".docx":
         pages = _build_docx_pages(input_path, output_path)
+        sheets = []
         document_kind = "docx"
+    elif extension == ".xlsx":
+        pages = []
+        sheets = _build_xlsx_sheets(input_path, output_path)
+        document_kind = "xlsx"
+    elif extension == ".pptx":
+        pages = _build_pptx_pages(input_path, output_path)
+        sheets = []
+        document_kind = "pptx"
     else:
         raise ValueError(f"Unsupported preview format: {extension}")
 
@@ -1937,9 +2335,12 @@ def build_job_preview(job: TranslationJob, *, created_at: str | None = None) -> 
         "created_at": created_at or now,
         "updated_at": now,
         "pages": pages,
+        "sheets": sheets,
     }
     if document_kind == "pdf":
         payload["pdf_text_granularity"] = PDF_PREVIEW_TEXT_GRANULARITY
+    if document_kind == "xlsx":
+        payload["xlsx_preview_version"] = XLSX_PREVIEW_SCHEMA_VERSION
     return payload
 
 
@@ -1974,6 +2375,18 @@ def _preview_matches_schema(payload: dict, extension: str) -> bool:
             and "translated_text" in page
             for page in payload.get("pages", [])
         )
+    if extension == ".xlsx":
+        return _preview_has_xlsx_sheets(payload)
+    if extension == ".pptx":
+        return payload.get("document_kind") == "pptx" and all(
+            isinstance(page, dict)
+            and "id" in page
+            and "label" in page
+            and "source_text" in page
+            and "translated_text" in page
+            and isinstance(page.get("paragraph_refs"), list)
+            for page in payload.get("pages", [])
+        )
     return False
 
 
@@ -1987,6 +2400,13 @@ def _preview_uses_current_pdf_text_granularity(payload: dict) -> bool:
 def _preview_has_docx_paragraph_indexes(payload: dict) -> bool:
     return payload.get("document_kind") != "docx" or all(
         isinstance(page, dict) and isinstance(page.get("paragraph_indexes"), list)
+        for page in payload.get("pages", [])
+    )
+
+
+def _preview_has_pptx_paragraph_refs(payload: dict) -> bool:
+    return payload.get("document_kind") != "pptx" or all(
+        isinstance(page, dict) and isinstance(page.get("paragraph_refs"), list)
         for page in payload.get("pages", [])
     )
 
@@ -2246,6 +2666,12 @@ def load_or_create_preview(job: TranslationJob, *, force: bool = False, migrate_
         if extension == ".docx" and not _preview_has_docx_paragraph_indexes(existing_preview):
             existing_preview = build_job_preview(job, created_at=existing_preview.get("created_at"))
             preview_changed = True
+        if extension == ".xlsx" and not _preview_has_xlsx_sheets(existing_preview):
+            existing_preview = build_job_preview(job, created_at=existing_preview.get("created_at"))
+            preview_changed = True
+        if extension == ".pptx" and not _preview_has_pptx_paragraph_refs(existing_preview):
+            existing_preview = build_job_preview(job, created_at=existing_preview.get("created_at"))
+            preview_changed = True
         if preview_changed:
             _write_preview(sidecar_path, existing_preview)
         return existing_preview
@@ -2314,6 +2740,35 @@ def _apply_docx_preview_updates(job: TranslationJob, preview: dict, page_updates
     finally:
         temp_path.unlink(missing_ok=True)
 
+    job.output_file.size_bytes = output_path.stat().st_size
+    job.output_file.checksum = file_checksum(output_path)
+    return build_job_preview(job, created_at=preview.get("created_at"))
+
+
+def _apply_pptx_preview_updates(job: TranslationJob, preview: dict, page_updates: list[dict[str, str]]) -> dict:
+    if job.output_file is None:
+        raise ValueError("Translated PPTX does not exist")
+
+    output_path = Path(job.output_file.storage_path)
+    if not output_path.exists():
+        raise ValueError("Translated PPTX does not exist")
+
+    page_lookup = {page["id"]: page for page in preview["pages"]}
+    replacements: dict[tuple[str, int], str] = {}
+    for update in page_updates:
+        page_id = update["id"]
+        page = page_lookup.get(page_id)
+        if page is None:
+            raise ValueError(f"Preview page '{page_id}' does not exist")
+        paragraph_refs = [
+            (str(ref["part_name"]), int(ref["paragraph_index"]))
+            for ref in page.get("paragraph_refs", [])
+        ]
+        replacement_texts = _split_docx_preview_text(update["translated_text"], len(paragraph_refs))
+        for paragraph_ref, replacement_text in zip(paragraph_refs, replacement_texts, strict=True):
+            replacements[paragraph_ref] = replacement_text
+
+    replace_pptx_paragraphs(output_path, replacements)
     job.output_file.size_bytes = output_path.stat().st_size
     job.output_file.checksum = file_checksum(output_path)
     return build_job_preview(job, created_at=preview.get("created_at"))
@@ -2812,9 +3267,24 @@ def update_preview(job: TranslationJob, update_payload: dict) -> dict:
         _write_preview(sidecar, updated_preview)
         return updated_preview
 
+    if preview["document_kind"] == "xlsx":
+        cell_updates = update_payload.get("cells")
+        if not isinstance(cell_updates, list):
+            raise ValueError("XLSX preview updates require cell content")
+        updated_preview = _apply_xlsx_preview_updates(job, preview, cell_updates)
+        _write_preview(sidecar, updated_preview)
+        return updated_preview
+
     page_updates = update_payload.get("pages")
     if not isinstance(page_updates, list):
-        raise ValueError("DOCX preview updates require page content")
+        raise ValueError("Office preview updates require page content")
+
+    if preview["document_kind"] == "pptx":
+        if not _preview_has_pptx_paragraph_refs(preview):
+            preview = build_job_preview(job, created_at=preview.get("created_at"))
+        updated_preview = _apply_pptx_preview_updates(job, preview, page_updates)
+        _write_preview(sidecar, updated_preview)
+        return updated_preview
 
     if not _preview_has_docx_paragraph_indexes(preview):
         preview = build_job_preview(job, created_at=preview.get("created_at"))

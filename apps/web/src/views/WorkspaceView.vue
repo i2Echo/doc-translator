@@ -38,7 +38,7 @@ let clockHandle = null;
 const activeJobs = computed(() => state.jobs.filter((job) => activeJobStatuses.has(job.status)).length);
 const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
 const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
-const supportedUploadExtensions = new Set([".pdf", ".docx"]);
+const supportedUploadExtensions = new Set([".pdf", ".docx", ".xlsx", ".ppt", ".pptx"]);
 const uploadMessageIsError = computed(() => {
   const message = state.messages.upload;
   return Boolean(
@@ -142,7 +142,10 @@ function addFiles(fileList) {
   });
   uploadForm.files.push(...nextFiles);
   if (selectedFiles.length && !nextFiles.length) {
-    state.messages.upload = copy("没有新的 PDF 或 DOCX 文件可加入。", "No new PDF or DOCX files to add.");
+    state.messages.upload = copy(
+      "没有新的 PDF、DOCX、XLSX 或 PPT 文件可加入。",
+      "No new PDF, DOCX, XLSX, or PPT files to add."
+    );
   } else if (nextFiles.length) {
     state.messages.upload = "";
   }
@@ -179,7 +182,10 @@ function hasSameTranslationLanguages(sourceLanguage, targetLanguage) {
 
 async function submitUpload() {
   if (!uploadForm.files.length) {
-    state.messages.upload = copy("请先选择 PDF 或 DOCX 文件。", "Choose a PDF or DOCX file first.");
+    state.messages.upload = copy(
+      "请先选择 PDF、DOCX、XLSX 或 PPT 文件。",
+      "Choose a PDF, DOCX, XLSX, or PPT file first."
+    );
     return;
   }
 
@@ -253,11 +259,11 @@ onBeforeUnmount(() => {
             ref="fileInputRef"
             type="file"
             multiple
-            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            accept=".pdf,.docx,.xlsx,.ppt,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
             @change="onFileChange"
           />
           <div class="upload-copy">
-            <strong>{{ copy("拖拽或选择 PDF / DOCX", "Drop or choose PDF / DOCX files") }}</strong>
+            <strong>{{ copy("拖拽或选择 PDF / DOCX / XLSX / PPT", "Drop or choose PDF / DOCX / XLSX / PPT files") }}</strong>
             <p class="subtle">
               {{
                 uploadForm.files.length
@@ -341,7 +347,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-if="!state.jobs.length" class="empty-state">
-        {{ copy("还没有任务。先上传一个 PDF 或 DOCX。", "No jobs yet. Upload a PDF or DOCX to get started.") }}
+        {{ copy("还没有任务。先上传一个 PDF、DOCX、XLSX 或 PPT。", "No jobs yet. Upload a PDF, DOCX, XLSX, or PPT to get started.") }}
       </div>
 
       <div v-else class="job-list">

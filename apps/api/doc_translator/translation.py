@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,8 +26,10 @@ from doc_translator.db import SessionLocal
 from doc_translator.docx_translator import translate_docx
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
 from doc_translator.preview import load_or_create_preview, preview_sidecar_path
+from doc_translator.pptx_translator import PPTX_CONTENT_TYPE, convert_ppt_to_pptx, translate_pptx
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
 from doc_translator.storage import build_output_target, file_checksum, translated_output_name
+from doc_translator.xlsx_translator import translate_xlsx
 from doc_translator.translators.prompt_builder import build_terminology_instruction
 from doc_translator.translators.trie_matcher import default_terminology_matcher
 
@@ -75,6 +78,10 @@ _BABELDOC_PROGRESS_EVENT_PREFIX = "__BABELDOC_PROGRESS__"
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BABELDOC_PROGRESS_FRACTION_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 _MODEL_ERROR_BODY_LIMIT = 600
+_MODEL_REQUEST_MAX_ATTEMPTS = 4
+_MODEL_REQUEST_INITIAL_BACKOFF_SECONDS = 1.0
+_MODEL_REQUEST_MAX_BACKOFF_SECONDS = 8.0
+_MODEL_REQUEST_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
 @dataclass(frozen=True)
@@ -134,6 +141,73 @@ class OpenAICompatibleTranslator:
         self.runtime = runtime
         base_url = runtime.model_base_url.rstrip("/")
         self.endpoint = f"{base_url}/chat/completions"
+        self.client = httpx.Client(
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            timeout=httpx.Timeout(
+                runtime.model_timeout_seconds,
+                connect=min(30.0, float(runtime.model_timeout_seconds)),
+                read=runtime.model_timeout_seconds,
+                write=min(30.0, float(runtime.model_timeout_seconds)),
+                pool=10.0,
+            ),
+        )
+
+    def close(self) -> None:
+        self.client.close()
+
+    def _retry_delay_seconds(self, attempt: int) -> float:
+        return min(_MODEL_REQUEST_MAX_BACKOFF_SECONDS, _MODEL_REQUEST_INITIAL_BACKOFF_SECONDS * (2**attempt))
+
+    def _request_json(self, payload: dict[str, object]) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(_MODEL_REQUEST_MAX_ATTEMPTS):
+            try:
+                response = self.client.post(
+                    self.endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self.runtime.model_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                if response.status_code in _MODEL_REQUEST_RETRYABLE_STATUS_CODES:
+                    raise httpx.HTTPStatusError(
+                        f"Retryable status code {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                if status_code not in _MODEL_REQUEST_RETRYABLE_STATUS_CODES or attempt + 1 >= _MODEL_REQUEST_MAX_ATTEMPTS:
+                    body = exc.response.text.strip()
+                    summary = re.sub(r"\s+", " ", body)[:_MODEL_ERROR_BODY_LIMIT].strip()
+                    reason = exc.response.reason_phrase or "HTTP error"
+                    if summary:
+                        raise RuntimeError(
+                            f"Model API request failed with {status_code} {reason}: {summary}"
+                        ) from exc
+                    raise RuntimeError(f"Model API request failed with {status_code} {reason}") from exc
+                last_error = exc
+            except httpx.RequestError as exc:
+                if attempt + 1 >= _MODEL_REQUEST_MAX_ATTEMPTS:
+                    raise RuntimeError(f"Model API request failed after {_MODEL_REQUEST_MAX_ATTEMPTS} attempts: {exc}") from exc
+                last_error = exc
+
+            delay = self._retry_delay_seconds(attempt)
+            logger.warning(
+                "Model API request failed, retrying",
+                extra={
+                    "attempt": attempt + 1,
+                    "max_attempts": _MODEL_REQUEST_MAX_ATTEMPTS,
+                    "delay_seconds": delay,
+                    "endpoint": self.endpoint,
+                    "error": str(last_error) if last_error else None,
+                },
+            )
+            time.sleep(delay)
+        raise RuntimeError("Model API request failed unexpectedly")
 
     def translate_text(
         self,
@@ -161,13 +235,8 @@ class OpenAICompatibleTranslator:
         if extra_system_instruction:
             system_content = f"{system_content}\n\n{extra_system_instruction}"
 
-        response = httpx.post(
-            self.endpoint,
-            headers={
-                "Authorization": f"Bearer {self.runtime.model_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
+        payload = self._request_json(
+            {
                 "model": self.runtime.model_name,
                 "temperature": 0,
                 "messages": [
@@ -177,21 +246,8 @@ class OpenAICompatibleTranslator:
                     },
                     {"role": "user", "content": text},
                 ],
-            },
-            timeout=self.runtime.model_timeout_seconds,
+            }
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            body = response.text.strip()
-            summary = re.sub(r"\s+", " ", body)[:_MODEL_ERROR_BODY_LIMIT].strip()
-            reason = response.reason_phrase or "HTTP error"
-            if summary:
-                raise RuntimeError(
-                    f"Model API request failed with {response.status_code} {reason}: {summary}"
-                ) from exc
-            raise RuntimeError(f"Model API request failed with {response.status_code} {reason}") from exc
-        payload = response.json()
         try:
             return payload["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
@@ -854,19 +910,23 @@ def translate_pdf(
 
 def test_model_connection(runtime: RuntimeSettings) -> tuple[int, str]:
     translator = OpenAICompatibleTranslator(runtime)
-    return translator.test_connection()
+    try:
+        return translator.test_connection()
+    finally:
+        translator.close()
 
 
-def _remove_docx_result(output_path: Path) -> None:
+def _remove_office_result(output_path: Path) -> None:
     for path in (output_path, preview_sidecar_path(str(output_path))):
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            logger.warning("Could not remove incomplete DOCX result", extra={"path": str(path), "error": str(exc)})
+            logger.warning("Could not remove incomplete Office result", extra={"path": str(path), "error": str(exc)})
 
 
 def run_translation_job(job_id: str) -> None:
     session = SessionLocal()
+    translator: OpenAICompatibleTranslator | None = None
     try:
         job = (
             session.query(TranslationJob)
@@ -891,8 +951,9 @@ def run_translation_job(job_id: str) -> None:
         input_file = job.input_file
         input_path = str(_ensure_input_file_available(session, job))
         extension = Path(input_file.original_name).suffix.lower()
-        output_path = build_output_target(runtime, input_file.original_name, extension, job.target_language)
-        output_display_name = translated_output_name(input_file.original_name, job.target_language, extension)
+        output_extension = ".pptx" if extension == ".ppt" else extension
+        output_path = build_output_target(runtime, input_file.original_name, output_extension, job.target_language)
+        output_display_name = translated_output_name(input_file.original_name, job.target_language, output_extension)
         page_count: int | None
 
         if extension == ".pdf":
@@ -922,6 +983,71 @@ def run_translation_job(job_id: str) -> None:
                     message="Writing translated DOCX",
                 ),
             )
+        elif extension == ".xlsx":
+            translator = OpenAICompatibleTranslator(runtime)
+            update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating XLSX cells")
+            page_count = translate_xlsx(
+                input_path,
+                output_path,
+                translator=translator,
+                translate_segments=translate_segments,
+                source_language=job.source_language,
+                target_language=job.target_language,
+                on_progress=lambda index, total: update_job_state(
+                    session,
+                    job,
+                    status=JobStatus.TRANSLATING,
+                    progress=20 + int((index / max(total, 1)) * 60),
+                ),
+                cancel_check=lambda: ensure_not_cancelled(session, job),
+                on_rebuilding=lambda: update_job_state(
+                    session,
+                    job,
+                    status=JobStatus.REBUILDING,
+                    progress=88,
+                    message="Writing translated XLSX",
+                ),
+            )
+        elif extension in {".ppt", ".pptx"}:
+            translator = OpenAICompatibleTranslator(runtime)
+            update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating presentation content")
+
+            def translate_presentation_input(presentation_input_path: str) -> int | None:
+                return translate_pptx(
+                    presentation_input_path,
+                    output_path,
+                    translator=translator,
+                    translate_segments=translate_segments,
+                    source_language=job.source_language,
+                    target_language=job.target_language,
+                    on_progress=lambda index, total: update_job_state(
+                        session,
+                        job,
+                        status=JobStatus.TRANSLATING,
+                        progress=20 + int((index / max(total, 1)) * 60),
+                    ),
+                    cancel_check=lambda: ensure_not_cancelled(session, job),
+                    on_rebuilding=lambda: update_job_state(
+                        session,
+                        job,
+                        status=JobStatus.REBUILDING,
+                        progress=88,
+                        message="Writing translated PPTX",
+                    ),
+                )
+
+            if extension == ".ppt":
+                with tempfile.TemporaryDirectory(prefix="ppt-convert-") as temp_dir:
+                    update_job_state(
+                        session,
+                        job,
+                        status=JobStatus.PARSING,
+                        progress=12,
+                        message="Converting PPT to PPTX",
+                    )
+                    page_count = translate_presentation_input(str(convert_ppt_to_pptx(input_path, Path(temp_dir))))
+            else:
+                page_count = translate_presentation_input(input_path)
         else:
             raise RuntimeError("Unsupported file type")
 
@@ -929,7 +1055,7 @@ def run_translation_job(job_id: str) -> None:
             original_name=output_display_name,
             stored_name=output_path.name,
             storage_path=str(output_path),
-            content_type=input_file.content_type,
+            content_type=PPTX_CONTENT_TYPE if output_extension == ".pptx" else input_file.content_type,
             size_bytes=output_path.stat().st_size,
             checksum=file_checksum(output_path),
             kind=JobFileKind.OUTPUT,
@@ -970,8 +1096,8 @@ def run_translation_job(job_id: str) -> None:
         logger.info("Completed translation job", extra={"job_id": job.id})
     except JobCancelledError:
         if "job" in locals():
-            if locals().get("extension") == ".docx" and "output_path" in locals():
-                _remove_docx_result(output_path)
+            if locals().get("extension") in {".docx", ".xlsx", ".ppt", ".pptx"} and "output_path" in locals():
+                _remove_office_result(output_path)
             session.rollback()
             job = session.get(TranslationJob, job_id) or job
             update_job_state(session, job, status=JobStatus.CANCELLED, progress=job.progress, message="Job cancelled")
@@ -987,8 +1113,8 @@ def run_translation_job(job_id: str) -> None:
     except Exception as exc:
         if "job" in locals():
             logger.exception("Translation job failed", extra={"job_id": job.id})
-            if locals().get("extension") == ".docx" and "output_path" in locals():
-                _remove_docx_result(output_path)
+            if locals().get("extension") in {".docx", ".xlsx", ".ppt", ".pptx"} and "output_path" in locals():
+                _remove_office_result(output_path)
             session.rollback()
             job = session.get(TranslationJob, job_id) or job
             update_job_state(
@@ -1012,4 +1138,6 @@ def run_translation_job(job_id: str) -> None:
         else:
             logger.exception("Translation job failed before loading state", extra={"job_id": job_id})
     finally:
+        if translator is not None:
+            translator.close()
         session.close()

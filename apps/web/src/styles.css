@@ -1081,6 +1081,12 @@ svg {
   gap: 12px;
 }
 
+.preview-body--pptx {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
 .preview-column {
   position: relative;
   min-height: 0;
@@ -1433,6 +1439,165 @@ svg {
   padding: 12px 0;
 }
 
+.preview-column--docx > .docx-preview-stack {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 16px;
+}
+
+.preview-body--xlsx {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+}
+
+.preview-column--xlsx {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.preview-column--xlsx-editor {
+  background: rgba(255, 252, 247, 0.94);
+}
+
+.preview-column--pptx-editor {
+  background: rgba(255, 252, 247, 0.94);
+}
+
+.xlsx-preview-heading,
+.xlsx-preview-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.xlsx-preview-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.xlsx-preview-status strong {
+  color: var(--ink);
+}
+
+.xlsx-sheet-tabs {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 12px;
+  overflow-x: auto;
+}
+
+.xlsx-sheet-tab {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+}
+
+.xlsx-sheet-tab:hover,
+.xlsx-sheet-tab.active {
+  color: var(--ink);
+  border-color: var(--line-strong);
+  background: rgba(255, 252, 247, 0.92);
+}
+
+.xlsx-sheet-tab span {
+  font-weight: 700;
+}
+
+.xlsx-sheet-tab small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.xlsx-grid-scroll {
+  min-height: 0;
+  overflow: auto;
+  background: #f3f3f3;
+}
+
+.xlsx-grid {
+  display: grid;
+  min-width: max-content;
+  width: max-content;
+  color: #1f1f1f;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.xlsx-grid-corner,
+.xlsx-grid-header {
+  position: sticky;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  border-right: 1px solid #c8c8c8;
+  border-bottom: 1px solid #c8c8c8;
+}
+
+.xlsx-grid-corner {
+  top: 0;
+  left: 0;
+  grid-column: 1;
+  grid-row: 1;
+  z-index: 8;
+}
+
+.xlsx-grid-header--column {
+  top: 0;
+}
+
+.xlsx-grid-header--row {
+  left: 0;
+}
+
+.xlsx-grid-header.hidden {
+  color: #9a9a9a;
+  background: #e3e3e3;
+}
+
+.xlsx-grid-cell {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  min-height: 0;
+  padding: 5px 7px;
+  border-right: 1px solid #d6d6d6;
+}
+
+.xlsx-grid-cell.is-editable:hover {
+  box-shadow: inset 0 0 0 2px rgba(15, 110, 106, 0.28);
+}
+
+.xlsx-grid-cell.muted {
+  color: #777;
+}
+
+.xlsx-grid-cell span {
+  min-width: 0;
+}
+
+.xlsx-grid-editor {
+  width: 100%;
+  min-height: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  resize: none;
+}
+
+.xlsx-grid-editor:focus {
+  box-shadow: inset 0 0 0 2px rgba(15, 110, 106, 0.55);
+}
+
 .docx-preview-stack--editor {
   min-height: 0;
   align-content: start;
@@ -1481,6 +1646,8 @@ svg {
 @media (max-width: 1200px) {
   .preview-body--pdf,
   .preview-body--docx,
+  .preview-body--pptx,
+  .preview-body--xlsx,
   .preview-text-grid {
     grid-template-columns: 1fr;
   }

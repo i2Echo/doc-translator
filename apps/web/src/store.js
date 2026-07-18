@@ -195,6 +195,14 @@ function hasPreviewChanges(original, draft) {
     return false;
   }
 
+  if (original.document_kind === "xlsx") {
+    return original.sheets.some((sheet, sheetIndex) =>
+      sheet.cells.some(
+        (cell, cellIndex) => cell.translated_text !== draft.sheets[sheetIndex].cells[cellIndex].translated_text
+      )
+    );
+  }
+
   return original.pages.some((page, index) => page.translated_text !== draft.pages[index].translated_text);
 }
 
@@ -247,6 +255,28 @@ function previewEditablePayload() {
           tgt_text: draftBlock.tgt_text,
           font_size_final: originalBlock.font_size_current || originalBlock.font_size_original,
           layout_status: draftBlock.layout_status || "ok",
+        });
+      }
+    });
+  });
+  return updates;
+}
+
+function xlsxEditablePayload() {
+  if (!state.previewData || !state.previewDraft || state.previewData.document_kind !== "xlsx") {
+    return [];
+  }
+
+  const updates = [];
+  state.previewData.sheets.forEach((originalSheet, sheetIndex) => {
+    const draftSheet = state.previewDraft.sheets[sheetIndex];
+    originalSheet.cells.forEach((originalCell, cellIndex) => {
+      const draftCell = draftSheet.cells[cellIndex];
+      if (originalCell.editable && originalCell.translated_text !== draftCell.translated_text) {
+        updates.push({
+          sheet_id: originalSheet.id,
+          coordinate: originalCell.coordinate,
+          translated_text: draftCell.translated_text,
         });
       }
     });
@@ -529,7 +559,11 @@ export async function cancelJob(jobId) {
 }
 
 export async function retryJob(jobId) {
-  await authedRequest(`/jobs/${jobId}/retry`, { method: "POST" });
+  const updatedJob = await authedRequest(`/jobs/${jobId}/retry`, { method: "POST" });
+  state.jobs = state.jobs.map((job) => (job.id === updatedJob.id ? updatedJob : job));
+  if (state.selectedJob?.id === updatedJob.id) {
+    state.selectedJob = updatedJob;
+  }
   await refreshAll();
 }
 
@@ -538,7 +572,7 @@ export async function downloadJob(jobId) {
   const blob = await response.blob();
   const job = state.jobs.find((candidate) => candidate.id === jobId) || (state.previewJob?.id === jobId ? state.previewJob : null);
   const outputName = job?.output_file?.original_name || "";
-  const fallback = outputName.toLowerCase().endsWith(".docx") ? outputName : `translated-${jobId}`;
+  const fallback = outputName || `translated-${jobId}`;
   const filename = contentDispositionFilename(response.headers.get("content-disposition"), fallback);
   triggerDownload(blob, filename);
 }
@@ -601,17 +635,25 @@ export async function toggleUserState(userId, payload) {
   state.users = state.users.map((user) => (user.id === updatedUser.id ? updatedUser : user));
 }
 
-function loadPreviewDocuments(jobId, revision) {
+function loadPreviewDocuments(jobId, revision, documentKind) {
   const version = revision ? `?rev=${encodeURIComponent(revision)}` : "";
   revokePreviewDocumentUrls();
+  if (documentKind === "pptx") {
+    state.previewDocuments.sourceUrl = apiPath(`/jobs/${jobId}/documents/source-preview${version}`);
+    state.previewDocuments.translatedUrl = apiPath(`/jobs/${jobId}/documents/translated-preview${version}`);
+    return;
+  }
   state.previewDocuments.sourceUrl = apiPath(`/jobs/${jobId}/documents/source`);
   state.previewDocuments.translatedUrl = apiPath(`/jobs/${jobId}/documents/translated${version}`);
 }
 
-function refreshTranslatedPreviewDocument(jobId, revision) {
+function refreshTranslatedPreviewDocument(jobId, revision, documentKind) {
   const version = revision ? `?rev=${encodeURIComponent(revision)}` : "";
   revokePreviewDocumentUrl("translatedUrl");
-  state.previewDocuments.translatedUrl = apiPath(`/jobs/${jobId}/documents/translated${version}`);
+  state.previewDocuments.translatedUrl =
+    documentKind === "pptx"
+      ? apiPath(`/jobs/${jobId}/documents/translated-preview${version}`)
+      : apiPath(`/jobs/${jobId}/documents/translated${version}`);
 }
 
 export async function loadPreview(jobId) {
@@ -633,10 +675,8 @@ export async function loadPreview(jobId) {
     state.previewDraft = clonePreview(preview);
     state.previewMode = "view";
 
-    if (preview.document_kind === "pdf") {
-      loadPreviewDocuments(jobId, preview.updated_at);
-    } else if (preview.document_kind === "docx") {
-      loadPreviewDocuments(jobId, preview.updated_at);
+    if (preview.document_kind === "pdf" || preview.document_kind === "docx" || preview.document_kind === "pptx") {
+      loadPreviewDocuments(jobId, preview.updated_at, preview.document_kind);
     }
   } finally {
     state.pending.preview = false;
@@ -673,6 +713,10 @@ export async function savePreview() {
             status: "validated",
             payload: pdfPayload,
           }
+        : state.previewDraft.document_kind === "xlsx"
+          ? {
+              cells: xlsxEditablePayload(),
+            }
         : {
             pages: state.previewDraft.pages.map((page) => ({
               id: page.id,
@@ -687,8 +731,8 @@ export async function savePreview() {
     });
     state.previewData = preview;
     state.previewDraft = restoreQuarantinedPdfEdits(clonePreview(preview), quarantined);
-    if (preview.document_kind === "pdf" || preview.document_kind === "docx") {
-      refreshTranslatedPreviewDocument(state.previewJob.id, preview.updated_at);
+    if (preview.document_kind === "pdf" || preview.document_kind === "docx" || preview.document_kind === "pptx") {
+      refreshTranslatedPreviewDocument(state.previewJob.id, preview.updated_at, preview.document_kind);
     }
     state.messages.preview =
       quarantined.size > 0

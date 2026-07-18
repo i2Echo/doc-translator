@@ -28,6 +28,9 @@ const editorScroller = ref(null);
 const layoutSandbox = ref(null);
 const docxSourceHost = ref(null);
 const docxTranslatedHost = ref(null);
+const xlsxSourceScroller = ref(null);
+const xlsxTranslatedScroller = ref(null);
+const activeXlsxSheetId = ref("");
 const activePdfItemId = ref("");
 const currentPdfPage = ref(1);
 const pdfStageAspect = reactive({
@@ -121,6 +124,9 @@ let docxRenderVersion = 0;
 
 const isPdf = computed(() => state.previewData?.document_kind === "pdf");
 const isDocx = computed(() => state.previewData?.document_kind === "docx");
+const isPptx = computed(() => state.previewData?.document_kind === "pptx");
+const isXlsx = computed(() => state.previewData?.document_kind === "xlsx");
+const isVisualPreview = computed(() => isPdf.value || isPptx.value);
 const isEditing = computed(() => state.previewMode === "edit");
 const title = computed(() => state.previewData?.output_name || state.previewJob?.output_file?.original_name || "");
 const referencePdfKind = computed(() => (isEditing.value ? "translated" : "source"));
@@ -135,15 +141,44 @@ const subtitle = computed(() => {
   return `${fileKindLabel(state.previewJob.input_file.original_name)} · ${languageName(state.previewJob.source_language, copy)} → ${languageName(state.previewJob.target_language, copy)}`;
 });
 
+const xlsxSheets = computed(() => (isXlsx.value ? state.previewDraft?.sheets || [] : []));
+const activeXlsxSheet = computed(
+  () => xlsxSheets.value.find((sheet) => sheet.id === activeXlsxSheetId.value) || xlsxSheets.value[0] || null
+);
+const xlsxEditableCellCount = computed(() => activeXlsxSheet.value?.cells.filter((cell) => cell.editable).length || 0);
+const activeXlsxCells = computed(() => activeXlsxSheet.value?.cells.filter((cell) => !cell.merged_parent) || []);
+const activeXlsxSheetNumber = computed(() => {
+  const index = xlsxSheets.value.findIndex((sheet) => sheet.id === activeXlsxSheet.value?.id);
+  return index >= 0 ? index + 1 : 1;
+});
+const xlsxSheetCount = computed(() => xlsxSheets.value.length || 1);
+const hasHiddenXlsxSheets = computed(() => xlsxSheets.value.some((sheet) => sheet.state !== "visible"));
+const showXlsxSheetTabs = computed(() => xlsxSheets.value.length > 1 || hasHiddenXlsxSheets.value);
+const pptxSlides = computed(() =>
+  isPptx.value
+    ? (() => {
+        const pages = state.previewData?.pages || [];
+        const slides = pages.filter((page) => !String(page.label || "").toLowerCase().startsWith("notes"));
+        return slides.length ? slides : pages;
+      })()
+    : []
+);
+
 const pdfPages = computed(() => {
   if (!state.previewDraft?.pages || !isPdf.value) {
     return [];
   }
   return [...state.previewDraft.pages].sort((left, right) => (left.page_num || 0) - (right.page_num || 0));
 });
+const visualPageCount = computed(() => {
+  if (isPptx.value) {
+    return pptxSlides.value.length || 1;
+  }
+  return pdfPages.value.length || 1;
+});
 
 const repeatedPdfEdgeTexts = computed(() => collectRepeatedPdfEdgeTexts(pdfPages.value));
-const pageCount = computed(() => pdfPages.value.length || 1);
+const pageCount = computed(() => visualPageCount.value);
 const currentDraftPage = computed(() => pdfPages.value.find((page) => page.page_num === currentPdfPage.value) || pdfPages.value[0] || null);
 const currentPdfItems = computed(() => editablePdfItems(currentDraftPage.value));
 const activePdfItem = computed(() => currentPdfItems.value.find((item) => item.id === activePdfItemId.value) || currentPdfItems.value[0] || null);
@@ -733,9 +768,100 @@ function syncScroll(source, target) {
   target.scrollTop = ratio * targetRange;
 }
 
+function xlsxCellTypeLabel(cell) {
+  if (cell.value_type === "formula") {
+    return copy("公式", "Formula");
+  }
+  if (cell.value_type === "value") {
+    return copy("只读值", "Read-only");
+  }
+  return copy("文本", "Text");
+}
+
+function xlsxSheetStateLabel(sheet) {
+  if (sheet.state === "veryHidden") {
+    return copy("深度隐藏", "Very hidden");
+  }
+  if (sheet.state === "hidden") {
+    return copy("隐藏", "Hidden");
+  }
+  return copy("可见", "Visible");
+}
+
+function xlsxEditorRows(text) {
+  return Math.min(6, Math.max(2, String(text || "").split("\n").length));
+}
+
+function xlsxColumnPosition(sheet, columnIndex) {
+  return Math.max((sheet?.columns || []).findIndex((column) => column.index === columnIndex), 0) + 2;
+}
+
+function xlsxRowPosition(sheet, rowIndex) {
+  return Math.max((sheet?.rows || []).findIndex((row) => row.index === rowIndex), 0) + 2;
+}
+
+function xlsxGridStyle(sheet) {
+  const columns = sheet?.columns?.length ? sheet.columns : [{ width: 72 }];
+  const rows = sheet?.rows?.length ? sheet.rows : [{ height: 28 }];
+  return {
+    gridTemplateColumns: `46px ${columns.map((column) => `${column.width || 72}px`).join(" ")}`,
+    gridTemplateRows: `30px ${rows.map((row) => `${row.height || 28}px`).join(" ")}`,
+  };
+}
+
+function xlsxGridCellStyle(sheet, cell) {
+  return {
+    gridColumn: `${xlsxColumnPosition(sheet, cell.col_index)} / span ${cell.col_span || 1}`,
+    gridRow: `${xlsxRowPosition(sheet, cell.row_index)} / span ${cell.row_span || 1}`,
+    ...cell.style,
+  };
+}
+
+function xlsxColumnHeaderStyle(index) {
+  return {
+    gridColumn: index + 2,
+    gridRow: 1,
+  };
+}
+
+function xlsxRowHeaderStyle(index) {
+  return {
+    gridColumn: 1,
+    gridRow: index + 2,
+  };
+}
+
+function xlsxCellText(cell, pane) {
+  return pane === "source" ? cell.source_text : cell.translated_text;
+}
+
+function selectXlsxSheet(sheetId) {
+  activeXlsxSheetId.value = sheetId;
+  nextTick(() => {
+    for (const scroller of [xlsxSourceScroller.value, xlsxTranslatedScroller.value]) {
+      scroller?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    }
+  });
+}
+
+function handleXlsxScroll(kind) {
+  const activeScroller = kind === "source" ? xlsxSourceScroller.value : xlsxTranslatedScroller.value;
+  const passiveScroller = kind === "source" ? xlsxTranslatedScroller.value : xlsxSourceScroller.value;
+
+  if (!activeScroller || syncingScroll || !passiveScroller) {
+    return;
+  }
+
+  syncingScroll = true;
+  syncScroll(activeScroller, passiveScroller);
+  window.requestAnimationFrame(() => {
+    syncingScroll = false;
+  });
+}
+
 async function renderCurrentPdfPages() {
   const referenceDoc = pdfDocs[referencePdfKind.value];
-  if (!isPdf.value || !referenceDoc) {
+  if (!isVisualPreview.value || !referenceDoc) {
     return;
   }
 
@@ -799,9 +925,10 @@ async function loadPdfPreview({ resetView = false } = {}) {
 async function ensurePreview(jobId) {
   try {
     currentPdfPage.value = 1;
+    activeXlsxSheetId.value = "";
     resetPdfOnNextDocumentsChange = true;
     await loadPreview(jobId);
-    if (!isPdf.value) {
+    if (!isVisualPreview.value) {
       resetPdfOnNextDocumentsChange = false;
     }
   } catch (error) {
@@ -901,7 +1028,7 @@ function handleEditorScroll() {
 }
 
 function schedulePdfRender() {
-  if (!isPdf.value || state.pending.preview) {
+  if (!isVisualPreview.value || state.pending.preview) {
     return;
   }
   window.clearTimeout(resizeTimer);
@@ -988,7 +1115,7 @@ watch(
 watch(
   () => [state.previewDocuments.sourceUrl, state.previewDocuments.translatedUrl],
   async () => {
-    if (!isPdf.value || !state.previewDocuments.sourceUrl) {
+    if (!isVisualPreview.value || !state.previewDocuments.sourceUrl) {
       return;
     }
     const resetView = resetPdfOnNextDocumentsChange;
@@ -1010,7 +1137,7 @@ watch(
 watch(
   () => state.previewMode,
   () => {
-    if (!isPdf.value || state.pending.preview) {
+    if (!isVisualPreview.value || state.pending.preview) {
       return;
     }
     if (isEditing.value) {
@@ -1025,6 +1152,9 @@ watch(
   () => {
     activePdfItemId.value = "";
     scheduleLayoutMeasure();
+    if (isXlsx.value && !xlsxSheets.value.some((sheet) => sheet.id === activeXlsxSheetId.value)) {
+      activeXlsxSheetId.value = xlsxSheets.value[0]?.id || "";
+    }
   }
 );
 
@@ -1293,6 +1423,246 @@ onUnmounted(async () => {
           </button>
           <button class="icon-button icon-button--small" type="button" :disabled="currentPdfPage >= pageCount" @click="movePage(1)">›</button>
         </footer>
+      </article>
+    </section>
+
+    <section
+      v-else-if="state.previewData && isPptx"
+      class="preview-body preview-body--pptx"
+      :class="{ 'preview-body--pptx-editor': isEditing }"
+    >
+      <article class="preview-column preview-column--canvas">
+        <div class="preview-column__head">
+          <strong>{{ referencePdfLabel }}</strong>
+          <span :title="referencePdfName">{{ referencePdfName }}</span>
+        </div>
+
+        <div class="preview-zoom-control">
+          <button
+            class="icon-button icon-button--tiny icon-button--bare"
+            type="button"
+            :disabled="pdfZoom.source <= 0.7"
+            :title="copy('缩小', 'Zoom out')"
+            @click="adjustZoom('source', -1)"
+          >
+            −
+          </button>
+          <span>{{ formatZoom("source") }}</span>
+          <button
+            class="icon-button icon-button--tiny icon-button--bare"
+            type="button"
+            :disabled="pdfZoom.source >= 1.8"
+            :title="copy('放大', 'Zoom in')"
+            @click="adjustZoom('source', 1)"
+          >
+            +
+          </button>
+        </div>
+
+        <div ref="sourceScroller" class="pdf-stage pdf-stage--scroll" :style="pdfStageStyle('source')" @scroll="handlePdfScroll('source')">
+          <div v-for="(page, index) in pptxSlides" :key="`source-${page.id}`" class="pdf-page-shell" :data-page="index + 1">
+            <div class="pdf-canvas-shell">
+              <canvas class="pdf-canvas" :data-page="index + 1"></canvas>
+              <div class="pdf-page-loader" aria-hidden="true">
+                <span class="pdf-page-spinner"></span>
+                <span>{{ copy("页面加载中", "Loading page") }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="floating-page-chip">
+          <span>{{ currentPdfPage }} / {{ pageCount }}</span>
+        </div>
+      </article>
+
+      <article v-if="!isEditing" class="preview-column preview-column--canvas">
+        <div class="preview-column__head">
+          <strong>{{ copy("译文 PPTX", "Translated PPTX") }}</strong>
+          <span :title="title">{{ title }}</span>
+        </div>
+
+        <div class="preview-zoom-control">
+          <button
+            class="icon-button icon-button--tiny icon-button--bare"
+            type="button"
+            :disabled="pdfZoom.translated <= 0.7"
+            :title="copy('缩小', 'Zoom out')"
+            @click="adjustZoom('translated', -1)"
+          >
+            −
+          </button>
+          <span>{{ formatZoom("translated") }}</span>
+          <button
+            class="icon-button icon-button--tiny icon-button--bare"
+            type="button"
+            :disabled="pdfZoom.translated >= 1.8"
+            :title="copy('放大', 'Zoom in')"
+            @click="adjustZoom('translated', 1)"
+          >
+            +
+          </button>
+        </div>
+
+        <div
+          ref="translatedScroller"
+          class="pdf-stage pdf-stage--scroll"
+          :style="pdfStageStyle('translated')"
+          @scroll="handlePdfScroll('translated')"
+        >
+          <div v-for="(page, index) in pptxSlides" :key="`translated-${page.id}`" class="pdf-page-shell" :data-page="index + 1">
+            <div class="pdf-canvas-shell">
+              <canvas class="pdf-canvas" :data-page="index + 1"></canvas>
+              <div class="pdf-page-loader" aria-hidden="true">
+                <span class="pdf-page-spinner"></span>
+                <span>{{ copy("页面加载中", "Loading page") }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="floating-page-chip">
+          <span>{{ currentPdfPage }} / {{ pageCount }}</span>
+        </div>
+      </article>
+
+      <article v-else class="preview-column preview-column--docx preview-column--pptx-editor">
+        <div class="preview-column__head">
+          <div class="preview-column-title">
+            <strong>{{ copy("右侧编辑区", "Editor") }}</strong>
+            <span>{{ state.previewJob?.input_file?.original_name }}</span>
+          </div>
+          <span>{{ previewDirty ? copy("草稿未保存", "Unsaved draft") : copy("无待保存修改", "No pending edits") }}</span>
+        </div>
+
+        <div class="docx-preview-stack docx-preview-stack--editor">
+          <article v-for="page in state.previewDraft.pages" :key="page.id" class="docx-preview-card">
+            <div class="editor-item-head">
+              <strong>{{ page.label || copy("幻灯片", "Slide") }}</strong>
+              <span>{{ page.id }}</span>
+            </div>
+            <p class="editor-source">{{ page.source_text || copy("没有原文可参考。", "No source text available.") }}</p>
+            <span class="control-shell control-shell--textarea">
+              <textarea v-model="page.translated_text" rows="10"></textarea>
+            </span>
+          </article>
+        </div>
+      </article>
+    </section>
+
+    <section v-else-if="state.previewData && isXlsx" class="preview-body preview-body--xlsx">
+      <nav v-if="showXlsxSheetTabs" class="xlsx-sheet-tabs" :aria-label="copy('工作表', 'Worksheets')">
+        <button
+          v-for="sheet in xlsxSheets"
+          :key="sheet.id"
+          class="xlsx-sheet-tab"
+          :class="{ active: activeXlsxSheet?.id === sheet.id }"
+          type="button"
+          @click="selectXlsxSheet(sheet.id)"
+        >
+          <span>{{ sheet.name }}</span>
+          <small v-if="sheet.state !== 'visible'">{{ xlsxSheetStateLabel(sheet) }}</small>
+        </button>
+      </nav>
+
+      <article class="preview-column preview-column--xlsx">
+        <div class="preview-column__head xlsx-preview-heading">
+          <div class="preview-column-title">
+            <strong>{{ copy("原文 XLSX", "Source XLSX") }}</strong>
+            <span v-if="activeXlsxSheet">{{ activeXlsxSheet.name }}</span>
+          </div>
+        </div>
+
+        <div v-if="activeXlsxSheet" ref="xlsxSourceScroller" class="xlsx-grid-scroll" @scroll="handleXlsxScroll('source')">
+          <div class="xlsx-grid" :style="xlsxGridStyle(activeXlsxSheet)">
+            <div class="xlsx-grid-corner"></div>
+            <div
+              v-for="(column, index) in activeXlsxSheet.columns"
+              :key="column.index"
+              class="xlsx-grid-header xlsx-grid-header--column"
+              :class="{ hidden: column.hidden }"
+              :style="xlsxColumnHeaderStyle(index)"
+            >
+              {{ column.letter }}
+            </div>
+            <div
+              v-for="(row, index) in activeXlsxSheet.rows"
+              :key="row.index"
+              class="xlsx-grid-header xlsx-grid-header--row"
+              :class="{ hidden: row.hidden }"
+              :style="xlsxRowHeaderStyle(index)"
+            >
+              {{ row.index }}
+            </div>
+            <div
+              v-for="cell in activeXlsxCells"
+              :key="cell.coordinate"
+              class="xlsx-grid-cell"
+              :class="{ 'is-editable': cell.editable, muted: !cell.editable }"
+              :style="xlsxGridCellStyle(activeXlsxSheet, cell)"
+              :title="`${cell.coordinate} · ${xlsxCellTypeLabel(cell)}`"
+            >
+              <span>{{ xlsxCellText(cell, "source") }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="floating-page-chip">
+          <span>{{ activeXlsxSheetNumber }} / {{ xlsxSheetCount }}</span>
+        </div>
+      </article>
+
+      <article class="preview-column preview-column--xlsx" :class="{ 'preview-column--xlsx-editor': isEditing }">
+        <div class="preview-column__head xlsx-preview-heading">
+          <div class="preview-column-title">
+            <strong>{{ isEditing ? copy("右侧编辑区", "Editor") : copy("译文 XLSX", "Translated XLSX") }}</strong>
+            <span v-if="activeXlsxSheet">{{ activeXlsxSheet.name }}</span>
+          </div>
+          <div class="xlsx-preview-status">
+            <span v-if="isEditing">{{ previewDirty ? copy("草稿未保存", "Unsaved draft") : copy("无待保存修改", "No pending edits") }}</span>
+            <strong>{{ xlsxEditableCellCount }} {{ copy("个可编辑", "editable") }}</strong>
+          </div>
+        </div>
+
+        <div v-if="activeXlsxSheet" ref="xlsxTranslatedScroller" class="xlsx-grid-scroll" @scroll="handleXlsxScroll('translated')">
+          <div class="xlsx-grid" :style="xlsxGridStyle(activeXlsxSheet)">
+            <div class="xlsx-grid-corner"></div>
+            <div
+              v-for="(column, index) in activeXlsxSheet.columns"
+              :key="column.index"
+              class="xlsx-grid-header xlsx-grid-header--column"
+              :class="{ hidden: column.hidden }"
+              :style="xlsxColumnHeaderStyle(index)"
+            >
+              {{ column.letter }}
+            </div>
+            <div
+              v-for="(row, index) in activeXlsxSheet.rows"
+              :key="row.index"
+              class="xlsx-grid-header xlsx-grid-header--row"
+              :class="{ hidden: row.hidden }"
+              :style="xlsxRowHeaderStyle(index)"
+            >
+              {{ row.index }}
+            </div>
+            <div
+              v-for="cell in activeXlsxCells"
+              :key="cell.coordinate"
+              class="xlsx-grid-cell"
+              :class="{ 'is-editable': cell.editable, muted: !cell.editable }"
+              :style="xlsxGridCellStyle(activeXlsxSheet, cell)"
+              :title="`${cell.coordinate} · ${xlsxCellTypeLabel(cell)}`"
+            >
+              <textarea
+                v-if="isEditing && cell.editable"
+                v-model="cell.translated_text"
+                class="xlsx-grid-editor"
+                :rows="xlsxEditorRows(cell.translated_text)"
+              ></textarea>
+              <span v-else>{{ xlsxCellText(cell, "translated") }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="floating-page-chip">
+          <span>{{ activeXlsxSheetNumber }} / {{ xlsxSheetCount }}</span>
+        </div>
       </article>
     </section>
 

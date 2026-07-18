@@ -206,16 +206,53 @@ class JobPreviewPageRead(BaseModel):
     blocks: list[JobPreviewPdfTextBlockRead | JobPreviewPdfTableBlockRead] = Field(default_factory=list)
 
 
+class JobPreviewXlsxCellRead(BaseModel):
+    coordinate: str
+    row_index: int = Field(ge=1)
+    col_index: int = Field(ge=1)
+    source_text: str
+    translated_text: str
+    value_type: Literal["text", "formula", "value"]
+    editable: bool
+    row_span: int = Field(default=1, ge=1)
+    col_span: int = Field(default=1, ge=1)
+    merged_parent: str | None = None
+    style: dict[str, str] = Field(default_factory=dict)
+
+
+class JobPreviewXlsxColumnRead(BaseModel):
+    index: int = Field(ge=1)
+    letter: str
+    width: int = Field(ge=1)
+    hidden: bool = False
+
+
+class JobPreviewXlsxRowRead(BaseModel):
+    index: int = Field(ge=1)
+    height: int = Field(ge=1)
+    hidden: bool = False
+
+
+class JobPreviewXlsxSheetRead(BaseModel):
+    id: str
+    name: str
+    state: Literal["visible", "hidden", "veryHidden"]
+    columns: list[JobPreviewXlsxColumnRead] = Field(default_factory=list)
+    rows: list[JobPreviewXlsxRowRead] = Field(default_factory=list)
+    cells: list[JobPreviewXlsxCellRead] = Field(default_factory=list)
+
+
 class JobPreviewRead(BaseModel):
     job_id: str
     title: str
     output_name: str
-    document_kind: Literal["pdf", "docx"]
+    document_kind: Literal["pdf", "docx", "xlsx", "pptx"]
     source_language: str
     target_language: str
     created_at: datetime
     updated_at: datetime
     pages: list[JobPreviewPageRead]
+    sheets: list[JobPreviewXlsxSheetRead] = Field(default_factory=list)
 
 
 class JobPreviewPageUpdate(BaseModel):
@@ -237,10 +274,17 @@ class JobPreviewPdfBlockUpdate(BaseModel):
         return self
 
 
+class JobPreviewXlsxCellUpdate(BaseModel):
+    sheet_id: str
+    coordinate: str
+    translated_text: str
+
+
 class JobPreviewUpdate(BaseModel):
     pages: list[JobPreviewPageUpdate] | None = None
     status: Literal["validated"] | None = None
     payload: list[JobPreviewPdfBlockUpdate] | None = None
+    cells: list[JobPreviewXlsxCellUpdate] | None = None
 
 
 class AuditLogRead(ORMModel):

@@ -18,8 +18,9 @@ from doc_translator.core.config import assert_secure_for_production, get_setting
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health, get_db
 from doc_translator.models import AuditLog, JobFile, JobFileKind, JobStatus, TranslationJob, User
-from doc_translator.preview import load_or_create_preview, update_preview
+from doc_translator.preview import load_or_create_preview, load_or_create_ppt_preview_pdf, update_preview
 from doc_translator.queueing import enqueue_job, get_redis_client
+from doc_translator.translation import add_job_event
 from doc_translator.schemas import (
     AuditLogRead,
     AuditLogListRead,
@@ -134,6 +135,14 @@ def load_job_document(job: TranslationJob, document_kind: str) -> JobFile:
         if job.output_file.deleted_at is not None:
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Translated file has expired")
         return job.output_file
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+
+def load_job_preview_document(job: TranslationJob, document_kind: str) -> Path:
+    if document_kind == "source-preview":
+        return load_or_create_ppt_preview_pdf(job, "source")
+    if document_kind == "translated-preview":
+        return load_or_create_ppt_preview_pdf(job, "translated")
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
 
@@ -449,12 +458,20 @@ def retry_job(
     job = load_job_or_404(session, job_id, current_user)
     if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only failed or cancelled jobs can be retried")
+    previous_status = job.status
     job.status = JobStatus.QUEUED
     job.progress = 0
     job.error_message = None
     job.cancel_requested = False
     job.started_at = None
     job.completed_at = None
+    job.events.clear()
+    add_job_event(
+        session,
+        job,
+        "Job retried and re-queued",
+        details={"previous_status": previous_status.value},
+    )
     record_audit(
         session,
         action="jobs.retried",
@@ -508,6 +525,18 @@ def read_job_document(
     session: Session = Depends(get_db),
 ):
     job = load_job_or_404(session, job_id, current_user)
+    if document_kind in {"source-preview", "translated-preview"}:
+        if job.status != JobStatus.COMPLETED or job.output_file is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preview is available after translation completes")
+        if job.output_file.deleted_at is not None:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Preview is no longer available because the translated file expired")
+        preview_path = load_job_preview_document(job, document_kind)
+        return FileResponse(
+            path=preview_path,
+            media_type="application/pdf",
+            filename=preview_path.name,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
     job_file = load_job_document(job, document_kind)
     # FileResponse(filename=...) RFC-encodes the filename (preventing header
     # injection via a crafted original_name) and defaults to an attachment

@@ -83,5 +83,14 @@ export function fileKindLabel(fileName) {
   if (normalized.endsWith(".docx")) {
     return "DOCX";
   }
+  if (normalized.endsWith(".xlsx")) {
+    return "XLSX";
+  }
+  if (normalized.endsWith(".ppt")) {
+    return "PPT";
+  }
+  if (normalized.endsWith(".pptx")) {
+    return "PPTX";
+  }
   return "FILE";
 }

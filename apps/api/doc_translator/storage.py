@@ -10,6 +10,9 @@ from doc_translator.settings_service import RuntimeSettings
 SUPPORTED_EXTENSIONS = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 _TRANSLATED_FILENAME_LANGUAGE_ALIASES = {
@@ -54,7 +57,10 @@ def validate_upload_name(filename: str | None) -> str:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing file name")
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF and DOCX files are supported")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF, DOCX, XLSX, PPT, and PPTX files are supported",
+        )
     return extension
 
 

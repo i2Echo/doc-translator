@@ -1,6 +1,6 @@
 # Doc Translator
 
-Doc Translator is a private-deployment document translation MVP for small companies. It keeps original and translated files inside customer-controlled storage, lets admins configure a customer-provided OpenAI-compatible model endpoint, and runs asynchronous PDF or DOCX translation jobs with audit logging.
+Doc Translator is a private-deployment document translation MVP for small companies. It keeps original and translated files inside customer-controlled storage, lets admins configure a customer-provided OpenAI-compatible model endpoint, and runs asynchronous PDF, DOCX, XLSX, or presentation translation jobs with audit logging.
 
 ## Privacy Boundary
 
@@ -14,8 +14,9 @@ Files stay inside the customer's environment, but translated text may still leav
 
 - Local authentication with admin and standard user roles
 - Admin settings for model endpoint, storage, OCR, retention, and concurrency
-- PDF and DOCX upload with asynchronous translation jobs
+- PDF, DOCX, XLSX, PPT, and PPTX upload with asynchronous translation jobs
 - OCR fallback for scanned PDFs
+- PPT input is converted to PPTX in the worker container before translation; translated presentations download as PPTX.
 - Job events, retry, cancel, download, and audit logs
 - Retention cleanup for expired stored files
 - Docker Compose deployment with `web`, `api`, `worker`, `postgres`, and `redis`
