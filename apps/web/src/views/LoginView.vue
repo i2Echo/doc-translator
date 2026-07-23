@@ -64,7 +64,7 @@ async function handleSubmit() {
             <input v-model="form.password" type="password" autocomplete="current-password" required />
           </span>
         </label>
-        <button class="primary-button" type="submit" :disabled="state.pending.login">
+        <button class="primary-button" type="submit" :class="{ 'is-loading': state.pending.login }" :disabled="state.pending.login">
           {{ state.pending.login ? copy("登录中…", "Signing in...") : copy("登录", "Sign in") }}
         </button>
         <p v-if="state.messages.login" class="message error">{{ state.messages.login }}</p>

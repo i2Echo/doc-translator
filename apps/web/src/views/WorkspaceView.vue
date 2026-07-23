@@ -31,6 +31,8 @@ const uploadForm = reactive({
   ...defaultUploadState(),
 });
 const fileInputRef = ref(null);
+const isDragOver = ref(false);
+let dragDepth = 0;
 const activeJobStatuses = new Set(["queued", "running", "parsing", "ocr_running", "translating", "rebuilding", "validating"]);
 const terminalJobStatuses = new Set(["completed", "failed", "cancelled"]);
 const nowMs = ref(Date.now());
@@ -156,7 +158,21 @@ function onFileChange(event) {
   event.target.value = "";
 }
 
+function onDragEnter() {
+  dragDepth += 1;
+  isDragOver.value = true;
+}
+
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) {
+    isDragOver.value = false;
+  }
+}
+
 function onFileDrop(event) {
+  dragDepth = 0;
+  isDragOver.value = false;
   addFiles(event.dataTransfer?.files);
 }
 
@@ -253,7 +269,15 @@ onBeforeUnmount(() => {
       </div>
 
       <form class="form-stack card-scroll-body" @submit.prevent="submitUpload">
-        <label class="upload-dropzone" for="upload-file-input" @dragover.prevent @drop.prevent="onFileDrop">
+        <label
+          class="upload-dropzone"
+          :class="{ 'is-dragover': isDragOver }"
+          for="upload-file-input"
+          @dragover.prevent
+          @dragenter.prevent="onDragEnter"
+          @dragleave.prevent="onDragLeave"
+          @drop.prevent="onFileDrop"
+        >
           <input
             id="upload-file-input"
             ref="fileInputRef"
@@ -330,7 +354,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="button-row">
-          <button class="primary-button" type="submit" :disabled="state.pending.upload">
+          <button class="primary-button" type="submit" :class="{ 'is-loading': state.pending.upload }" :disabled="state.pending.upload">
             {{ state.pending.upload ? copy("提交中…", "Queuing...") : copy("开始翻译", "Start translation") }}
           </button>
         </div>

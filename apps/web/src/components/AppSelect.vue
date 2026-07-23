@@ -334,30 +334,30 @@ onUnmounted(() => {
   position: relative;
   display: flex;
   align-items: center;
-  min-height: 42px;
-  padding: 0 34px 0 12px;
+  min-height: 38px;
+  padding: 0 32px 0 10px;
   border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.8);
+  border-radius: 8px;
+  background: var(--surface, #fff);
   color: var(--text);
   text-align: left;
-  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, transform 160ms ease;
+  transition: border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
 }
 
-.app-select__trigger:hover {
-  transform: translateY(-1px);
+.app-select__trigger:hover:not(:disabled) {
+  border-color: var(--line-strong, rgba(0, 0, 0, 0.16));
 }
 
 .app-select--open .app-select__trigger,
 .app-select__trigger:focus-visible {
   border-color: var(--accent);
-  box-shadow: 0 0 0 4px rgba(15, 110, 106, 0.12);
-  background: #fff;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
 }
 
 .app-select--disabled .app-select__trigger {
   cursor: not-allowed;
-  opacity: 0.64;
+  opacity: 0.55;
 }
 
 .app-select__value {
@@ -375,13 +375,13 @@ onUnmounted(() => {
 
 .app-select__chevron {
   position: absolute;
-  right: 12px;
+  right: 10px;
   top: 50%;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   color: var(--muted);
   transform: translateY(-50%);
-  transition: transform 160ms ease;
+  transition: transform 140ms ease;
 }
 
 .app-select--open .app-select__chevron {
@@ -402,43 +402,55 @@ onUnmounted(() => {
   position: fixed;
   z-index: 120;
   display: grid;
-  gap: 4px;
-  padding: 6px;
+  gap: 2px;
+  padding: 4px;
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(255, 250, 244, 0.98);
-  box-shadow: 0 18px 38px rgba(47, 33, 20, 0.16);
-  backdrop-filter: blur(18px);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.05);
   max-height: min(320px, calc(100vh - 24px));
   overflow: auto;
+  animation: app-select-in 120ms ease-out;
+}
+
+@keyframes app-select-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .app-select__option {
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: 10px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
   background: transparent;
   color: var(--text);
   text-align: left;
   font-size: 13px;
-  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+  transition: background-color 100ms ease, color 100ms ease;
 }
 
 .app-select__option:hover,
 .app-select__option:focus-visible,
 .app-select__option--highlighted {
-  background: rgba(15, 110, 106, 0.08);
+  background: rgba(0, 0, 0, 0.05);
+  outline: none;
 }
 
 .app-select__option--active {
-  border-color: rgba(15, 110, 106, 0.22);
   background: var(--accent-soft);
   color: var(--accent-strong);
+  font-weight: 600;
 }
 
 .app-select--compact .app-select__trigger {
-  min-height: 38px;
-  padding-left: 11px;
+  min-height: 34px;
+  padding-left: 9px;
 }
 
 .app-select--compact .app-select__value,

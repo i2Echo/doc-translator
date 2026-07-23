@@ -39,9 +39,6 @@ onMounted(() => {
 
 <template>
   <div class="app-shell">
-    <div class="ambient ambient-left"></div>
-    <div class="ambient ambient-right"></div>
-
     <div
       class="app-frame"
       :class="{ 'app-frame--preview': isPreviewRoute, 'app-frame--workspace': isWorkspaceRoute, 'app-frame--admin': isAdminRoute }"
@@ -52,7 +49,15 @@ onMounted(() => {
         <header v-if="!isPreviewRoute" class="topbar">
           <div class="brand-block">
             <p class="eyebrow">{{ copy("私有部署文档翻译", "Private document translation") }}</p>
-            <h1>Doc Translator</h1>
+            <div class="brand-title">
+              <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 20 20" fill="none">
+                  <path d="M2.5 5.5h6M5.5 3.5v2M3.8 5.5c.6 2 1.9 3.7 3.7 4.7M7.4 5.5c-.7 1.8-1.9 3.3-3.5 4.3" />
+                  <path d="m9.5 16.5 3-7 3 7M10.7 13.8h3.6" />
+                </svg>
+              </span>
+              <h1>Doc Translator</h1>
+            </div>
             <p class="subtle">{{ userLabel }}</p>
           </div>
 
