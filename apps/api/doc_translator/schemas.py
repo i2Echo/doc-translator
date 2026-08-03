@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
+from doc_translator.model_api import ModelApiFormat
 from doc_translator.models import JobFileKind, JobStatus, UserRole
 
 
@@ -53,9 +54,10 @@ class MessageResponse(BaseModel):
 
 
 class SettingsRead(BaseModel):
-    storage_mode: str
+    storage_mode: Literal["local"]
     local_storage_path: str
     file_retention_days: int
+    model_api_format: ModelApiFormat
     model_base_url: str
     # Masked: never returns the raw key to the client. Empty string means no
     # key is configured; otherwise only the last 4 characters are exposed so
@@ -74,9 +76,10 @@ class SettingsUpdate(BaseModel):
     # Partial update: every field is Optional. ``None`` (field omitted) means
     # "leave unchanged"; an explicit value replaces the stored one. This lets
     # the admin save other settings without round-tripping the raw API key.
-    storage_mode: str | None = Field(default=None)
+    storage_mode: Literal["local"] | None = None
     local_storage_path: str | None = None
     file_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    model_api_format: ModelApiFormat | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
     model_name: str | None = None
@@ -97,6 +100,7 @@ class SettingsUpdate(BaseModel):
 
 
 class SettingsTestRequest(BaseModel):
+    model_api_format: ModelApiFormat | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
     model_name: str | None = None
@@ -137,6 +141,7 @@ class JobRead(ORMModel):
     target_language: str
     model_base_url_snapshot: str
     model_name_snapshot: str
+    model_api_format_snapshot: ModelApiFormat
     error_message: str | None
     page_count: int | None
     cancel_requested: bool
@@ -151,6 +156,14 @@ class JobRead(ORMModel):
 
 class JobDetail(JobRead):
     events: list[JobEventRead]
+
+
+class JobListRead(BaseModel):
+    items: list[JobRead]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
 
 
 class JobPreviewPdfTextBlockRead(BaseModel):
@@ -317,4 +330,11 @@ class StorageSummary(BaseModel):
 class ModelTestResult(BaseModel):
     ok: bool
     latency_ms: int
-    preview: str
+
+
+class ModelResponseValidationResult(BaseModel):
+    ok: bool
+
+
+class ModelListResult(BaseModel):
+    models: list[str]

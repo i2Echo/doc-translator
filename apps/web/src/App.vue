@@ -3,7 +3,7 @@ import { computed, onMounted, watch } from "vue";
 import { RouterView, useRoute, useRouter } from "vue-router";
 import AppSelect from "./components/AppSelect.vue";
 import LoginView from "./views/LoginView.vue";
-import { bootstrapSession, copy, isAdmin, isAuthenticated, logout, refreshAll, setUiLanguage, state } from "./store";
+import { bootstrapSession, copy, isAdmin, isAuthenticated, logout, setUiLanguage, state } from "./store";
 
 const route = useRoute();
 const router = useRouter();
@@ -75,9 +75,6 @@ onMounted(() => {
             </button>
             <button v-if="isAdmin" class="ghost-button" type="button" @click="router.push('/admin/settings')">
               {{ copy("管理", "Admin") }}
-            </button>
-            <button class="ghost-button" type="button" :disabled="state.pending.refresh" @click="refreshAll()">
-              {{ copy("刷新", "Refresh") }}
             </button>
             <button class="ghost-button danger-text" type="button" @click="logout()">
               {{ copy("退出", "Log out") }}

@@ -13,7 +13,7 @@ API_DIR = ROOT / "apps" / "api"
 if str(API_DIR) not in sys.path:
     sys.path.insert(0, str(API_DIR))
 
-from doc_translator.core.config import get_settings
+from doc_translator.core.config import get_settings  # noqa: E402
 from doc_translator.models import Base  # noqa: E402
 
 
@@ -56,4 +56,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

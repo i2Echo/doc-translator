@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 
 from doc_translator.core.config import get_settings
+from doc_translator.model_api import ModelApiFormat
 from doc_translator.models import SystemSetting
 from doc_translator.schemas import SettingsRead, SettingsUpdate
 
@@ -36,19 +37,22 @@ def validate_model_endpoint(base_url: str) -> str:
     host = (parsed.hostname or "").lower()
     if not host:
         raise InvalidModelEndpointError("Model endpoint is missing a host.")
+    if parsed.username is not None or parsed.password is not None:
+        raise InvalidModelEndpointError("Model endpoint must not contain embedded credentials.")
+    if parsed.query or parsed.fragment:
+        raise InvalidModelEndpointError("Model endpoint must not contain a query string or fragment.")
     # Reject the cloud-metadata IP and obvious internal targets by name first.
-    if host in {"metadata.google.internal"}:
-        raise InvalidModelEndpointError("Model endpoint must not point to a metadata service.")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise InvalidModelEndpointError("Model endpoint must not point to a local or internal hostname.")
     try:
         # host may be a hostname or an IP literal; only screen IP literals here.
         addr = ipaddress.ip_address(host)
     except ValueError:
         addr = None
-    if addr is not None:
-        if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_unspecified or addr.is_reserved:
-            raise InvalidModelEndpointError(
-                "Model endpoint must not point to a loopback, link-local, private, reserved, or unspecified address."
-            )
+    if addr is not None and (not addr.is_global or addr.is_multicast):
+        raise InvalidModelEndpointError(
+            "Model endpoint must not point to a non-public address."
+        )
     return url
 
 
@@ -64,6 +68,7 @@ class RuntimeSettings:
     storage_mode: str
     local_storage_path: str
     file_retention_days: int
+    model_api_format: ModelApiFormat
     model_base_url: str
     model_api_key: str
     model_name: str
@@ -85,6 +90,7 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
     "storage_mode": SettingDefinition("STORAGE_MODE", settings.storage_mode, str),
     "local_storage_path": SettingDefinition("LOCAL_STORAGE_PATH", settings.local_storage_path, str),
     "file_retention_days": SettingDefinition("FILE_RETENTION_DAYS", settings.file_retention_days, int),
+    "model_api_format": SettingDefinition("MODEL_API_FORMAT", settings.model_api_format, ModelApiFormat),
     "model_base_url": SettingDefinition("MODEL_BASE_URL", settings.model_base_url, str),
     "model_api_key": SettingDefinition("MODEL_API_KEY", settings.model_api_key, str),
     "model_name": SettingDefinition("MODEL_NAME", settings.model_name, str),
@@ -129,6 +135,7 @@ def get_settings_response(session: Session) -> SettingsRead:
         storage_mode=runtime.storage_mode,
         local_storage_path=runtime.local_storage_path,
         file_retention_days=runtime.file_retention_days,
+        model_api_format=runtime.model_api_format,
         model_base_url=runtime.model_base_url,
         model_api_key=mask_api_key(runtime.model_api_key),
         model_name=runtime.model_name,

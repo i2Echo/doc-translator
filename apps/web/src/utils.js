@@ -45,7 +45,13 @@ export function isJobExpired(job) {
 }
 
 export function jobStatusKey(job) {
-  return isJobExpired(job) ? "expired" : String(job?.status || "").toLowerCase();
+  if (isJobExpired(job)) {
+    return "expired";
+  }
+  if (job?.cancel_requested && !["completed", "failed", "cancelled"].includes(job.status)) {
+    return "cancelling";
+  }
+  return String(job?.status || "").toLowerCase();
 }
 
 export function formatJobStatus(status, copy) {
@@ -59,6 +65,7 @@ export function formatJobStatus(status, copy) {
     translating: copy("翻译中", "Translating"),
     rebuilding: copy("生成中", "Building"),
     validating: copy("校验中", "Validating"),
+    cancelling: copy("取消中", "Cancelling"),
     completed: copy("已完成", "Completed"),
     expired: copy("已过期", "Expired"),
     failed: copy("失败", "Failed"),

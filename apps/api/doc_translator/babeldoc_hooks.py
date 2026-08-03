@@ -1851,8 +1851,6 @@ class BabeldocHookContext:
                         if next_index < len(ordered_items):
                             right, _right_original_index = ordered_items[next_index]
                             should_merge, reason = self._should_merge_same_line_fragments(current, right)
-                            left_record = self._record_for_paragraph(current)
-                            right_record = self._record_for_paragraph(right)
                             if (
                                 not should_merge
                                 and len(rejected) < 12
@@ -1861,8 +1859,6 @@ class BabeldocHookContext:
                                 rejected.append(self._same_line_neighbor_reject_sample(current, right, reason))
                         break
                     right, right_original_index = ordered_items[candidate_index]
-                    left_record = self._record_for_paragraph(current)
-                    right_record = self._record_for_paragraph(right)
                     is_punct = self._should_attach_inline_punctuation_fragment(current, right)
                     should_merge, reason = (True, "inline_punctuation") if is_punct else self._should_merge_same_line_fragments(current, right)
                     plan.append(self._same_line_merge_plan_item(current, right, reason if not is_punct else "inline_punctuation"))

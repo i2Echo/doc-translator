@@ -1,7 +1,7 @@
 <script setup>
 import { reactive } from "vue";
 import { useRouter } from "vue-router";
-import { copy, login, state } from "../store";
+import { copy, login, setMessage, state } from "../store";
 
 const router = useRouter();
 const form = reactive({
@@ -16,7 +16,7 @@ async function handleSubmit() {
     form.password = "";
     router.replace("/");
   } catch (error) {
-    state.messages.login = error.message;
+    setMessage("login", error.message, "error");
   }
 }
 </script>
@@ -67,7 +67,7 @@ async function handleSubmit() {
         <button class="primary-button" type="submit" :class="{ 'is-loading': state.pending.login }" :disabled="state.pending.login">
           {{ state.pending.login ? copy("登录中…", "Signing in...") : copy("登录", "Sign in") }}
         </button>
-        <p v-if="state.messages.login" class="message error">{{ state.messages.login }}</p>
+        <p v-if="state.messages.login" class="message" :class="state.messageLevels.login">{{ state.messages.login }}</p>
       </form>
     </section>
   </main>

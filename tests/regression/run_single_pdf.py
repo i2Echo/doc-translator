@@ -53,12 +53,14 @@ def _build_runtime_settings(args: argparse.Namespace):
     sqlalchemy (which the runner does not otherwise need).
     """
 
+    from doc_translator.model_api import ModelApiFormat
     from doc_translator.settings_service import RuntimeSettings
 
     return RuntimeSettings(
         storage_mode="local",
         local_storage_path=str(_REPO_ROOT / "tests" / "regression" / "runs"),
         file_retention_days=7,
+        model_api_format=ModelApiFormat.CHAT_COMPLETIONS,
         model_base_url=args.model_base_url,
         model_api_key=args.model_api_key,
         model_name=args.model_name,

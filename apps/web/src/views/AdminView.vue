@@ -1,15 +1,20 @@
 <script setup>
-import { computed, reactive, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import AppSelect from "../components/AppSelect.vue";
 import {
+  cachedModels,
+  clearCachedModels,
+  clearModelTestResult,
   copy,
   createUser,
   isAdmin,
   loadAuditPage,
+  listModels,
   loadMoreUsers,
   refreshAll,
   saveSettings,
+  setMessage,
   state,
   testModel,
   toggleUserState,
@@ -30,6 +35,7 @@ const settingsForm = reactive({
   storage_mode: "local",
   local_storage_path: "",
   file_retention_days: 30,
+  model_api_format: "chat_completions",
   model_base_url: "",
   model_api_key: "",
   model_name: "",
@@ -39,6 +45,7 @@ const settingsForm = reactive({
   max_upload_mb: 100,
   max_concurrent_jobs: 10,
 });
+const availableModels = ref([]);
 
 const userForm = reactive({
   full_name: "",
@@ -50,6 +57,20 @@ const roleOptions = computed(() => [
   { value: "user", label: copy("标准用户", "Standard user") },
   { value: "admin", label: copy("管理员", "Admin") },
 ]);
+const modelApiFormatOptions = computed(() => [
+  { value: "anthropic_messages", label: "Anthropic Messages (/v1/messages)" },
+  { value: "chat_completions", label: "Chat Completions (/chat/completions)" },
+  { value: "responses", label: "Responses (/responses)" },
+]);
+const storageModeOptions = computed(() => [
+  { value: "local", label: copy("本地存储（local）", "Local storage (local)") },
+]);
+const modelNameOptions = computed(() =>
+  [...new Set([settingsForm.model_name, ...availableModels.value].filter(Boolean))].map((model) => ({
+    value: model,
+    label: model,
+  }))
+);
 
 const activePage = computed(() => (pages.includes(props.page) ? props.page : "settings"));
 const visibleUserCount = computed(() => state.users.length);
@@ -73,12 +94,44 @@ watch(
   { immediate: true }
 );
 
+watch(
+  () => [settingsForm.model_api_format, settingsForm.model_base_url, settingsForm.model_api_key],
+  () => {
+    availableModels.value = settingsForm.model_api_key ? [] : cachedModels(modelRequestPayload());
+  },
+  { immediate: true }
+);
+
+watch(
+  () => [
+    settingsForm.model_api_format,
+    settingsForm.model_base_url,
+    settingsForm.model_api_key,
+    settingsForm.model_name,
+    settingsForm.model_timeout_seconds,
+  ],
+  clearModelTestResult
+);
+
 if (isAdmin.value && !state.settings) {
   void refreshAll();
 }
 
 function navigate(page) {
   router.replace(`/admin/${page}`);
+}
+
+function modelRequestPayload() {
+  const payload = {
+    model_api_format: settingsForm.model_api_format,
+    model_base_url: settingsForm.model_base_url,
+    model_name: settingsForm.model_name,
+    model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
+  };
+  if (settingsForm.model_api_key && settingsForm.model_api_key.trim()) {
+    payload.model_api_key = settingsForm.model_api_key.trim();
+  }
+  return payload;
 }
 
 async function submitSettings() {
@@ -89,6 +142,7 @@ async function submitSettings() {
       storage_mode: settingsForm.storage_mode,
       local_storage_path: settingsForm.local_storage_path,
       file_retention_days: Number(settingsForm.file_retention_days),
+      model_api_format: settingsForm.model_api_format,
       model_base_url: settingsForm.model_base_url,
       model_name: settingsForm.model_name,
       model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
@@ -102,26 +156,29 @@ async function submitSettings() {
     }
     await saveSettings(payload);
   } catch (error) {
-    state.messages.settings = error.message;
+    setMessage("settings", error.message, "error");
   }
 }
 
 async function runModelTest() {
   try {
-    const testPayload = {
-      model_base_url: settingsForm.model_base_url,
-      model_name: settingsForm.model_name,
-      model_timeout_seconds: Number(settingsForm.model_timeout_seconds),
-    };
-    // If the admin typed a new key, test with it; otherwise the backend tests
-    // against the already-stored key (model_api_key omitted -> no override).
-    if (settingsForm.model_api_key && settingsForm.model_api_key.trim()) {
-      testPayload.model_api_key = settingsForm.model_api_key.trim();
-    }
-    await testModel(testPayload);
+    await testModel(modelRequestPayload());
   } catch (error) {
-    state.messages.settings = error.message;
+    setMessage("settings", error.message, "error");
   }
+}
+
+async function loadModelList() {
+  try {
+    availableModels.value = await listModels(modelRequestPayload());
+  } catch (error) {
+    setMessage("settings", error.message, "error");
+  }
+}
+
+function clearModelListCache() {
+  clearCachedModels();
+  availableModels.value = [];
 }
 
 async function submitUser() {
@@ -135,7 +192,7 @@ async function submitUser() {
     userForm.password = "";
     userForm.role = "user";
   } catch (error) {
-    state.messages.users = error.message;
+    setMessage("users", error.message, "error");
   }
 }
 
@@ -147,14 +204,14 @@ function handleUserListScroll(event) {
   const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
   if (remaining <= 120) {
     loadMoreUsers().catch((error) => {
-      state.messages.users = error.message;
+      setMessage("users", error.message, "error");
     });
   }
 }
 
 function requestMoreUsers() {
   loadMoreUsers().catch((error) => {
-    state.messages.users = error.message;
+    setMessage("users", error.message, "error");
   });
 }
 
@@ -163,7 +220,7 @@ function changeAuditPage(page) {
     return;
   }
   loadAuditPage(page).catch((error) => {
-    state.messages.audit = error.message;
+    setMessage("audit", error.message, "error");
   });
 }
 </script>
@@ -212,25 +269,43 @@ function changeAuditPage(page) {
         <form class="form-stack" @submit.prevent="submitSettings">
           <div class="compact-grid two-up">
             <label class="field">
-              <span>Model base URL</span>
+              <span>Base URL</span>
               <span class="control-shell">
-                <input v-model="settingsForm.model_base_url" type="url" required />
+                <input v-model="settingsForm.model_base_url" type="url" required @input="clearModelListCache" />
               </span>
             </label>
             <label class="field">
-              <span>Model name</span>
-              <span class="control-shell">
-                <input v-model="settingsForm.model_name" type="text" required />
-              </span>
+              <span>{{ copy("API 格式", "API format") }}</span>
+              <AppSelect
+                v-model="settingsForm.model_api_format"
+                :options="modelApiFormatOptions"
+                :aria-label="copy('API 格式', 'API format')"
+              />
             </label>
             <label class="field">
-              <span>Model API key</span>
+              <span>API Key</span>
               <span class="control-shell">
                 <input
                   v-model="settingsForm.model_api_key"
                   type="password"
+                  autocomplete="new-password"
                   :placeholder="state.settings?.model_api_key ? copy('已设置（当前：', 'Set (current: ') + state.settings.model_api_key + ')' : copy('未设置', 'Not set')"
+                  @input="clearModelListCache"
                 />
+              </span>
+            </label>
+            <label class="field">
+              <span>{{ copy("模型列表", "Model list") }}</span>
+              <span class="model-list-control">
+                <AppSelect
+                  v-model="settingsForm.model_name"
+                  :options="modelNameOptions"
+                  :placeholder="copy('先获取模型列表', 'Load model list first')"
+                  :aria-label="copy('模型列表', 'Model list')"
+                />
+                <button class="ghost-button" type="button" :disabled="state.pending.modelList" @click="loadModelList">
+                  {{ state.pending.modelList ? copy("加载中…", "Loading...") : copy("获取列表", "Load") }}
+                </button>
               </span>
             </label>
             <label class="field">
@@ -241,9 +316,11 @@ function changeAuditPage(page) {
             </label>
             <label class="field">
               <span>{{ copy("存储模式", "Storage mode") }}</span>
-              <span class="control-shell">
-                <input v-model="settingsForm.storage_mode" type="text" required />
-              </span>
+              <AppSelect
+                v-model="settingsForm.storage_mode"
+                :options="storageModeOptions"
+                :aria-label="copy('存储模式', 'Storage mode')"
+              />
             </label>
             <label class="field">
               <span>{{ copy("本地存储路径", "Local storage path") }}</span>
@@ -277,13 +354,15 @@ function changeAuditPage(page) {
             </label>
           </div>
 
-          <label class="switch-field">
-            <input v-model="settingsForm.ocr_enabled" class="switch-input" type="checkbox" />
-            <span class="switch-indicator" aria-hidden="true">
-              <span class="switch-thumb"></span>
-            </span>
+          <div class="switch-field">
+            <label class="switch-control" :aria-label="copy('为扫描 PDF 启用 OCR', 'Enable OCR for scanned PDFs')">
+              <input v-model="settingsForm.ocr_enabled" class="switch-input" type="checkbox" />
+              <span class="switch-indicator" aria-hidden="true">
+                <span class="switch-thumb"></span>
+              </span>
+            </label>
             <span class="switch-copy">{{ copy("为扫描 PDF 启用 OCR", "Enable OCR for scanned PDFs") }}</span>
-          </label>
+          </div>
 
           <div class="button-row">
             <button class="primary-button" type="submit" :disabled="state.pending.settings">
@@ -293,7 +372,23 @@ function changeAuditPage(page) {
               {{ state.pending.modelTest ? copy("测试中…", "Testing...") : copy("测试连接", "Test connection") }}
             </button>
           </div>
-          <p v-if="state.messages.settings" class="message">{{ state.messages.settings }}</p>
+          <p v-if="state.messages.settings" class="message" :class="state.messageLevels.settings">
+            {{ state.messages.settings }}
+          </p>
+          <p
+            v-if="state.modelTestResult.connectionMessage"
+            class="message"
+            :class="state.modelTestResult.connectionLevel"
+          >
+            {{ state.modelTestResult.connectionMessage }}
+          </p>
+          <p
+            v-if="state.modelTestResult.validationMessage"
+            class="message"
+            :class="state.modelTestResult.validationLevel"
+          >
+            {{ state.modelTestResult.validationMessage }}
+          </p>
           <p v-if="state.settings?.privacy_notice" class="subtle">{{ state.settings.privacy_notice }}</p>
         </form>
       </section>
@@ -335,7 +430,9 @@ function changeAuditPage(page) {
             <button class="primary-button" type="submit" :disabled="state.pending.userCreate">
               {{ state.pending.userCreate ? copy("创建中…", "Creating...") : copy("创建用户", "Create user") }}
             </button>
-            <p v-if="state.messages.users" class="message">{{ state.messages.users }}</p>
+            <p v-if="state.messages.users" class="message" :class="state.messageLevels.users">
+              {{ state.messages.users }}
+            </p>
           </form>
         </aside>
 

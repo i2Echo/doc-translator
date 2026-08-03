@@ -18,12 +18,16 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 import doc_translator.translation as translation  # noqa: E402
 from doc_translator.db import Base  # noqa: E402
+from doc_translator.model_api import ModelApiFormat  # noqa: E402
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob, User, UserRole  # noqa: E402
 from doc_translator.preview import preview_sidecar_path  # noqa: E402
 from doc_translator.settings_service import RuntimeSettings  # noqa: E402
 
 
 class MockTranslator:
+    def close(self) -> None:
+        pass
+
     def translate_text(
         self,
         text: str,
@@ -63,6 +67,7 @@ def _create_job(session_factory, storage_root: Path, user_id: str, label: str) -
             input_file=input_file,
             model_base_url_snapshot="https://example.com/v1",
             model_name_snapshot="mock",
+            model_api_format_snapshot=ModelApiFormat.CHAT_COMPLETIONS.value,
         )
         session.add(job)
         session.commit()
@@ -118,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         storage_mode="local",
         local_storage_path=str(storage_root),
         file_retention_days=7,
+        model_api_format=ModelApiFormat.CHAT_COMPLETIONS,
         model_base_url="https://example.com/v1",
         model_api_key="",
         model_name="mock",
@@ -143,12 +149,12 @@ def main(argv: list[str] | None = None) -> int:
 
     original_session_local = translation.SessionLocal
     original_runtime_loader = translation.get_runtime_settings
-    original_translator = translation.OpenAICompatibleTranslator
+    original_translator = translation.ModelTranslator
     original_preview_loader = translation.load_or_create_preview
     original_checksum = translation.file_checksum
     translation.SessionLocal = session_factory
     translation.get_runtime_settings = lambda session: runtime
-    translation.OpenAICompatibleTranslator = lambda runtime: MockTranslator()
+    translation.ModelTranslator = lambda runtime: MockTranslator()
 
     try:
         success_job_id = _create_job(session_factory, storage_root, user_id, "success")
@@ -211,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                         cancel_session.commit()
                 return translated_text
 
-        translation.OpenAICompatibleTranslator = lambda runtime: CancellingTranslator()
+        translation.ModelTranslator = lambda runtime: CancellingTranslator()
         existing_results = set((storage_root / "results").iterdir())
         translation.run_translation_job(cancellation_job_id)
         cancellation_job = _load_job(session_factory, cancellation_job_id)
@@ -224,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         translation.SessionLocal = original_session_local
         translation.get_runtime_settings = original_runtime_loader
-        translation.OpenAICompatibleTranslator = original_translator
+        translation.ModelTranslator = original_translator
         translation.load_or_create_preview = original_preview_loader
         translation.file_checksum = original_checksum
         engine.dispose()

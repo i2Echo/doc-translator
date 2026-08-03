@@ -5,11 +5,13 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi import HTTPException
 import redis
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from doc_translator.audit import record_audit
 from doc_translator.bootstrap import bootstrap_defaults
@@ -21,7 +23,7 @@ from doc_translator.babeldoc_hooks import babeldoc_ir_sidecar_path, babeldoc_str
 from doc_translator.preview import ppt_preview_pdf_path, preview_sidecar_path
 from doc_translator.queueing import TRANSLATION_QUEUE_KEY, get_redis_client
 from doc_translator.settings_service import get_runtime_settings
-from doc_translator.translation import run_translation_job
+from doc_translator.translation import JOB_LEASE_DURATION, run_translation_job
 
 
 logger = logging.getLogger(__name__)
@@ -34,11 +36,14 @@ RECOVERABLE_JOB_STATUSES = {
     JobStatus.REBUILDING,
     JobStatus.VALIDATING,
 }
+IN_PROGRESS_JOB_STATUSES = RECOVERABLE_JOB_STATUSES - {JobStatus.QUEUED}
+QUEUE_RECONCILE_INTERVAL_SECONDS = 30
 
 
 class WorkerRuntime:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.worker_id = f"worker-{uuid4()}"
         self.stop_event = threading.Event()
         self.dispatch_thread: threading.Thread | None = None
         self.cleanup_thread: threading.Thread | None = None
@@ -46,12 +51,16 @@ class WorkerRuntime:
         self.futures: dict[str, Future] = {}
         self.lock = threading.Lock()
         self.last_heartbeat: datetime | None = None
+        self.last_queue_reconcile_at = 0.0
 
     def start(self) -> None:
         configure_logging(self.settings.log_level)
         with SessionLocal() as session:
             bootstrap_defaults(session)
-        self.recover_orphaned_jobs()
+        try:
+            self._reconcile_queued_jobs(get_redis_client(), force=True)
+        except Exception:
+            logger.exception("Initial job recovery failed; dispatch loop will retry")
         self.dispatch_thread = threading.Thread(target=self.dispatch_loop, daemon=True)
         self.cleanup_thread = threading.Thread(target=self.cleanup_loop, daemon=True)
         self.dispatch_thread.start()
@@ -68,97 +77,6 @@ class WorkerRuntime:
     def update_heartbeat(self) -> None:
         self.last_heartbeat = datetime.now(timezone.utc)
 
-    def recover_orphaned_jobs(self) -> None:
-        try:
-            redis_client = get_redis_client()
-            queued_job_ids = set(redis_client.lrange(TRANSLATION_QUEUE_KEY, 0, -1))
-        except redis.RedisError:
-            logger.exception("Worker could not inspect Redis queue during orphaned-job recovery")
-            return
-
-        jobs_to_enqueue: list[str] = []
-        recovered_count = 0
-        cancelled_count = 0
-
-        with SessionLocal() as session:
-            jobs = (
-                session.query(TranslationJob)
-                .filter(TranslationJob.status.in_(tuple(RECOVERABLE_JOB_STATUSES)))
-                .order_by(TranslationJob.created_at.asc())
-                .all()
-            )
-            for job in jobs:
-                if job.cancel_requested:
-                    previous_status = job.status
-                    job.status = JobStatus.CANCELLED
-                    job.completed_at = datetime.now(timezone.utc)
-                    job.events.clear()
-                    session.add(
-                        JobEvent(
-                            job_id=job.id,
-                            level="info",
-                            message="Recovered orphaned job and finalized cancellation",
-                            details={"recovery": "worker_startup", "previous_status": previous_status.value},
-                        )
-                    )
-                    record_audit(
-                        session,
-                        action="jobs.recovered_cancelled",
-                        entity_type="translation_job",
-                        entity_id=job.id,
-                        details={"previous_status": previous_status.value},
-                    )
-                    cancelled_count += 1
-                    continue
-
-                if job.status != JobStatus.QUEUED:
-                    previous_status = job.status
-                    job.status = JobStatus.QUEUED
-                    job.progress = 0
-                    job.started_at = None
-                    job.completed_at = None
-                    job.error_message = None
-                    job.events.clear()
-                    session.add(
-                        JobEvent(
-                            job_id=job.id,
-                            level="info",
-                            message="Recovered orphaned in-progress job and re-queued it",
-                            details={"recovery": "worker_startup", "previous_status": previous_status.value},
-                        )
-                    )
-                    record_audit(
-                        session,
-                        action="jobs.recovered_queued",
-                        entity_type="translation_job",
-                        entity_id=job.id,
-                        details={"previous_status": previous_status.value},
-                    )
-                    recovered_count += 1
-
-                if job.id not in queued_job_ids:
-                    jobs_to_enqueue.append(job.id)
-                    queued_job_ids.add(job.id)
-
-            session.commit()
-
-        if jobs_to_enqueue:
-            try:
-                redis_client.rpush(TRANSLATION_QUEUE_KEY, *jobs_to_enqueue)
-            except redis.RedisError:
-                logger.exception("Worker could not re-enqueue recovered jobs")
-                return
-
-        if recovered_count or cancelled_count:
-            logger.warning(
-                "Recovered orphaned translation jobs on worker startup",
-                extra={
-                    "recovered_count": recovered_count,
-                    "cancelled_count": cancelled_count,
-                    "enqueued_count": len(jobs_to_enqueue),
-                },
-            )
-
     def dispatch_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -166,6 +84,7 @@ class WorkerRuntime:
                 while not self.stop_event.is_set():
                     self.update_heartbeat()
                     self._prune_finished()
+                    self._reconcile_queued_jobs(redis_client)
                     concurrency = self._load_concurrency_limit()
                     if len(self.futures) >= concurrency:
                         time.sleep(1)
@@ -178,16 +97,140 @@ class WorkerRuntime:
                     with self.lock:
                         if job_id in self.futures:
                             continue
-                        self.futures[job_id] = self.executor.submit(run_translation_job, job_id)
+                        self.futures[job_id] = self.executor.submit(run_translation_job, job_id, self.worker_id)
             except redis.RedisError:
                 logger.exception("Worker lost Redis connectivity; retrying shortly")
+                self.stop_event.wait(2)
+            except Exception:
+                logger.exception("Worker dispatch loop failed; retrying shortly")
                 self.stop_event.wait(2)
 
     def _prune_finished(self) -> None:
         with self.lock:
             completed = [job_id for job_id, future in self.futures.items() if future.done()]
             for job_id in completed:
-                self.futures.pop(job_id)
+                future = self.futures.pop(job_id)
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("Translation worker task crashed", extra={"job_id": job_id})
+
+    def _reconcile_queued_jobs(self, redis_client: redis.Redis, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_queue_reconcile_at < QUEUE_RECONCILE_INTERVAL_SECONDS:
+            return
+
+        current_time = datetime.now(timezone.utc)
+        with self.lock:
+            active_job_ids = tuple(self.futures)
+
+        recovered_count = 0
+        cancelled_count = 0
+        with SessionLocal() as session:
+            if active_job_ids:
+                (
+                    session.query(TranslationJob)
+                    .filter(
+                        TranslationJob.id.in_(active_job_ids),
+                        TranslationJob.worker_id == self.worker_id,
+                        TranslationJob.status.in_(tuple(IN_PROGRESS_JOB_STATUSES)),
+                    )
+                    .update(
+                        {TranslationJob.lease_expires_at: current_time + JOB_LEASE_DURATION},
+                        synchronize_session=False,
+                    )
+                )
+
+            recoverable_jobs = (
+                session.query(TranslationJob)
+                .filter(
+                    TranslationJob.status.in_(tuple(RECOVERABLE_JOB_STATUSES)),
+                    or_(
+                        TranslationJob.status == JobStatus.QUEUED,
+                        TranslationJob.lease_expires_at.is_(None),
+                        TranslationJob.lease_expires_at < current_time,
+                    ),
+                )
+                .order_by(TranslationJob.created_at.asc())
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+            for job in recoverable_jobs:
+                previous_status = job.status
+                if job.cancel_requested:
+                    job.status = JobStatus.CANCELLED
+                    job.completed_at = current_time
+                    session.add(
+                        JobEvent(
+                            job_id=job.id,
+                            level="info",
+                            message="Recovered orphaned job and finalized cancellation",
+                            details={"recovery": "expired_lease", "previous_status": previous_status.value},
+                        )
+                    )
+                    record_audit(
+                        session,
+                        action="jobs.recovered_cancelled",
+                        entity_type="translation_job",
+                        entity_id=job.id,
+                        details={"previous_status": previous_status.value},
+                    )
+                    cancelled_count += 1
+                elif job.status != JobStatus.QUEUED:
+                    job.status = JobStatus.QUEUED
+                    job.progress = 0
+                    job.started_at = None
+                    job.completed_at = None
+                    job.error_message = None
+                    session.add(
+                        JobEvent(
+                            job_id=job.id,
+                            level="warning",
+                            message="Recovered job after its worker lease expired",
+                            details={"recovery": "expired_lease", "previous_status": previous_status.value},
+                        )
+                    )
+                    record_audit(
+                        session,
+                        action="jobs.recovered_queued",
+                        entity_type="translation_job",
+                        entity_id=job.id,
+                        details={"previous_status": previous_status.value},
+                    )
+                    recovered_count += 1
+                job.worker_id = None
+                job.lease_expires_at = None
+
+            session.flush()
+            database_job_ids = [
+                job_id
+                for (job_id,) in (
+                    session.query(TranslationJob.id)
+                    .filter(TranslationJob.status == JobStatus.QUEUED)
+                    .order_by(TranslationJob.created_at.asc())
+                    .all()
+                )
+            ]
+            session.commit()
+
+        queued_job_ids = set(redis_client.lrange(TRANSLATION_QUEUE_KEY, 0, -1))
+        self.last_queue_reconcile_at = now
+        missing_job_ids = [job_id for job_id in database_job_ids if job_id not in queued_job_ids]
+        if missing_job_ids:
+            redis_client.rpush(TRANSLATION_QUEUE_KEY, *missing_job_ids)
+            logger.warning(
+                "Re-enqueued jobs missing from Redis",
+                extra={"job_count": len(missing_job_ids)},
+            )
+        if recovered_count or cancelled_count:
+            logger.warning(
+                "Recovered translation jobs with expired leases",
+                extra={
+                    "recovered_count": recovered_count,
+                    "cancelled_count": cancelled_count,
+                    "enqueued_count": len(missing_job_ids),
+                },
+            )
 
     def _load_concurrency_limit(self) -> int:
         with SessionLocal() as session:
@@ -205,6 +248,7 @@ class WorkerRuntime:
     def run_cleanup_pass(self) -> None:
         with SessionLocal() as session:
             runtime = get_runtime_settings(session)
+            storage_root = Path(runtime.local_storage_path).resolve()
             cutoff = datetime.now(timezone.utc) - timedelta(days=runtime.file_retention_days)
             expired_files = (
                 session.query(JobFile)
@@ -213,27 +257,43 @@ class WorkerRuntime:
                 .all()
             )
             for job_file in expired_files:
+                job_file_id = job_file.id
+                storage_path = job_file.storage_path
                 try:
-                    from pathlib import Path
-
-                    Path(job_file.storage_path).unlink(missing_ok=True)
+                    artifact_paths = [Path(storage_path)]
                     if job_file.kind.value == "output":
-                        preview_sidecar_path(job_file.storage_path).unlink(missing_ok=True)
-                        ppt_preview_pdf_path(job_file.storage_path, "source").unlink(missing_ok=True)
-                        ppt_preview_pdf_path(job_file.storage_path, "translated").unlink(missing_ok=True)
-                        babeldoc_ir_sidecar_path(Path(job_file.storage_path)).unlink(missing_ok=True)
-                        babeldoc_structure_snapshot_path(Path(job_file.storage_path), "before_translation").unlink(missing_ok=True)
-                        babeldoc_structure_snapshot_path(Path(job_file.storage_path), "after_translation").unlink(missing_ok=True)
-                finally:
+                        artifact_paths.extend(
+                            (
+                                preview_sidecar_path(storage_path),
+                                ppt_preview_pdf_path(storage_path, "source"),
+                                ppt_preview_pdf_path(storage_path, "translated"),
+                                babeldoc_ir_sidecar_path(Path(storage_path)),
+                                babeldoc_structure_snapshot_path(Path(storage_path), "before_translation"),
+                                babeldoc_structure_snapshot_path(Path(storage_path), "after_translation"),
+                            )
+                        )
+
+                    for artifact_path in artifact_paths:
+                        resolved_path = artifact_path.resolve()
+                        if not resolved_path.is_relative_to(storage_root):
+                            raise ValueError(f"Refusing to delete file outside storage root: {resolved_path}")
+                        resolved_path.unlink(missing_ok=True)
+
                     job_file.deleted_at = datetime.now(timezone.utc)
                     record_audit(
                         session,
                         action="files.retention_deleted",
                         entity_type="job_file",
-                        entity_id=job_file.id,
-                        details={"path": job_file.storage_path},
+                        entity_id=job_file_id,
+                        details={"path": storage_path},
                     )
-            session.commit()
+                    session.commit()
+                except (OSError, ValueError):
+                    session.rollback()
+                    logger.exception(
+                        "Could not delete expired file",
+                        extra={"job_file_id": job_file_id, "path": storage_path},
+                    )
 
 
 runtime = WorkerRuntime()

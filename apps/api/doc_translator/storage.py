@@ -55,6 +55,8 @@ def ensure_storage_directories(root_path: str) -> dict[str, Path]:
 def validate_upload_name(filename: str | None) -> str:
     if not filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing file name")
+    if len(filename) > 255:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File name is too long")
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(

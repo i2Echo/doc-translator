@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     local_storage_path: str = "/data/files"
     file_retention_days: int = 7
 
+    model_api_format: str = "chat_completions"
     model_base_url: str = "https://api.openai.com/v1"
     model_api_key: str = ""
     model_name: str = "gpt-4.1-mini"

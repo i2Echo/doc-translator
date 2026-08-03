@@ -1,5 +1,13 @@
 const API_BASE = "/api/v1";
 
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export function apiPath(path) {
   return `${API_BASE}${path}`;
 }
@@ -23,7 +31,7 @@ export async function apiRequest(path, options = {}, config = {}) {
   });
 
   if (!response.ok) {
-    throw new Error(await buildErrorMessage(response, "Request failed"));
+    throw new ApiError(await buildErrorMessage(response, "Request failed"), response.status);
   }
 
   if (config.raw) {

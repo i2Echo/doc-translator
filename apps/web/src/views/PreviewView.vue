@@ -9,6 +9,7 @@ import {
   loadPreview,
   previewDirty,
   savePreview,
+  setMessage,
   setPreviewMode,
   state,
 } from "../store";
@@ -933,7 +934,7 @@ async function ensurePreview(jobId) {
     }
   } catch (error) {
     resetPdfOnNextDocumentsChange = false;
-    state.messages.preview = error.message;
+    setMessage("preview", error.message, "error");
   }
 }
 
@@ -1090,7 +1091,7 @@ async function renderDocxDocuments() {
     }
   } catch (error) {
     if (version === docxRenderVersion) {
-      state.messages.preview = error.message;
+      setMessage("preview", error.message, "error");
     }
   }
 }
@@ -1106,7 +1107,7 @@ watch(
 watch(
   () => currentPdfPage.value,
   () => {
-    state.messages.preview = "";
+    setMessage("preview");
     activePdfItemId.value = "";
     scheduleLayoutMeasure();
   }
@@ -1718,6 +1719,8 @@ onUnmounted(async () => {
       <div class="empty-state">{{ copy("预览未就绪。", "Preview is not ready.") }}</div>
     </section>
 
-    <p v-if="state.messages.preview" class="preview-message-banner">{{ state.messages.preview }}</p>
+    <p v-if="state.messages.preview" class="preview-message-banner" :class="state.messageLevels.preview">
+      {{ state.messages.preview }}
+    </p>
   </main>
 </template>

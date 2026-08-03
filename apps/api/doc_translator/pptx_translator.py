@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable
 from xml.etree import ElementTree
 
 if TYPE_CHECKING:
-    from doc_translator.translation import OpenAICompatibleTranslator
+    from doc_translator.translation import ModelTranslator
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +219,7 @@ def translate_pptx(
     input_path: str,
     output_path: Path,
     *,
-    translator: OpenAICompatibleTranslator,
+    translator: ModelTranslator,
     translate_segments: Callable[..., list[str]],
     source_language: str,
     target_language: str,

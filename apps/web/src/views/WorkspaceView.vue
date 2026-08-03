@@ -1,15 +1,18 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import AppSelect from "../components/AppSelect.vue";
 import {
+  cachedModelMappings,
   cancelJob,
   copy,
   defaultUploadState,
   downloadJob,
-  refreshAll,
+  loadMoreJobs,
+  refreshJobs,
   retryJob,
   selectJob,
+  setMessage,
   state,
   uploadJobs,
 } from "../store";
@@ -41,23 +44,55 @@ const activeJobs = computed(() => state.jobs.filter((job) => activeJobStatuses.h
 const localizedSourceLanguageOptions = computed(() => sourceLanguageOptions(copy));
 const localizedTargetLanguageOptions = computed(() => targetLanguageOptions(copy));
 const supportedUploadExtensions = new Set([".pdf", ".docx", ".xlsx", ".ppt", ".pptx"]);
-const uploadMessageIsError = computed(() => {
-  const message = state.messages.upload;
-  return Boolean(
-    message &&
-      (message.includes("Choose") ||
-        message.includes("请先") ||
-        message.includes("无需翻译") ||
-        message.includes("No translation is needed") ||
-        message.includes("选择其他语言") ||
-        message.includes("different target language") ||
-        message.includes("language are the same"))
+const configuredModel = computed(() => {
+  if (state.settings?.model_name) {
+    return { modelName: state.settings.model_name, apiFormat: state.settings.model_api_format };
+  }
+  const latestJob = state.jobs[0];
+  return latestJob?.model_name_snapshot
+    ? { modelName: latestJob.model_name_snapshot, apiFormat: latestJob.model_api_format_snapshot }
+    : null;
+});
+const selectedModelValue = computed({
+  get: () => uploadForm.modelName && uploadForm.modelApiFormat
+    ? JSON.stringify([uploadForm.modelApiFormat, uploadForm.modelName])
+    : "",
+  set: (value) => {
+    const [apiFormat, modelName] = JSON.parse(value);
+    uploadForm.modelName = modelName;
+    uploadForm.modelApiFormat = apiFormat;
+  },
+});
+const workspaceModelOptions = computed(() => {
+  const cached = state.settings
+    ? cachedModelMappings({
+        model_base_url: state.settings.model_base_url,
+      })
+    : [];
+  const selected = uploadForm.modelName && uploadForm.modelApiFormat
+    ? { modelName: uploadForm.modelName, apiFormat: uploadForm.modelApiFormat }
+    : null;
+  const unique = new Map(
+    [selected, configuredModel.value, ...cached]
+      .filter(Boolean)
+      .map((entry) => [JSON.stringify([entry.apiFormat, entry.modelName]), entry])
   );
+  return [...unique.entries()].map(([value, entry]) => ({
+    value,
+    label: entry.modelName,
+  }));
 });
 
-const workspaceModel = computed(() => {
-  return state.settings?.model_name || state.jobs[0]?.model_name_snapshot || copy("托管模型", "Managed model");
-});
+watch(
+  configuredModel,
+  (model) => {
+    if (model && !uploadForm.modelName) {
+      uploadForm.modelName = model.modelName;
+      uploadForm.modelApiFormat = model.apiFormat;
+    }
+  },
+  { immediate: true }
+);
 
 const selectedJobTimeline = computed(() => {
   const job = state.selectedJob;
@@ -144,12 +179,13 @@ function addFiles(fileList) {
   });
   uploadForm.files.push(...nextFiles);
   if (selectedFiles.length && !nextFiles.length) {
-    state.messages.upload = copy(
-      "没有新的 PDF、DOCX、XLSX 或 PPT 文件可加入。",
-      "No new PDF, DOCX, XLSX, or PPT files to add."
+    setMessage(
+      "upload",
+      copy("没有新的 PDF、DOCX、XLSX 或 PPT 文件可加入。", "No new PDF, DOCX, XLSX, or PPT files to add."),
+      "warning"
     );
   } else if (nextFiles.length) {
-    state.messages.upload = "";
+    setMessage("upload");
   }
 }
 
@@ -198,26 +234,37 @@ function hasSameTranslationLanguages(sourceLanguage, targetLanguage) {
 
 async function submitUpload() {
   if (!uploadForm.files.length) {
-    state.messages.upload = copy(
-      "请先选择 PDF、DOCX、XLSX 或 PPT 文件。",
-      "Choose a PDF, DOCX, XLSX, or PPT file first."
+    setMessage(
+      "upload",
+      copy("请先选择 PDF、DOCX、XLSX 或 PPT 文件。", "Choose a PDF, DOCX, XLSX, or PPT file first."),
+      "warning"
     );
     return;
   }
 
   if (hasSameTranslationLanguages(uploadForm.sourceLanguage, uploadForm.targetLanguage)) {
-    state.messages.upload = copy(
-      "源语言与目标语言相同，无需翻译；请选择其他目标语言。",
-      "Source and target language are the same. No translation is needed, or choose a different target language."
+    setMessage(
+      "upload",
+      copy(
+        "源语言与目标语言相同，无需翻译；请选择其他目标语言。",
+        "Source and target language are the same. No translation is needed, or choose a different target language."
+      ),
+      "warning"
     );
     return;
   }
 
   try {
-    await uploadJobs(uploadForm.files, uploadForm.sourceLanguage, uploadForm.targetLanguage);
+    await uploadJobs(
+      uploadForm.files,
+      uploadForm.sourceLanguage,
+      uploadForm.targetLanguage,
+      uploadForm.modelName,
+      uploadForm.modelApiFormat
+    );
     uploadForm.files = [];
   } catch (error) {
-    state.messages.upload = error.message;
+    setMessage("upload", error.message, "error");
   }
 }
 
@@ -238,7 +285,15 @@ function canRetry(job) {
 }
 
 function canCancel(job) {
-  return activeJobStatuses.has(job.status);
+  return activeJobStatuses.has(job.status) && !job.cancel_requested;
+}
+
+async function requestCancellation(jobId) {
+  try {
+    await cancelJob(jobId);
+  } catch {
+    // cancelJob restores the previous state and exposes the API error in the jobs panel.
+  }
 }
 
 onMounted(() => {
@@ -263,7 +318,7 @@ onBeforeUnmount(() => {
           <p class="eyebrow">{{ copy("上传任务", "Upload job") }}</p>
           <h2>{{ copy("提交新的翻译文档", "Queue a document") }}</h2>
         </div>
-        <button class="ghost-button" type="button" :disabled="state.pending.refresh" @click="refreshAll()">
+        <button class="ghost-button" type="button" :disabled="state.pending.refresh" @click="refreshJobs()">
           {{ copy("刷新任务", "Refresh jobs") }}
         </button>
       </div>
@@ -345,7 +400,13 @@ onBeforeUnmount(() => {
         <div class="stats-row">
           <div class="mini-stat">
             <span>{{ copy("当前模型", "Current model") }}</span>
-            <strong>{{ workspaceModel }}</strong>
+            <AppSelect
+              v-model="selectedModelValue"
+              :options="workspaceModelOptions"
+              :placeholder="copy('使用系统默认模型', 'Use system default model')"
+              :aria-label="copy('当前模型', 'Current model')"
+              compact
+            />
           </div>
           <div class="mini-stat">
             <span>{{ copy("活跃任务", "Active jobs") }}</span>
@@ -358,7 +419,7 @@ onBeforeUnmount(() => {
             {{ state.pending.upload ? copy("提交中…", "Queuing...") : copy("开始翻译", "Start translation") }}
           </button>
         </div>
-        <p v-if="state.messages.upload" class="message" :class="{ error: uploadMessageIsError }">
+        <p v-if="state.messages.upload" class="message" :class="state.messageLevels.upload">
           {{ state.messages.upload }}
         </p>
       </form>
@@ -369,6 +430,7 @@ onBeforeUnmount(() => {
         <p class="eyebrow">{{ copy("最近任务", "Recent jobs") }}</p>
         <h2>{{ copy("队列、进度与预览入口", "Queue, progress, and preview") }}</h2>
       </div>
+      <p v-if="state.messages.jobs" class="message" :class="state.messageLevels.jobs">{{ state.messages.jobs }}</p>
 
       <div v-if="!state.jobs.length" class="empty-state">
         {{ copy("还没有任务。先上传一个 PDF、DOCX、XLSX 或 PPT。", "No jobs yet. Upload a PDF, DOCX, XLSX, or PPT to get started.") }}
@@ -435,7 +497,7 @@ onBeforeUnmount(() => {
                   type="button"
                   :aria-label="copy('取消', 'Cancel')"
                   :title="copy('取消', 'Cancel')"
-                  @click.stop="cancelJob(job.id)"
+                  @click.stop="requestCancellation(job.id)"
                 >
                   <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
                     <circle cx="10" cy="10" r="6.75" />
@@ -460,6 +522,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </article>
+        <button v-if="state.jobsPage.hasMore" class="secondary-button" type="button" @click="loadMoreJobs">
+          {{ copy("加载更多任务", "Load more jobs") }}
+        </button>
       </div>
     </section>
 

@@ -7,14 +7,12 @@ import re
 import shutil
 import tempfile
 import time
-import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
 import fitz
-import httpx
 import pytesseract
 from PIL import Image
 from sqlalchemy.orm import Session, selectinload
@@ -25,7 +23,8 @@ from doc_translator.babeldoc_runner import BabeldocLibraryResult, translate_pdf_
 from doc_translator.db import SessionLocal
 from doc_translator.docx_translator import translate_docx
 from doc_translator.models import JobEvent, JobFile, JobFileKind, JobStatus, TranslationJob
-from doc_translator.preview import load_or_create_preview, preview_sidecar_path
+from doc_translator.model_api import ModelApiClient, ModelApiFormat
+from doc_translator.preview import load_or_create_preview, ppt_preview_pdf_path, preview_sidecar_path
 from doc_translator.pptx_translator import PPTX_CONTENT_TYPE, convert_ppt_to_pptx, translate_pptx
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings
 from doc_translator.storage import build_output_target, file_checksum, translated_output_name
@@ -77,11 +76,7 @@ _BABELDOC_PROGRESS_END = 92
 _BABELDOC_PROGRESS_EVENT_PREFIX = "__BABELDOC_PROGRESS__"
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BABELDOC_PROGRESS_FRACTION_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
-_MODEL_ERROR_BODY_LIMIT = 600
-_MODEL_REQUEST_MAX_ATTEMPTS = 4
-_MODEL_REQUEST_INITIAL_BACKOFF_SECONDS = 1.0
-_MODEL_REQUEST_MAX_BACKOFF_SECONDS = 8.0
-_MODEL_REQUEST_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+JOB_LEASE_DURATION = timedelta(minutes=2)
 
 
 @dataclass(frozen=True)
@@ -136,78 +131,25 @@ class JobCancelledError(Exception):
     pass
 
 
-class OpenAICompatibleTranslator:
-    def __init__(self, runtime: RuntimeSettings) -> None:
+class JobLeaseLostError(Exception):
+    pass
+
+
+class ModelTranslator:
+    def __init__(self, runtime: RuntimeSettings, *, max_attempts: int | None = None) -> None:
         self.runtime = runtime
-        base_url = runtime.model_base_url.rstrip("/")
-        self.endpoint = f"{base_url}/chat/completions"
-        self.client = httpx.Client(
-            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
-            timeout=httpx.Timeout(
-                runtime.model_timeout_seconds,
-                connect=min(30.0, float(runtime.model_timeout_seconds)),
-                read=runtime.model_timeout_seconds,
-                write=min(30.0, float(runtime.model_timeout_seconds)),
-                pool=10.0,
-            ),
+        attempt_override = {"max_attempts": max_attempts} if max_attempts is not None else {}
+        self.client = ModelApiClient(
+            api_format=runtime.model_api_format,
+            base_url=runtime.model_base_url,
+            api_key=runtime.model_api_key,
+            model=runtime.model_name,
+            timeout_seconds=runtime.model_timeout_seconds,
+            **attempt_override,
         )
 
     def close(self) -> None:
         self.client.close()
-
-    def _retry_delay_seconds(self, attempt: int) -> float:
-        return min(_MODEL_REQUEST_MAX_BACKOFF_SECONDS, _MODEL_REQUEST_INITIAL_BACKOFF_SECONDS * (2**attempt))
-
-    def _request_json(self, payload: dict[str, object]) -> dict:
-        last_error: Exception | None = None
-        for attempt in range(_MODEL_REQUEST_MAX_ATTEMPTS):
-            try:
-                response = self.client.post(
-                    self.endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self.runtime.model_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                if response.status_code in _MODEL_REQUEST_RETRYABLE_STATUS_CODES:
-                    raise httpx.HTTPStatusError(
-                        f"Retryable status code {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as exc:
-                status_code = exc.response.status_code
-                if status_code not in _MODEL_REQUEST_RETRYABLE_STATUS_CODES or attempt + 1 >= _MODEL_REQUEST_MAX_ATTEMPTS:
-                    body = exc.response.text.strip()
-                    summary = re.sub(r"\s+", " ", body)[:_MODEL_ERROR_BODY_LIMIT].strip()
-                    reason = exc.response.reason_phrase or "HTTP error"
-                    if summary:
-                        raise RuntimeError(
-                            f"Model API request failed with {status_code} {reason}: {summary}"
-                        ) from exc
-                    raise RuntimeError(f"Model API request failed with {status_code} {reason}") from exc
-                last_error = exc
-            except httpx.RequestError as exc:
-                if attempt + 1 >= _MODEL_REQUEST_MAX_ATTEMPTS:
-                    raise RuntimeError(f"Model API request failed after {_MODEL_REQUEST_MAX_ATTEMPTS} attempts: {exc}") from exc
-                last_error = exc
-
-            delay = self._retry_delay_seconds(attempt)
-            logger.warning(
-                "Model API request failed, retrying",
-                extra={
-                    "attempt": attempt + 1,
-                    "max_attempts": _MODEL_REQUEST_MAX_ATTEMPTS,
-                    "delay_seconds": delay,
-                    "endpoint": self.endpoint,
-                    "error": str(last_error) if last_error else None,
-                },
-            )
-            time.sleep(delay)
-        raise RuntimeError("Model API request failed unexpectedly")
 
     def translate_text(
         self,
@@ -235,29 +177,39 @@ class OpenAICompatibleTranslator:
         if extra_system_instruction:
             system_content = f"{system_content}\n\n{extra_system_instruction}"
 
-        payload = self._request_json(
-            {
-                "model": self.runtime.model_name,
-                "temperature": 0,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_content,
-                    },
-                    {"role": "user", "content": text},
-                ],
-            }
+        completion = self.client.complete(
+            [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": text},
+            ]
+        )
+        return completion.text
+
+    def validate_structured_response(self) -> None:
+        structured = self.client.complete(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Create a JSON object with exactly two non-empty string fields: "
+                        '"src" and "tgt". Use "ADC" as src and its Chinese translation as tgt.'
+                    ),
+                }
+            ],
+            max_tokens=512,
+            json_mode=True,
         )
         try:
-            return payload["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("Model API returned an unexpected response") from exc
-
-    def test_connection(self) -> tuple[int, str]:
-        started = datetime.now(timezone.utc)
-        preview = self.translate_text("hello", "English", "Spanish")
-        latency = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        return latency, preview[:120]
+            result = json.loads(structured.text)
+            if not isinstance(result, dict) or not all(
+                isinstance(result.get(key), str) and result[key].strip()
+                for key in ("src", "tgt")
+            ):
+                raise ValueError("expected non-empty src and tgt strings")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{self.runtime.model_api_format.value} API is not compatible with PDF structured translation"
+            ) from exc
 
 
 def add_job_event(session: Session, job: TranslationJob, message: str, *, level: str = "info", details: dict | None = None) -> None:
@@ -275,6 +227,18 @@ def update_job_state(
     details: dict | None = None,
     commit: bool = True,
 ) -> None:
+    expected_worker_id = job.worker_id
+    if expected_worker_id is not None:
+        current_worker_id = (
+            session.query(TranslationJob.worker_id)
+            .filter(TranslationJob.id == job.id)
+            .with_for_update()
+            .scalar()
+        )
+        if current_worker_id != expected_worker_id:
+            raise JobLeaseLostError(f"Job {job.id} is now owned by another worker")
+
+    now = datetime.now(timezone.utc)
     if status is not None:
         job.status = status
     if progress is not None:
@@ -282,9 +246,13 @@ def update_job_state(
     if error_message is not None:
         job.error_message = error_message
     if status == JobStatus.PARSING and job.started_at is None:
-        job.started_at = datetime.now(timezone.utc)
+        job.started_at = now
     if status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
-        job.completed_at = datetime.now(timezone.utc)
+        job.completed_at = now
+        job.worker_id = None
+        job.lease_expires_at = None
+    elif job.worker_id is not None:
+        job.lease_expires_at = now + JOB_LEASE_DURATION
     if message:
         add_job_event(session, job, message, level="error" if status == JobStatus.FAILED else "info", details=details)
     if commit:
@@ -292,7 +260,10 @@ def update_job_state(
 
 
 def ensure_not_cancelled(session: Session, job: TranslationJob) -> None:
+    expected_worker_id = job.worker_id
     session.refresh(job)
+    if expected_worker_id is not None and job.worker_id != expected_worker_id:
+        raise JobLeaseLostError(f"Job {job.id} is now owned by another worker")
     if job.cancel_requested or job.status == JobStatus.CANCELLED:
         raise JobCancelledError("Job was cancelled")
 
@@ -314,7 +285,7 @@ def split_text(text: str, max_chars: int = 1800) -> list[str]:
 
 
 def translate_segments(
-    translator: OpenAICompatibleTranslator,
+    translator: ModelTranslator,
     segments: list[str],
     *,
     source_language: str,
@@ -817,11 +788,16 @@ def _ensure_input_file_available(session: Session, job: TranslationJob) -> Path:
         session.commit()
         return input_path
 
-    actual_text = "missing" if actual_size is None else f"{actual_size} bytes"
-    raise RuntimeError(
-        f"Input file is unavailable or incomplete: expected {input_file.size_bytes} bytes at {input_path}, found {actual_text}. "
-        "Please re-upload the source document."
+    logger.warning(
+        "Input file is unavailable or incomplete",
+        extra={
+            "job_id": job.id,
+            "path": str(input_path),
+            "expected_size": input_file.size_bytes,
+            "actual_size": actual_size,
+        },
     )
+    raise RuntimeError("Input file is unavailable or incomplete. Please re-upload the source document.")
 
 
 def translate_pdf(
@@ -908,26 +884,84 @@ def translate_pdf(
         output_document.close()
 
 
-def test_model_connection(runtime: RuntimeSettings) -> tuple[int, str]:
-    translator = OpenAICompatibleTranslator(runtime)
+def test_model_connection(runtime: RuntimeSettings) -> int:
+    client = ModelApiClient(
+        api_format=runtime.model_api_format,
+        base_url=runtime.model_base_url,
+        api_key=runtime.model_api_key,
+        model=runtime.model_name,
+        timeout_seconds=runtime.model_timeout_seconds,
+        max_attempts=1,
+    )
     try:
-        return translator.test_connection()
+        started = time.monotonic()
+        client.list_models()
+        return int((time.monotonic() - started) * 1000)
+    finally:
+        client.close()
+
+
+def validate_model_response(runtime: RuntimeSettings) -> None:
+    translator = ModelTranslator(runtime, max_attempts=1)
+    try:
+        translator.validate_structured_response()
     finally:
         translator.close()
 
 
-def _remove_office_result(output_path: Path) -> None:
-    for path in (output_path, preview_sidecar_path(str(output_path))):
+def _remove_incomplete_result(output_path: Path) -> None:
+    artifact_paths = (
+        output_path,
+        preview_sidecar_path(str(output_path)),
+        ppt_preview_pdf_path(str(output_path), "source"),
+        ppt_preview_pdf_path(str(output_path), "translated"),
+        babeldoc_ir_sidecar_path(output_path),
+        babeldoc_structure_snapshot_path(output_path, "before_translation"),
+        babeldoc_structure_snapshot_path(output_path, "after_translation"),
+    )
+    for path in artifact_paths:
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            logger.warning("Could not remove incomplete Office result", extra={"path": str(path), "error": str(exc)})
+            logger.warning("Could not remove incomplete translation result", extra={"path": str(path), "error": str(exc)})
 
 
-def run_translation_job(job_id: str) -> None:
-    session = SessionLocal()
-    translator: OpenAICompatibleTranslator | None = None
+def _load_owned_job(session: Session, job_id: str, worker_id: str) -> TranslationJob | None:
+    return (
+        session.query(TranslationJob)
+        .filter(TranslationJob.id == job_id, TranslationJob.worker_id == worker_id)
+        .with_for_update()
+        .first()
+    )
+
+
+def run_translation_job(job_id: str, worker_id: str | None = None) -> None:
+    session: Session | None = None
+    translator: ModelTranslator | None = None
     try:
+        session = SessionLocal()
+        claimed_at = datetime.now(timezone.utc)
+        claimed_worker_id = worker_id or f"inline-{os.getpid()}-{time.monotonic_ns()}"
+        claimed = (
+            session.query(TranslationJob)
+            .filter(TranslationJob.id == job_id, TranslationJob.status == JobStatus.QUEUED)
+            .update(
+                {
+                    TranslationJob.status: JobStatus.PARSING,
+                    TranslationJob.progress: 5,
+                    TranslationJob.started_at: claimed_at,
+                    TranslationJob.completed_at: None,
+                    TranslationJob.worker_id: claimed_worker_id,
+                    TranslationJob.lease_expires_at: claimed_at + JOB_LEASE_DURATION,
+                },
+                synchronize_session=False,
+            )
+        )
+        session.commit()
+        if claimed != 1:
+            logger.info("Skipped stale or duplicate queue message", extra={"job_id": job_id})
+            return
+
         job = (
             session.query(TranslationJob)
             .options(
@@ -941,11 +975,15 @@ def run_translation_job(job_id: str) -> None:
         if job is None:
             logger.warning("Job not found", extra={"job_id": job_id})
             return
-        if job.status == JobStatus.CANCELLED:
-            return
 
-        runtime = get_runtime_settings(session)
-        update_job_state(session, job, status=JobStatus.PARSING, progress=5, message="Parsing document")
+        add_job_event(session, job, "Parsing document")
+        session.commit()
+        runtime = replace(
+            get_runtime_settings(session),
+            model_api_format=ModelApiFormat(job.model_api_format_snapshot),
+            model_base_url=job.model_base_url_snapshot,
+            model_name=job.model_name_snapshot,
+        )
         ensure_not_cancelled(session, job)
 
         input_file = job.input_file
@@ -959,7 +997,7 @@ def run_translation_job(job_id: str) -> None:
         if extension == ".pdf":
             page_count = translate_pdf(input_path, output_path, runtime, job, session)
         elif extension == ".docx":
-            translator = OpenAICompatibleTranslator(runtime)
+            translator = ModelTranslator(runtime)
             update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating DOCX content")
             page_count = translate_docx(
                 input_path,
@@ -984,7 +1022,7 @@ def run_translation_job(job_id: str) -> None:
                 ),
             )
         elif extension == ".xlsx":
-            translator = OpenAICompatibleTranslator(runtime)
+            translator = ModelTranslator(runtime)
             update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating XLSX cells")
             page_count = translate_xlsx(
                 input_path,
@@ -1009,7 +1047,7 @@ def run_translation_job(job_id: str) -> None:
                 ),
             )
         elif extension in {".ppt", ".pptx"}:
-            translator = OpenAICompatibleTranslator(runtime)
+            translator = ModelTranslator(runtime)
             update_job_state(session, job, status=JobStatus.TRANSLATING, progress=20, message="Translating presentation content")
 
             def translate_presentation_input(presentation_input_path: str) -> int | None:
@@ -1094,12 +1132,21 @@ def run_translation_job(job_id: str) -> None:
         )
         session.commit()
         logger.info("Completed translation job", extra={"job_id": job.id})
-    except JobCancelledError:
-        if "job" in locals():
-            if locals().get("extension") in {".docx", ".xlsx", ".ppt", ".pptx"} and "output_path" in locals():
-                _remove_office_result(output_path)
+    except JobLeaseLostError:
+        if session is not None:
+            if "output_path" in locals():
+                _remove_incomplete_result(output_path)
             session.rollback()
-            job = session.get(TranslationJob, job_id) or job
+        logger.warning("Stopped translation after worker lease was lost", extra={"job_id": job_id})
+    except JobCancelledError:
+        if session is not None and "job" in locals():
+            if "output_path" in locals():
+                _remove_incomplete_result(output_path)
+            session.rollback()
+            job = _load_owned_job(session, job_id, claimed_worker_id)
+            if job is None:
+                logger.warning("Skipped cancellation update after worker lease was lost", extra={"job_id": job_id})
+                return
             update_job_state(session, job, status=JobStatus.CANCELLED, progress=job.progress, message="Job cancelled")
             record_audit(
                 session,
@@ -1111,12 +1158,15 @@ def run_translation_job(job_id: str) -> None:
             )
             session.commit()
     except Exception as exc:
-        if "job" in locals():
+        if session is not None and "job" in locals():
             logger.exception("Translation job failed", extra={"job_id": job.id})
-            if locals().get("extension") in {".docx", ".xlsx", ".ppt", ".pptx"} and "output_path" in locals():
-                _remove_office_result(output_path)
+            if "output_path" in locals():
+                _remove_incomplete_result(output_path)
             session.rollback()
-            job = session.get(TranslationJob, job_id) or job
+            job = _load_owned_job(session, job_id, claimed_worker_id)
+            if job is None:
+                logger.warning("Skipped failure update after worker lease was lost", extra={"job_id": job_id})
+                return
             update_job_state(
                 session,
                 job,
@@ -1140,4 +1190,5 @@ def run_translation_job(job_id: str) -> None:
     finally:
         if translator is not None:
             translator.close()
-        session.close()
+        if session is not None:
+            session.close()

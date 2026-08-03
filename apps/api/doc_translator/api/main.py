@@ -2,32 +2,45 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordRequestForm
+import redis
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload
 
 from doc_translator.audit import record_audit
-from doc_translator.auth import authenticate_user, create_access_token, get_current_user, require_admin
+from doc_translator.auth import (
+    authenticate_user,
+    clear_login_failures,
+    create_access_token,
+    get_current_user,
+    is_login_rate_limited,
+    record_login_failure,
+    require_admin,
+)
 from doc_translator.babeldoc_hooks import babeldoc_structure_snapshot_path
 from doc_translator.bootstrap import bootstrap_defaults
 from doc_translator.core.config import assert_secure_for_production, get_settings
 from doc_translator.core.logging import configure_logging
 from doc_translator.db import SessionLocal, check_database_health, get_db
-from doc_translator.models import AuditLog, JobFile, JobFileKind, JobStatus, TranslationJob, User
+from doc_translator.models import AuditLog, JobFile, JobFileKind, JobStatus, TranslationJob, User, UserRole
 from doc_translator.preview import load_or_create_preview, load_or_create_ppt_preview_pdf, update_preview
 from doc_translator.queueing import enqueue_job, get_redis_client
-from doc_translator.translation import add_job_event
+from doc_translator.translation import add_job_event, test_model_connection, validate_model_response
 from doc_translator.schemas import (
     AuditLogRead,
     AuditLogListRead,
     JobDetail,
+    JobListRead,
     JobPreviewRead,
     JobPreviewUpdate,
     JobRead,
+    ModelListResult,
+    ModelResponseValidationResult,
     ModelTestResult,
     SettingsRead,
     SettingsTestRequest,
@@ -41,10 +54,20 @@ from doc_translator.schemas import (
 )
 from doc_translator.settings_service import RuntimeSettings, get_runtime_settings, get_settings_response, update_settings, validate_model_endpoint
 from doc_translator.storage import persist_upload
-from doc_translator.translation import test_model_connection
+from doc_translator.model_api import ModelApiClient, ModelApiFormat
+
+
+logger = logging.getLogger(__name__)
+MODEL_TEST_TIMEOUT_SECONDS = 60
 
 
 def get_request_ip(request: Request) -> str | None:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",", maxsplit=1)[0].strip()[:64] or None
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()[:64] or None
     return request.client.host if request.client else None
 
 
@@ -116,6 +139,7 @@ def build_runtime_override(runtime: RuntimeSettings, payload: SettingsTestReques
     data = runtime.__dict__.copy()
     override = payload.model_dump(exclude_none=True)
     data.update(override)
+    data["model_timeout_seconds"] = min(data["model_timeout_seconds"], MODEL_TEST_TIMEOUT_SECONDS)
     return RuntimeSettings(**data)
 
 
@@ -128,14 +152,38 @@ def ensure_job_has_previewable_output(job: TranslationJob) -> None:
 
 def load_job_document(job: TranslationJob, document_kind: str) -> JobFile:
     if document_kind == "source":
-        return job.input_file
-    if document_kind == "translated":
+        job_file = job.input_file
+        expired_message = "Source file has expired"
+    elif document_kind == "translated":
+        if job.status != JobStatus.COMPLETED:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Translated file is available after translation completes")
         if job.output_file is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No translated file is available yet")
-        if job.output_file.deleted_at is not None:
-            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Translated file has expired")
-        return job.output_file
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        job_file = job.output_file
+        expired_message = "Translated file has expired"
+    else:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if job_file.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=expired_message)
+    if not Path(job_file.storage_path).is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document file is unavailable")
+    return job_file
+
+
+def enqueue_job_with_recovery(session: Session, job: TranslationJob) -> None:
+    try:
+        enqueue_job(job.id)
+    except redis.RedisError:
+        logger.exception("Could not enqueue translation job; worker reconciliation will retry", extra={"job_id": job.id})
+        add_job_event(
+            session,
+            job,
+            "Queue delivery was delayed and will be retried automatically",
+            level="warning",
+            details={"recovery": "worker_reconciliation"},
+        )
+        session.commit()
 
 
 def load_job_preview_document(job: TranslationJob, document_kind: str) -> Path:
@@ -168,26 +216,50 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     session: Session = Depends(get_db),
 ) -> TokenResponse:
+    client_ip = get_request_ip(request)
+    if is_login_rate_limited(form_data.username, client_ip):
+        record_audit(
+            session,
+            action="auth.login_rate_limited",
+            entity_type="user",
+            entity_id=form_data.username,
+            ip_address=client_ip,
+        )
+        session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": "300"},
+        )
+
     user = authenticate_user(session, form_data.username, form_data.password)
     if user is None:
+        rate_limited = record_login_failure(form_data.username, client_ip)
         record_audit(
             session,
             action="auth.login_failed",
             entity_type="user",
             entity_id=form_data.username,
-            ip_address=get_request_ip(request),
+            ip_address=client_ip,
             details={"username": form_data.username},
         )
         session.commit()
+        if rate_limited:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": "300"},
+            )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
+    clear_login_failures(form_data.username)
     record_audit(
         session,
         action="auth.login_succeeded",
         entity_type="user",
         entity_id=user.id,
         actor_id=user.id,
-        ip_address=get_request_ip(request),
+        ip_address=client_ip,
     )
     session.commit()
     return TokenResponse(access_token=create_access_token(user), user=UserRead.model_validate(user))
@@ -278,6 +350,21 @@ def update_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     data = payload.model_dump(exclude_none=True)
+    removes_active_admin = user.role == UserRole.ADMIN and user.is_active and (
+        data.get("role", UserRole.ADMIN) != UserRole.ADMIN or data.get("is_active") is False
+    )
+    if removes_active_admin:
+        active_admins = (
+            session.query(User)
+            .filter(User.role == UserRole.ADMIN, User.is_active.is_(True))
+            .with_for_update()
+            .all()
+        )
+        if len(active_admins) == 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The last active administrator cannot be disabled or demoted",
+            )
     if "full_name" in data:
         user.full_name = data["full_name"]
     if "role" in data:
@@ -338,17 +425,92 @@ def test_model(
     # SSRF defense-in-depth: re-check the resolved endpoint (covers the case
     # where an admin tests against the already-stored URL).
     validate_model_endpoint(runtime.model_base_url)
-    latency_ms, preview = test_model_connection(runtime)
+    try:
+        latency_ms = test_model_connection(runtime)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     record_audit(
         session,
         action="settings.model_test",
         entity_type="system_settings",
         actor_id=admin.id,
         ip_address=get_request_ip(request),
-        details={"model_name": runtime.model_name, "model_base_url": runtime.model_base_url, "latency_ms": latency_ms},
+        details={
+            "model_api_format": runtime.model_api_format.value,
+            "model_name": runtime.model_name,
+            "model_base_url": runtime.model_base_url,
+            "latency_ms": latency_ms,
+        },
     )
     session.commit()
-    return ModelTestResult(ok=True, latency_ms=latency_ms, preview=preview)
+    return ModelTestResult(ok=True, latency_ms=latency_ms)
+
+
+@app.post("/api/v1/settings/validate-model-response", response_model=ModelResponseValidationResult)
+def validate_model_response_format(
+    payload: SettingsTestRequest,
+    request: Request,
+    admin: User = Depends(require_admin),
+    session: Session = Depends(get_db),
+) -> ModelResponseValidationResult:
+    runtime = build_runtime_override(get_runtime_settings(session), payload)
+    validate_model_endpoint(runtime.model_base_url)
+    try:
+        validate_model_response(runtime)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    record_audit(
+        session,
+        action="settings.model_response_validated",
+        entity_type="system_settings",
+        actor_id=admin.id,
+        ip_address=get_request_ip(request),
+        details={
+            "model_api_format": runtime.model_api_format.value,
+            "model_name": runtime.model_name,
+            "model_base_url": runtime.model_base_url,
+        },
+    )
+    session.commit()
+    return ModelResponseValidationResult(ok=True)
+
+
+@app.post("/api/v1/settings/models", response_model=ModelListResult)
+def list_models(
+    payload: SettingsTestRequest,
+    request: Request,
+    admin: User = Depends(require_admin),
+    session: Session = Depends(get_db),
+) -> ModelListResult:
+    runtime = build_runtime_override(get_runtime_settings(session), payload)
+    validate_model_endpoint(runtime.model_base_url)
+    client = ModelApiClient(
+        api_format=runtime.model_api_format,
+        base_url=runtime.model_base_url,
+        api_key=runtime.model_api_key,
+        model=runtime.model_name,
+        timeout_seconds=runtime.model_timeout_seconds,
+    )
+    try:
+        models = client.list_models()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    finally:
+        client.close()
+    record_audit(
+        session,
+        action="settings.models_listed",
+        entity_type="system_settings",
+        actor_id=admin.id,
+        ip_address=get_request_ip(request),
+        details={
+            "model_api_format": runtime.model_api_format.value,
+            "model_base_url": runtime.model_base_url,
+            "model_count": len(models),
+        },
+    )
+    session.commit()
+    return ModelListResult(models=models)
 
 
 @app.post("/api/v1/jobs/upload", response_model=JobRead, status_code=status.HTTP_201_CREATED)
@@ -357,6 +519,8 @@ def upload_job(
     file: UploadFile = File(...),
     source_language: str = Form(...),
     target_language: str = Form(...),
+    model_name: str | None = Form(default=None, min_length=1, max_length=255),
+    model_api_format: ModelApiFormat | None = Form(default=None),
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_db),
 ) -> JobRead:
@@ -367,6 +531,8 @@ def upload_job(
         )
 
     runtime = get_runtime_settings(session)
+    selected_model_name = (model_name or "").strip() or runtime.model_name
+    selected_model_api_format = model_api_format or runtime.model_api_format
     file_meta = persist_upload(file, runtime)
 
     input_file = JobFile(kind=JobFileKind.INPUT, created_by=current_user.id, **file_meta)
@@ -381,7 +547,8 @@ def upload_job(
         target_language=target_language,
         input_file_id=input_file.id,
         model_base_url_snapshot=runtime.model_base_url,
-        model_name_snapshot=runtime.model_name,
+        model_name_snapshot=selected_model_name,
+        model_api_format_snapshot=selected_model_api_format.value,
     )
     session.add(job)
     session.flush()
@@ -392,17 +559,35 @@ def upload_job(
         entity_id=job.id,
         actor_id=current_user.id,
         ip_address=get_request_ip(request),
-        details={"file_name": input_file.original_name, "target_language": target_language},
+        details={
+            "file_name": input_file.original_name,
+            "target_language": target_language,
+            "model_name": selected_model_name,
+            "model_api_format": selected_model_api_format.value,
+        },
     )
-    session.commit()
-    enqueue_job(job.id)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        try:
+            Path(file_meta["storage_path"]).unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove upload after database failure", extra={"path": file_meta["storage_path"]})
+        raise
+    enqueue_job_with_recovery(session, job)
 
     job = load_job_or_404(session, job.id, current_user)
     return JobRead.model_validate(job)
 
 
-@app.get("/api/v1/jobs", response_model=list[JobRead])
-def list_jobs(current_user: User = Depends(get_current_user), session: Session = Depends(get_db)) -> list[JobRead]:
+@app.get("/api/v1/jobs", response_model=JobListRead)
+def list_jobs(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> JobListRead:
     query = session.query(TranslationJob).options(
         selectinload(TranslationJob.created_by_user),
         selectinload(TranslationJob.input_file),
@@ -410,8 +595,15 @@ def list_jobs(current_user: User = Depends(get_current_user), session: Session =
     )
     if current_user.role.value != "admin":
         query = query.filter(TranslationJob.created_by == current_user.id)
-    jobs = query.order_by(TranslationJob.created_at.desc()).all()
-    return [JobRead.model_validate(job) for job in jobs]
+    total = query.with_entities(func.count(TranslationJob.id)).scalar() or 0
+    jobs = query.order_by(TranslationJob.created_at.desc()).offset(offset).limit(limit).all()
+    return JobListRead(
+        items=[JobRead.model_validate(job) for job in jobs],
+        total=total,
+        offset=offset,
+        limit=limit,
+        has_more=offset + len(jobs) < total,
+    )
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobDetail)
@@ -430,10 +622,21 @@ def cancel_job(
     job = load_job_or_404(session, job_id, current_user)
     if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job cannot be cancelled")
+    if job.cancel_requested:
+        return JobRead.model_validate(job)
     job.cancel_requested = True
     if job.status == JobStatus.QUEUED:
         job.status = JobStatus.CANCELLED
         job.completed_at = datetime.now(timezone.utc)
+        event_message = "Job cancelled"
+    else:
+        event_message = "Cancellation requested; waiting for the current operation to stop"
+    add_job_event(
+        session,
+        job,
+        event_message,
+        details={"status": job.status.value},
+    )
     record_audit(
         session,
         action="jobs.cancel_requested",
@@ -465,7 +668,11 @@ def retry_job(
     job.cancel_requested = False
     job.started_at = None
     job.completed_at = None
-    job.events.clear()
+    job.page_count = None
+    job.output_file_id = None
+    job.output_file = None
+    job.worker_id = None
+    job.lease_expires_at = None
     add_job_event(
         session,
         job,
@@ -481,7 +688,7 @@ def retry_job(
         ip_address=get_request_ip(request),
     )
     session.commit()
-    enqueue_job(job.id)
+    enqueue_job_with_recovery(session, job)
     session.refresh(job)
     return JobRead.model_validate(job)
 
@@ -498,8 +705,7 @@ def download_job(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Download is available after translation completes")
     if job.output_file is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No translated file is available yet")
-    if job.output_file.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Translated file has expired")
+    output_file = load_job_document(job, "translated")
     record_audit(
         session,
         action="jobs.downloaded",
@@ -507,12 +713,12 @@ def download_job(
         entity_id=job.id,
         actor_id=current_user.id,
         ip_address=get_request_ip(request),
-        details={"output_file_id": job.output_file.id},
+        details={"output_file_id": output_file.id},
     )
     session.commit()
     return FileResponse(
-        path=job.output_file.storage_path,
-        filename=job.output_file.original_name,
+        path=output_file.storage_path,
+        filename=output_file.original_name,
         headers={"X-Content-Type-Options": "nosniff"},
     )
 
@@ -580,7 +786,8 @@ def read_job_preview(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not prepare preview: {exc}") from exc
+        logger.exception("Could not prepare job preview", extra={"job_id": job.id})
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not prepare preview") from exc
     return JobPreviewRead.model_validate(preview)
 
 

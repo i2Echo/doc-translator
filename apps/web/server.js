@@ -10,6 +10,12 @@ const root = path.join(__dirname, "dist");
 const port = Number(process.env.PORT || 3000);
 const apiHost = process.env.API_PROXY_HOST || "api";
 const apiPort = Number(process.env.API_PROXY_PORT || 8000);
+const securityHeaders = {
+  "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+  "Referrer-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+};
 
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
@@ -22,12 +28,18 @@ const contentTypes = {
 };
 
 function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(statusCode, { ...securityHeaders, "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
 }
 
 function proxyRequest(req, res) {
-  const headers = { ...req.headers, host: `${apiHost}:${apiPort}` };
+  const clientAddress = req.socket.remoteAddress || "unknown";
+  const headers = {
+    ...req.headers,
+    host: `${apiHost}:${apiPort}`,
+    "x-forwarded-for": clientAddress,
+    "x-real-ip": clientAddress,
+  };
   const upstream = http.request(
     {
       host: apiHost,
@@ -37,7 +49,7 @@ function proxyRequest(req, res) {
       headers,
     },
     (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+      res.writeHead(upstreamRes.statusCode || 502, { ...upstreamRes.headers, ...securityHeaders });
       upstreamRes.pipe(res);
     }
   );
@@ -77,7 +89,7 @@ const server = http.createServer(async (req, res) => {
     const filePath = resolveFile(req.url);
     const extension = path.extname(filePath).toLowerCase();
     const contentType = contentTypes[extension] || "application/octet-stream";
-    res.writeHead(200, { "Content-Type": contentType });
+    res.writeHead(200, { ...securityHeaders, "Content-Type": contentType });
     createReadStream(filePath).pipe(res);
   } catch (error) {
     sendJson(res, 500, { detail: `Static server error: ${error.message}` });

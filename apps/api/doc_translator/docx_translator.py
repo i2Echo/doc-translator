@@ -13,7 +13,7 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
 if TYPE_CHECKING:
-    from doc_translator.translation import OpenAICompatibleTranslator
+    from doc_translator.translation import ModelTranslator
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ def translate_docx(
     input_path: str,
     output_path: Path,
     *,
-    translator: OpenAICompatibleTranslator,
+    translator: ModelTranslator,
     translate_segments: Callable[..., list[str]],
     source_language: str,
     target_language: str,

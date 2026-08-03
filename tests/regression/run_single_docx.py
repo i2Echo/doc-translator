@@ -339,13 +339,15 @@ def _run_translation(input_path: Path, output_path: Path, args: argparse.Namespa
     events: list[str] = []
 
     if args.use_real_model:
+        from doc_translator.model_api import ModelApiFormat
         from doc_translator.settings_service import RuntimeSettings
-        from doc_translator.translation import OpenAICompatibleTranslator, translate_segments
+        from doc_translator.translation import ModelTranslator, translate_segments
 
         runtime = RuntimeSettings(
             storage_mode="local",
             local_storage_path=str(output_path.parent),
             file_retention_days=7,
+            model_api_format=ModelApiFormat.CHAT_COMPLETIONS,
             model_base_url=args.model_base_url,
             model_api_key=args.model_api_key,
             model_name=args.model_name,
@@ -355,7 +357,7 @@ def _run_translation(input_path: Path, output_path: Path, args: argparse.Namespa
             max_upload_mb=100,
             max_concurrent_jobs=1,
         )
-        translator = OpenAICompatibleTranslator(runtime)
+        translator = ModelTranslator(runtime)
         segment_translator = translate_segments
     else:
         translator = MockTranslator()

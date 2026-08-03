@@ -4,9 +4,13 @@ import { isJobExpired } from "./utils";
 
 const TOKEN_STORAGE_KEY = "doc-translator.token";
 const UI_LANGUAGE_STORAGE_KEY = "doc-translator.ui-language";
+const MODEL_LIST_CACHE_STORAGE_KEY = "doc-translator.model-list-cache";
+const MODEL_FORMAT_CACHE_STORAGE_KEY = "doc-translator.model-format-cache";
+const MODEL_LIST_CACHE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_SOURCE_LANGUAGE = "auto";
 const DEFAULT_TARGET_LANGUAGE = "Chinese";
 const POLL_INTERVAL_MS = 15000;
+const JOB_PAGE_SIZE = 50;
 const USER_PAGE_SIZE = 20;
 const AUDIT_PAGE_SIZE = 10;
 
@@ -20,6 +24,10 @@ export const state = reactive({
   uiLanguage: window.localStorage.getItem(UI_LANGUAGE_STORAGE_KEY) || defaultUiLanguage(),
   user: null,
   jobs: [],
+  jobsPage: {
+    total: 0,
+    hasMore: false,
+  },
   selectedJobId: null,
   selectedJob: null,
   settings: null,
@@ -59,14 +67,31 @@ export const state = reactive({
     userList: false,
     audit: false,
     modelTest: false,
+    modelList: false,
+  },
+  modelTestResult: {
+    connectionMessage: "",
+    connectionLevel: "info",
+    validationMessage: "",
+    validationLevel: "info",
   },
   messages: {
     login: "",
     upload: "",
+    jobs: "",
     preview: "",
     settings: "",
     users: "",
     audit: "",
+  },
+  messageLevels: {
+    login: "info",
+    upload: "info",
+    jobs: "info",
+    preview: "info",
+    settings: "info",
+    users: "info",
+    audit: "info",
   },
   pollHandle: null,
 });
@@ -78,6 +103,18 @@ export const previewLayoutOverflowCount = computed(() => countPreviewLayoutOverf
 
 export function copy(zh, en) {
   return state.uiLanguage === "zh-CN" ? zh : en;
+}
+
+export function setMessage(scope, text = "", level = "info") {
+  state.messages[scope] = text;
+  state.messageLevels[scope] = level;
+}
+
+export function clearModelTestResult() {
+  state.modelTestResult.connectionMessage = "";
+  state.modelTestResult.connectionLevel = "info";
+  state.modelTestResult.validationMessage = "";
+  state.modelTestResult.validationLevel = "info";
 }
 
 export function setUiLanguage(value) {
@@ -135,7 +172,7 @@ export function clearPreviewState() {
   state.previewData = null;
   state.previewDraft = null;
   state.previewMode = "view";
-  state.messages.preview = "";
+  setMessage("preview");
 }
 
 function clearSessionState() {
@@ -143,8 +180,13 @@ function clearSessionState() {
   clearPreviewState();
   state.user = null;
   state.jobs = [];
+  state.jobsPage = {
+    total: 0,
+    hasMore: false,
+  };
   state.selectedJobId = null;
   state.selectedJob = null;
+  setMessage("jobs");
   state.settings = null;
   state.users = [];
   state.usersPage = {
@@ -340,7 +382,16 @@ function restoreQuarantinedPdfEdits(draft, quarantined) {
 }
 
 async function authedRequest(path, options = {}, config = {}) {
-  return apiRequest(path, options, { ...config, token: state.token });
+  try {
+    return await apiRequest(path, options, { ...config, token: state.token });
+  } catch (error) {
+    if (error?.status === 401) {
+      setToken("");
+      clearSessionState();
+      setMessage("login", copy("登录已过期，请重新登录。", "Your session expired. Please sign in again."), "warning");
+    }
+    throw error;
+  }
 }
 
 async function refreshSelectedJob() {
@@ -357,6 +408,111 @@ async function refreshSelectedJob() {
   }
 }
 
+function modelListCacheKey(payload) {
+  const baseUrl = String(payload.model_base_url || "").trim().replace(/\/+$/, "");
+  return JSON.stringify([state.user?.id || "", payload.model_api_format, baseUrl]);
+}
+
+function readModelListCache() {
+  try {
+    return JSON.parse(window.sessionStorage.getItem(MODEL_LIST_CACHE_STORAGE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+export function cachedModels(payload) {
+  const entry = readModelListCache()[modelListCacheKey(payload)];
+  if (
+    !entry ||
+    !Array.isArray(entry.models) ||
+    !entry.models.every((model) => typeof model === "string") ||
+    typeof entry.cachedAt !== "number" ||
+    Date.now() - entry.cachedAt >= MODEL_LIST_CACHE_TTL_MS
+  ) {
+    return [];
+  }
+  return entry.models;
+}
+
+export function cachedModelMappings(payload) {
+  const requestedBaseUrl = String(payload.model_base_url || "").trim().replace(/\/+$/, "");
+  const mappings = [];
+  let cache;
+  try {
+    cache = JSON.parse(window.sessionStorage.getItem(MODEL_FORMAT_CACHE_STORAGE_KEY) || "{}");
+  } catch {
+    return mappings;
+  }
+  for (const [key, entry] of Object.entries(cache)) {
+    let cacheIdentity;
+    try {
+      cacheIdentity = JSON.parse(key);
+    } catch {
+      continue;
+    }
+    const [userId, baseUrl, modelName] = cacheIdentity;
+    if (
+      userId !== (state.user?.id || "") ||
+      baseUrl !== requestedBaseUrl ||
+      !entry ||
+      !["anthropic_messages", "chat_completions", "responses"].includes(entry.apiFormat) ||
+      typeof entry.cachedAt !== "number" ||
+      Date.now() - entry.cachedAt >= MODEL_LIST_CACHE_TTL_MS
+    ) {
+      continue;
+    }
+    mappings.push({ modelName, apiFormat: entry.apiFormat });
+  }
+  return mappings;
+}
+
+export function clearCachedModels() {
+  try {
+    window.sessionStorage.removeItem(MODEL_LIST_CACHE_STORAGE_KEY);
+    window.sessionStorage.removeItem(MODEL_FORMAT_CACHE_STORAGE_KEY);
+  } catch {
+    // There is no cache to invalidate when browser storage is unavailable.
+  }
+}
+
+function cacheModelFormat(payload) {
+  const baseUrl = String(payload.model_base_url || "").trim().replace(/\/+$/, "");
+  const key = JSON.stringify([state.user?.id || "", baseUrl, payload.model_name]);
+  let cache;
+  try {
+    cache = JSON.parse(window.sessionStorage.getItem(MODEL_FORMAT_CACHE_STORAGE_KEY) || "{}");
+    cache[key] = { apiFormat: payload.model_api_format, cachedAt: Date.now() };
+    window.sessionStorage.setItem(MODEL_FORMAT_CACHE_STORAGE_KEY, JSON.stringify(cache));
+  } catch {
+    // A successful connection test does not depend on browser storage.
+  }
+}
+
+function cacheModels(payload, models) {
+  const cache = readModelListCache();
+  cache[modelListCacheKey(payload)] = { cachedAt: Date.now(), models };
+  try {
+    window.sessionStorage.setItem(MODEL_LIST_CACHE_STORAGE_KEY, JSON.stringify(cache));
+  } catch {
+    // Model discovery still succeeds when browser storage is unavailable.
+  }
+}
+
+async function fetchJobsThrough(requestedCount = JOB_PAGE_SIZE) {
+  const items = [];
+  let total = 0;
+  let hasMore = false;
+  do {
+    const limit = Math.min(100, Math.max(JOB_PAGE_SIZE, requestedCount - items.length));
+    const page = await authedRequest(`/jobs?offset=${items.length}&limit=${limit}`);
+    items.push(...page.items);
+    total = page.total;
+    hasMore = page.has_more;
+  } while (hasMore && items.length < requestedCount);
+  return { items, total, hasMore };
+}
+
 export async function bootstrapSession() {
   if (!state.token) {
     return;
@@ -370,7 +526,7 @@ export async function bootstrapSession() {
   } catch (error) {
     setToken("");
     clearSessionState();
-    state.messages.login = error.message;
+    setMessage("login", error.message, "error");
   } finally {
     state.pending.bootstrap = false;
   }
@@ -378,7 +534,7 @@ export async function bootstrapSession() {
 
 export async function login(email, password) {
   state.pending.login = true;
-  state.messages.login = "";
+  setMessage("login");
   try {
     const body = new URLSearchParams({
       username: email.trim(),
@@ -397,6 +553,11 @@ export async function login(email, password) {
     state.user = result.user;
     await refreshAll();
     startPolling();
+  } catch (error) {
+    setToken("");
+    clearSessionState();
+    setMessage("login", error.message, "error");
+    throw error;
   } finally {
     state.pending.login = false;
   }
@@ -411,8 +572,25 @@ export async function refreshJobsOnly() {
   if (!state.user) {
     return;
   }
-  state.jobs = await authedRequest("/jobs");
+  const jobsPage = await fetchJobsThrough(Math.max(state.jobs.length, JOB_PAGE_SIZE));
+  state.jobs = jobsPage.items;
+  state.jobsPage = { total: jobsPage.total, hasMore: jobsPage.hasMore };
   await refreshSelectedJob();
+}
+
+export async function refreshJobs() {
+  if (!state.user || state.pending.refresh) {
+    return;
+  }
+  state.pending.refresh = true;
+  setMessage("jobs");
+  try {
+    await refreshJobsOnly();
+  } catch (error) {
+    setMessage("jobs", error.message, "error");
+  } finally {
+    state.pending.refresh = false;
+  }
 }
 
 export async function refreshAll() {
@@ -422,7 +600,7 @@ export async function refreshAll() {
 
   state.pending.refresh = true;
   try {
-    const jobsPromise = authedRequest("/jobs");
+    const jobsPromise = fetchJobsThrough(Math.max(state.jobs.length, JOB_PAGE_SIZE));
     const adminPromise = isAdmin.value
       ? Promise.all([
           authedRequest("/settings"),
@@ -432,8 +610,10 @@ export async function refreshAll() {
         ])
       : Promise.resolve(null);
 
-    const [jobs, adminData] = await Promise.all([jobsPromise, adminPromise]);
+    const [jobsPage, adminData] = await Promise.all([jobsPromise, adminPromise]);
+    const jobs = jobsPage.items;
     state.jobs = jobs;
+    state.jobsPage = { total: jobsPage.total, hasMore: jobsPage.hasMore };
 
     if (!state.selectedJobId && jobs[0]) {
       state.selectedJobId = jobs[0].id;
@@ -465,13 +645,22 @@ export async function refreshAll() {
   }
 }
 
+export async function loadMoreJobs() {
+  if (!state.jobsPage.hasMore) {
+    return;
+  }
+  const page = await authedRequest(`/jobs?offset=${state.jobs.length}&limit=${JOB_PAGE_SIZE}`);
+  state.jobs = [...state.jobs, ...page.items];
+  state.jobsPage = { total: page.total, hasMore: page.has_more };
+}
+
 export async function loadMoreUsers() {
   if (state.pending.userList || !state.usersPage.hasMore) {
     return;
   }
 
   state.pending.userList = true;
-  state.messages.users = "";
+  setMessage("users");
   try {
     const result = await authedRequest(`/users?offset=${state.users.length}&limit=${USER_PAGE_SIZE}`);
     state.users = [...state.users, ...result.items];
@@ -488,7 +677,7 @@ export async function loadMoreUsers() {
 
 export async function loadUsersPage() {
   state.pending.userList = true;
-  state.messages.users = "";
+  setMessage("users");
   try {
     const result = await authedRequest(`/users?offset=0&limit=${USER_PAGE_SIZE}`);
     state.users = result.items;
@@ -508,7 +697,7 @@ export async function loadAuditPage(page = state.auditPage.page) {
   const offset = (nextPage - 1) * AUDIT_PAGE_SIZE;
 
   state.pending.audit = true;
-  state.messages.audit = "";
+  setMessage("audit");
   try {
     const result = await authedRequest(`/audit-logs?offset=${offset}&limit=${AUDIT_PAGE_SIZE}`);
     state.audit = result.items;
@@ -529,24 +718,33 @@ export async function selectJob(jobId) {
   await refreshSelectedJob();
 }
 
-export async function uploadJobs(files, sourceLanguage, targetLanguage) {
+export async function uploadJobs(files, sourceLanguage, targetLanguage, modelName, modelApiFormat) {
   const queue = Array.from(files);
   state.pending.upload = true;
-  state.messages.upload = "";
+  setMessage("upload");
   try {
     for (const file of queue) {
       const formData = new FormData();
       formData.set("file", file);
       formData.set("source_language", sourceLanguage || DEFAULT_SOURCE_LANGUAGE);
       formData.set("target_language", targetLanguage || DEFAULT_TARGET_LANGUAGE);
+      if (modelName) {
+        formData.set("model_name", modelName);
+      }
+      if (modelApiFormat) {
+        formData.set("model_api_format", modelApiFormat);
+      }
 
       await authedRequest("/jobs/upload", {
         method: "POST",
         body: formData,
       });
     }
-    state.messages.upload =
-      queue.length === 1 ? copy("任务已加入队列。", "Job queued.") : copy(`${queue.length} 个任务已加入队列。`, `${queue.length} jobs queued.`);
+    setMessage(
+      "upload",
+      queue.length === 1 ? copy("任务已加入队列。", "Job queued.") : copy(`${queue.length} 个任务已加入队列。`, `${queue.length} jobs queued.`),
+      "success"
+    );
     await refreshAll();
   } finally {
     state.pending.upload = false;
@@ -554,8 +752,30 @@ export async function uploadJobs(files, sourceLanguage, targetLanguage) {
 }
 
 export async function cancelJob(jobId) {
-  await authedRequest(`/jobs/${jobId}/cancel`, { method: "POST" });
-  await refreshAll();
+  const previousJob = state.jobs.find((job) => job.id === jobId);
+  const previousSelectedJob = state.selectedJob?.id === jobId ? state.selectedJob : null;
+  setMessage("jobs");
+  state.jobs = state.jobs.map((job) => (job.id === jobId ? { ...job, cancel_requested: true } : job));
+  if (previousSelectedJob) {
+    state.selectedJob = { ...previousSelectedJob, cancel_requested: true };
+  }
+  try {
+    const updatedJob = await authedRequest(`/jobs/${jobId}/cancel`, { method: "POST" });
+    state.jobs = state.jobs.map((job) => (job.id === updatedJob.id ? updatedJob : job));
+    if (state.selectedJob?.id === updatedJob.id) {
+      state.selectedJob = { ...state.selectedJob, ...updatedJob };
+      await refreshSelectedJob();
+    }
+  } catch (error) {
+    if (previousJob) {
+      state.jobs = state.jobs.map((job) => (job.id === jobId ? previousJob : job));
+    }
+    if (previousSelectedJob) {
+      state.selectedJob = previousSelectedJob;
+    }
+    setMessage("jobs", error.message, "error");
+    throw error;
+  }
 }
 
 export async function retryJob(jobId) {
@@ -579,14 +799,14 @@ export async function downloadJob(jobId) {
 
 export async function saveSettings(payload) {
   state.pending.settings = true;
-  state.messages.settings = "";
+  setMessage("settings");
   try {
     state.settings = await authedRequest(`/settings`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    state.messages.settings = copy("设置已保存。", "Settings saved.");
+    setMessage("settings", copy("设置已保存。", "Settings saved."), "success");
   } finally {
     state.pending.settings = false;
   }
@@ -594,25 +814,72 @@ export async function saveSettings(payload) {
 
 export async function testModel(payload) {
   state.pending.modelTest = true;
-  state.messages.settings = "";
+  setMessage("settings");
+  clearModelTestResult();
   try {
     const result = await authedRequest(`/settings/test-model`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    state.messages.settings = copy(
-      `连接成功，耗时 ${result.latency_ms} ms。返回示例：${result.preview}`,
-      `Connection OK in ${result.latency_ms} ms. Preview: ${result.preview}`
+    state.modelTestResult.connectionMessage = copy(
+      `模型连接成功，API 响应时间 ${result.latency_ms} ms。`,
+      `Model connected. API response time: ${result.latency_ms} ms.`
     );
+    state.modelTestResult.connectionLevel = "success";
+    state.modelTestResult.validationMessage = copy(
+      "正在验证 response 合法性…",
+      "Validating the response format…"
+    );
+
+    try {
+      await authedRequest(`/settings/validate-model-response`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      cacheModelFormat(payload);
+      state.modelTestResult.validationMessage = copy(
+        "Response 合法性验证通过。",
+        "Response format validation passed."
+      );
+      state.modelTestResult.validationLevel = "success";
+    } catch (error) {
+      state.modelTestResult.validationMessage = copy(
+        `Response 合法性验证失败：${error.message}`,
+        `Response format validation failed: ${error.message}`
+      );
+      state.modelTestResult.validationLevel = "error";
+    }
   } finally {
     state.pending.modelTest = false;
   }
 }
 
+export async function listModels(payload) {
+  state.pending.modelList = true;
+  setMessage("settings");
+  try {
+    const result = await authedRequest(`/settings/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    cacheModels(payload, result.models);
+    setMessage(
+      "settings",
+      copy(`已加载 ${result.models.length} 个模型。`, `Loaded ${result.models.length} models.`),
+      "info"
+    );
+    return result.models;
+  } finally {
+    state.pending.modelList = false;
+  }
+}
+
 export async function createUser(payload) {
   state.pending.userCreate = true;
-  state.messages.users = "";
+  setMessage("users");
   try {
     await authedRequest("/users", {
       method: "POST",
@@ -620,7 +887,7 @@ export async function createUser(payload) {
       body: JSON.stringify(payload),
     });
     await loadUsersPage();
-    state.messages.users = copy("用户已创建。", "User created.");
+    setMessage("users", copy("用户已创建。", "User created."), "success");
   } finally {
     state.pending.userCreate = false;
   }
@@ -658,7 +925,7 @@ function refreshTranslatedPreviewDocument(jobId, revision, documentKind) {
 
 export async function loadPreview(jobId) {
   state.pending.preview = true;
-  state.messages.preview = "";
+  setMessage("preview");
   try {
     clearPreviewState();
     const job = await authedRequest(`/jobs/${jobId}`);
@@ -685,7 +952,7 @@ export async function loadPreview(jobId) {
 
 export function setPreviewMode(mode) {
   state.previewMode = mode;
-  state.messages.preview = "";
+  setMessage("preview");
 }
 
 export async function savePreview() {
@@ -694,16 +961,19 @@ export async function savePreview() {
   }
 
   state.pending.previewSave = true;
-  state.messages.preview = "";
+  setMessage("preview");
   try {
     const pdfPayload = state.previewDraft.document_kind === "pdf" ? previewEditablePayload() : [];
     const quarantined =
       state.previewDraft.document_kind === "pdf" ? collectQuarantinedPdfEdits(state.previewData, state.previewDraft) : new Map();
     if (state.previewDraft.document_kind === "pdf" && pdfPayload.length === 0) {
-      state.messages.preview =
+      setMessage(
+        "preview",
         previewLayoutOverflowCount.value > 0
           ? copy("红框溢出块已隔离，没有可安全保存的修改。", "Overflow blocks were quarantined; there are no safe edits to save.")
-          : copy("没有可保存的修改。", "No edits to save.");
+          : copy("没有可保存的修改。", "No edits to save."),
+        "warning"
+      );
       return;
     }
 
@@ -734,10 +1004,13 @@ export async function savePreview() {
     if (preview.document_kind === "pdf" || preview.document_kind === "docx" || preview.document_kind === "pptx") {
       refreshTranslatedPreviewDocument(state.previewJob.id, preview.updated_at, preview.document_kind);
     }
-    state.messages.preview =
+    setMessage(
+      "preview",
       quarantined.size > 0
         ? copy("安全修改已保存，红框溢出块已保留在草稿中。", "Safe edits saved; overflow blocks remain quarantined in the draft.")
-        : copy("修改已保存。", "Edits saved.");
+        : copy("修改已保存。", "Edits saved."),
+      quarantined.size > 0 ? "warning" : "success"
+    );
   } finally {
     state.pending.previewSave = false;
   }
@@ -747,5 +1020,7 @@ export function defaultUploadState() {
   return {
     sourceLanguage: DEFAULT_SOURCE_LANGUAGE,
     targetLanguage: DEFAULT_TARGET_LANGUAGE,
+    modelName: "",
+    modelApiFormat: "",
   };
 }

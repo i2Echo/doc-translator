@@ -12,6 +12,7 @@ from types import FunctionType, SimpleNamespace
 from typing import Any, Callable
 
 from doc_translator.babeldoc_hooks import BabeldocHookContext
+from doc_translator.babeldoc_translator import BabeldocModelTranslator
 from doc_translator.hook_policy import HookPolicy
 from doc_translator.settings_service import RuntimeSettings
 
@@ -76,28 +77,15 @@ def translate_pdf_with_babeldoc_library(
     from babeldoc.format.pdf import high_level
     from babeldoc.format.pdf.translation_config import TranslationConfig
     from babeldoc.format.pdf.translation_config import WatermarkOutputMode
-    from babeldoc.translator.translator import OpenAITranslator
     from babeldoc.translator.translator import set_translate_rate_limiter
-    import httpx
-    import openai
 
     hook_context = BabeldocHookContext(hook_policy=HookPolicy.from_env())
     set_translate_rate_limiter(qps)
 
-    translator = OpenAITranslator(
+    translator = BabeldocModelTranslator(
+        runtime,
         lang_in=source_language or "en",
         lang_out=target_language,
-        model=runtime.model_name,
-        base_url=runtime.model_base_url,
-        api_key=runtime.model_api_key,
-    )
-    translator.client = openai.OpenAI(
-        base_url=runtime.model_base_url,
-        api_key=runtime.model_api_key,
-        http_client=httpx.Client(
-            limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
-            timeout=runtime.model_timeout_seconds,
-        ),
     )
     doc_layout_model = DocLayoutModel.load_onnx()
     config = TranslationConfig(
@@ -160,6 +148,7 @@ def translate_pdf_with_babeldoc_library(
     try:
         translate_result = asyncio.run(_run_babeldoc_translation(hooked_high_level, config, on_progress_event))
     finally:
+        translator.close()
         try:
             hook_sidecar = hook_context.write_sidecar()
         except OSError:
